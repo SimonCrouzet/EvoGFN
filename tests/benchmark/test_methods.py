@@ -43,11 +43,14 @@ from evogfn.benchmark.methods import (
     _RebuiltOnMove,
     anchor_arms,
     gflownet,
+    variant_arms,
 )
 from evogfn.benchmark.protocol import Protocol
 from evogfn.benchmark.tasks import Task
+from evogfn.env.mutation import MutationEnvironment, TerminalFeasibilityEnvironment
 from evogfn.landscapes.ehrlich import EhrlichLandscape
 from evogfn.loop.campaign import ReanchorableSampler
+from evogfn.models import AnchorConditionedPolicy, SequencePolicy
 
 #: Rounds and plate for the end-to-end runs. Small, because the property under
 #: test is accounting rather than optimisation, and two rounds is the fewest that
@@ -125,6 +128,33 @@ def source_of(arm):
 def proxy_spend(campaign):
     """What a finished campaign's sampler reports having spent on the proxy."""
     return campaign.sampler.proxy_calls
+
+
+def environment_of(campaign):
+    """The graph a campaign searches. Always present for the arms in this module."""
+    return campaign.environment
+
+
+def held_policy(sampler):
+    """The policy a GFlowNet sampler trains."""
+    return sampler._policy
+
+
+def policy_of(campaign):
+    """The policy a GFlowNet campaign's sampler trains."""
+    return held_policy(campaign.sampler)
+
+
+def reanchored_sampler(campaign, env):
+    """The sampler a campaign carries into a moved anchor, via the hook it prefers."""
+    return campaign.sampler.reanchored(env)
+
+
+def one_step_from(env):
+    """A design one legal substitution away from an environment's anchor."""
+    state = env.initial(1)
+    action = int(np.flatnonzero(env.forward_mask(state)[0, : env.n_mutation_actions])[0])
+    return env.step(state, np.array([action])).sequences[0]
 
 
 def counting_sampler(*, proxy_calls, bred, unconstructible, proposals=0):
@@ -408,3 +438,115 @@ class TestTheRebuiltArmIsTheSameArmWithoutItsMemory:
 
         assert np.array_equal(carried.sequences, rebuilt.sequences)
         assert carried.best_value == rebuilt.best_value
+
+
+class TestTheVariantLadderIsAddedRatherThanApplied:
+    """Two mechanisms, each off by default, so every existing result still stands.
+
+    The failure guarded against is a variant that leaks. Both of these change
+    what a campaign searches -- one the graph, one the policy's input -- so an
+    arm that acquired either silently would be tabled against arms it is no
+    longer comparable to, and nothing in the stored numbers would say which rows
+    those were. `genetic-feasible` is named separately below because it reaches
+    the same environment class through `feasible_only` and is the arm most
+    likely to be moved by accident.
+    """
+
+    def variant_env(self, name):
+        return environment_of(variant_arms()[name](toy_task(), 0))
+
+    def variant_policy(self, name):
+        return policy_of(variant_arms()[name](toy_task(), 0))
+
+    def test_every_shipped_arm_still_masks_feasibility_at_every_step(self):
+        for name, arm in {**BASELINES, **OBJECTIVES}.items():
+            assert type(environment_of(arm(toy_task(), 0))) is MutationEnvironment, name
+
+    def test_genetic_feasible_is_untouched(self):
+        # It reaches the environment through `feasible_only`, so it is the arm a
+        # change to the default masking rule would move without being named. Its
+        # rejection burden is the control for the feasibility claim, and a
+        # rejection burden measured on a graph that no longer rejects is nothing.
+        campaign = BASELINES["genetic-feasible"](toy_task(), 0)
+        assert type(environment_of(campaign)) is MutationEnvironment
+
+    def test_every_shipped_gflownet_arm_still_sees_only_the_sequence(self):
+        for name, arm in OBJECTIVES.items():
+            assert type(policy_of(arm(toy_task(), 0))) is SequencePolicy, name
+
+    def test_the_terminal_arm_searches_the_terminal_only_graph(self):
+        assert isinstance(self.variant_env("gfn-tb+terminal"), TerminalFeasibilityEnvironment)
+        assert type(self.variant_env("gfn-tb+anchor")) is MutationEnvironment
+
+    def test_the_anchor_arm_conditions_its_policy_on_the_anchor(self):
+        policy = self.variant_policy("gfn-tb+anchor")
+        assert isinstance(policy, AnchorConditionedPolicy)
+        assert type(self.variant_policy("gfn-tb+terminal")) is SequencePolicy
+
+    def test_the_both_arm_takes_both_and_the_two_do_not_interfere(self):
+        campaign = variant_arms()["gfn-tb+terminal+anchor"](toy_task(), 0)
+        assert isinstance(environment_of(campaign), TerminalFeasibilityEnvironment)
+        assert isinstance(policy_of(campaign), AnchorConditionedPolicy)
+
+    def test_the_conditioned_policy_starts_bound_to_the_graph_it_walks(self):
+        # A held anchor can disagree with the environment's, and the
+        # disagreement is silent: the policy conditions on a parent nobody is
+        # searching from and the loss stays finite.
+        campaign = variant_arms()["gfn-tb+anchor"](toy_task(), 0)
+        assert policy_of(campaign).anchor.tolist() == environment_of(campaign).parent.tolist()
+
+    def test_the_conditioned_policy_follows_a_moved_anchor(self):
+        # The campaign prefers the sampler's own re-anchoring hook over its
+        # factory, so this is the path a re-anchoring task actually takes, and
+        # it never passes through the factory that built the policy.
+        campaign = variant_arms()["gfn-tb+anchor"](toy_task(), 0)
+        env = environment_of(campaign)
+        moved_to = env.reanchored(one_step_from(env))
+        moved = reanchored_sampler(campaign, moved_to)
+
+        assert held_policy(moved) is policy_of(campaign), "no weight should be rebuilt"
+        assert held_policy(moved).anchor.tolist() == moved_to.parent.tolist()
+
+    def test_each_variant_changes_exactly_the_flag_it_is_named_for(self):
+        # An arm that also moved the step count, the reward exponent or the
+        # trunk width would be losing or winning on compute, and the ladder
+        # would report that as a feasibility or conditioning result.
+        base = settings(variant_arms()["gfn-tb"])
+        flags = ("terminal_feasibility", "anchor_conditioned")
+        for name in ("gfn-tb+terminal", "gfn-tb+anchor", "gfn-tb+terminal+anchor"):
+            resolved = settings(variant_arms()[name])
+            assert {k: v for k, v in resolved.items() if k not in flags} == {
+                k: v for k, v in base.items() if k not in flags
+            }, name
+
+    def test_the_flags_are_off_wherever_they_are_not_named(self):
+        assert settings(variant_arms()["gfn-tb"])["terminal_feasibility"] is False
+        assert settings(variant_arms()["gfn-tb"])["anchor_conditioned"] is False
+        assert settings(variant_arms()["gfn-tb+terminal"])["anchor_conditioned"] is False
+        assert settings(variant_arms()["gfn-tb+anchor"])["terminal_feasibility"] is False
+        both = settings(variant_arms()["gfn-tb+terminal+anchor"])
+        assert both["terminal_feasibility"] is True
+        assert both["anchor_conditioned"] is True
+
+    def test_the_ladder_reuses_the_shipped_arm_rather_than_rebuilding_it(self):
+        # The store keys on (task, arm), so a re-declared `gfn-tb` is the same
+        # cell only while two expressions agree. Looked up, they cannot disagree.
+        assert variant_arms()["gfn-tb"] is OBJECTIVES["gfn-tb"]
+
+    def test_the_variants_are_not_in_the_objective_sweep(self):
+        # `OBJECTIVES` is resolved key-by-key to a training objective by the
+        # configuration sweep. Neither variant is an objective -- both are plain
+        # trajectory balance -- so a key here would be looked up as one and fail.
+        assert not set(variant_arms()) - {"gfn-tb"} & set(OBJECTIVES)
+
+    @pytest.mark.slow
+    def test_a_variant_arm_runs_a_campaign_end_to_end(self):
+        # Cheap, and the only check that the two mechanisms survive contact with
+        # sampling, training and a moved anchor rather than only with unit
+        # fixtures. A dead-ended trajectory reaching the assay is the expected
+        # behaviour of the terminal-only arm, not an error, so this must pass.
+        arm = gflownet(
+            TrajectoryBalance(), steps=2, terminal_feasibility=True, anchor_conditioned=True
+        )
+        result = arm(toy_task(), 0).run()
+        assert result.sequences.shape[0] == ROUNDS * BATCH

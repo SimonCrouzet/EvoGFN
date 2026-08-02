@@ -59,6 +59,18 @@ of four, so a fixed anchor makes the optimum unreachable *in principle* and any
 regret measured against it is a regret no method could have closed.
 [reanchored][evogfn.env.mutation.MutationEnvironment.reanchored] is what a
 campaign calls between rounds to move the ball.
+
+Where feasibility is enforced is a choice
+-----------------------------------------
+
+`MutationEnvironment` masks the transition constraint at every intermediate,
+which is the conservative reading and the one every existing arm runs.
+[TerminalFeasibilityEnvironment][evogfn.env.mutation.TerminalFeasibilityEnvironment]
+is the other reading: an intermediate is a notepad entry rather than a molecule,
+so the constraint belongs on the terminal. It is a subclass rather than a flag on
+the base so that no arm can acquire it by default -- the two are different search
+spaces, and a result produced under one is not comparable to a result produced
+under the other.
 """
 
 from __future__ import annotations
@@ -71,6 +83,8 @@ import numpy as np
 from evogfn.env.base import SequenceEnvironment, State
 
 if TYPE_CHECKING:
+    from typing import Self
+
     import numpy.typing as npt
 
     from evogfn.core.types import Alphabet, Tokens
@@ -184,7 +198,7 @@ class MutationEnvironment(SequenceEnvironment):
         """Index of the action that terminates a trajectory."""
         return self.n_mutation_actions
 
-    def reanchored(self, parent: Tokens) -> MutationEnvironment:
+    def reanchored(self, parent: Tokens) -> Self:
         """Return the same environment anchored at a new parent.
 
         A campaign round searches within ``max_mutations`` of the anchor. Keeping
@@ -211,9 +225,14 @@ class MutationEnvironment(SequenceEnvironment):
                 best variant measured so far.
 
         Returns:
-            A new environment over the same alphabet, mutation budget,
-            transition matrix and stopping rule, anchored at ``parent``. This
-            environment is unchanged.
+            A new environment of *this* class over the same alphabet, mutation
+            budget, transition matrix and stopping rule, anchored at ``parent``.
+            This environment is unchanged. The class is read off ``self`` rather
+            than named, so a subclass that changes the masking rule keeps that
+            rule across a move; naming the base class here would silently revert
+            a campaign to intermediate-masked search the first time its anchor
+            moved, and every later round would be a different method than the
+            one the arm asked for.
 
         Raises:
             ValueError: If ``parent`` is not a single sequence of this
@@ -237,7 +256,7 @@ class MutationEnvironment(SequenceEnvironment):
                 "transition constraint, so the environment could no longer "
                 "guarantee that what it builds is constructible"
             )
-        return MutationEnvironment(
+        return type(self)(
             candidate,
             self._alphabet,
             max_mutations=self._max_mutations,
@@ -304,29 +323,71 @@ class MutationEnvironment(SequenceEnvironment):
             An ``(n, n_actions)`` boolean array.
         """
         n = len(state)
-        untouched = state.sequences == self._parent[None, :]
         capacity_left = self.n_mutations(state) < self._max_mutations
 
-        # (n, length, v): allowed if the position is still untouched, the token
-        # is a genuine change, and the trajectory has capacity left.
-        differs = self._parent[None, :, None] != np.arange(self._alphabet.size)[None, None, :]
-        allowed = untouched[:, :, None] & differs & capacity_left[:, None, None]
-
-        if self._transitions is not None:
-            allowed &= self._adjacency_allowed(state.sequences, self._transitions)
-
         mask = np.zeros((n, self.n_actions), dtype=np.bool_)
-        mask[:, : self.n_mutation_actions] = allowed.reshape(n, -1)
+        mask[:, : self.n_mutation_actions] = self._substitution_mask(state, capacity_left).reshape(
+            n, -1
+        )
 
         # Stopping is available once the trajectory is entitled to stop, and is
         # forced when nothing else is possible -- a state with no legal action
         # would leave the policy with nothing to normalise over.
-        may_stop = np.ones(n, dtype=np.bool_) if self._allow_stop_before_max else ~capacity_left
+        may_stop = self._may_stop(state, capacity_left)
         mask[:, self.stop_action] = may_stop | ~mask[:, : self.n_mutation_actions].any(axis=1)
 
         # A stopped trajectory takes no further actions at all.
         mask[state.stopped] = False
         return mask
+
+    def _substitution_mask(
+        self, state: State, capacity_left: npt.NDArray[np.bool_]
+    ) -> npt.NDArray[np.bool_]:
+        """Which substitutions are edges out of each state.
+
+        Split out of `forward_mask` so that *which constraints apply to an
+        intermediate* is one overridable decision rather than something a
+        subclass has to restate the whole mask to change. The stop rule is split
+        out for the same reason, and the two together are the only places a
+        variant of this graph differs.
+
+        Args:
+            state: The current state.
+            capacity_left: ``(n,)``, whether the trajectory may still mutate.
+
+        Returns:
+            An ``(n, length, v)`` boolean array: allowed where the position is
+            still untouched, the token is a genuine change, the trajectory has
+            capacity left, and the result keeps every adjacency permitted.
+        """
+        untouched = state.sequences == self._parent[None, :]
+        differs = self._parent[None, :, None] != np.arange(self._alphabet.size)[None, None, :]
+        allowed: npt.NDArray[np.bool_] = (
+            untouched[:, :, None] & differs & capacity_left[:, None, None]
+        )
+        if self._transitions is not None:
+            allowed &= self._adjacency_allowed(state.sequences, self._transitions)
+        return allowed
+
+    def _may_stop(
+        self, state: State, capacity_left: npt.NDArray[np.bool_]
+    ) -> npt.NDArray[np.bool_]:
+        """Which trajectories are *entitled* to stop where they are.
+
+        Entitlement is not the same as availability: `forward_mask` also forces
+        stopping on a trajectory with no other legal action, so a rule here that
+        forbids stopping everywhere still yields a well-formed mask.
+
+        Args:
+            state: The current state.
+            capacity_left: ``(n,)``, whether the trajectory may still mutate.
+
+        Returns:
+            An ``(n,)`` boolean array.
+        """
+        if self._allow_stop_before_max:
+            return np.ones(len(state), dtype=np.bool_)
+        return ~capacity_left
 
     def backward_mask(self, state: State) -> npt.NDArray[np.bool_]:
         """Which actions could have produced this state.
@@ -359,8 +420,7 @@ class MutationEnvironment(SequenceEnvironment):
 
         running = ~np.asarray(state.stopped, dtype=np.bool_)
         mutated = (state.sequences != self._parent[None, :]) & running[:, None]
-        if self._transitions is not None:
-            mutated &= self._parent_would_be_feasible(state.sequences)
+        mutated &= self._revertible(state.sequences)
         rows, positions = np.nonzero(mutated)
         tokens = state.sequences[rows, positions]
         mask[rows, positions * self._alphabet.size + tokens] = True
@@ -390,6 +450,26 @@ class MutationEnvironment(SequenceEnvironment):
         permitted = self._transitions > 0
         feasible = np.all(permitted[array[:, :-1], array[:, 1:]], axis=1)
         return np.asarray(within_budget & feasible, dtype=np.bool_)
+
+    def _revertible(self, sequences: Tokens) -> npt.NDArray[np.bool_]:
+        """Which mutated positions have the reversion as a genuine parent state.
+
+        The mirror of `_substitution_mask`: an edge exists backward exactly where
+        it exists forward, so whatever a subclass permits during construction it
+        must also permit undoing. Overriding one without the other gives ``P_B``
+        a different graph from ``P_F``, and trajectory balance is then being
+        solved for a graph nobody walks.
+
+        Args:
+            sequences: An ``(n, length)`` array of token indices.
+
+        Returns:
+            An ``(n, length)`` boolean array, ``True`` where reverting that
+            position lands on a state this environment admits.
+        """
+        if self._transitions is None:
+            return np.ones(sequences.shape, dtype=np.bool_)
+        return self._parent_would_be_feasible(sequences)
 
     def _parent_would_be_feasible(self, sequences: Tokens) -> npt.NDArray[np.bool_]:
         """Which single-mutation reversions land on a feasible state.
@@ -687,3 +767,174 @@ class MutationEnvironment(SequenceEnvironment):
                 f"{direction} action not permitted for trajectories {offenders.tolist()}: "
                 f"{actions[offenders].tolist()}"
             )
+
+
+class TerminalFeasibilityEnvironment(MutationEnvironment):
+    """The same lattice, with feasibility required of terminals and not of steps.
+
+    Why the intermediate constraint is an artifact
+    ----------------------------------------------
+
+    `MutationEnvironment` enforces the transition constraint at *every* state a
+    trajectory passes through, because that is what masking a construction graph
+    does. The consequence is that the set it can build is not the set of feasible
+    designs within the mutation budget: it is the smaller set of feasible designs
+    that have *some ordering of their substitutions along which every prefix is
+    also feasible*. A design can be perfectly feasible, sit well inside the
+    budget, and still be unreachable because every order of writing its
+    substitutions down passes through a forbidden adjacency.
+
+    The claim this class makes is that the excluded designs are excluded for no
+    reason a biologist would recognise. An intermediate here has no physical
+    referent. It is never synthesised, never assayed, and never exists in a tube;
+    it is the state of the policy's notepad after some of the substitutions have
+    been written down. Feasibility is a constraint on a **sequence** -- on what
+    gets built -- not on the order in which its differences from the parent are
+    enumerated. Requiring it of intermediates is a property of masking-on-
+    intermediates, not of the biology, and it silently deletes designs from the
+    search space.
+
+    So this environment masks substitutions on the mutation budget alone, leaves
+    adjacency unenforced during construction, and applies the constraint where it
+    means something: at the terminal.
+
+    What that buys
+    --------------
+
+    Every feasible design within the budget becomes constructible, by any
+    ordering at all. Two things that were approximations in the base class become
+    exact as a result:
+    [is_reachable][evogfn.env.mutation.MutationEnvironment.is_reachable] --
+    within budget and feasible -- now describes the constructible set rather than
+    over-stating it, and ``log k!`` really is the number of trajectories reaching
+    a ``k``-mutation state, since no ordering is refused.
+
+    How the stop action carries the constraint, and what it costs
+    -------------------------------------------------------------
+
+    The constraint has to be applied *somewhere*, and the only edge whose
+    destination is a terminal is the stop action. So stopping is an entitlement
+    of feasible states only: a trajectory sitting on an infeasible sequence must
+    keep mutating.
+
+    That is what creates the dead-end. Substitutions still consume budget, each
+    position may still be mutated at most once, and reverting is not an edge of
+    an acyclic graph -- so a trajectory can spend its last unit of budget on a
+    substitution that breaks an adjacency and then have nothing legal left: no
+    capacity to repair, and no entitlement to stop. **The decision taken here is
+    to force the stop action in that case**, which is exactly the rule the base
+    class already applies when a state has no other move, and the trajectory
+    terminates on an infeasible design.
+
+    The alternatives were all worse. Permitting a reverting move would make the
+    graph cyclic and the flow equations unsolvable. Refusing any substitution
+    whose result cannot still be repaired within the remaining budget is a
+    reachability lookahead over the rest of the ball, which is the expensive
+    computation the masking was supposed to avoid, and it re-imports the
+    intermediate constraint in a weaker disguise. Raising would turn a legal walk
+    of the graph into a crash.
+
+    What the decision costs is real and should be reported, not hidden:
+
+    * A share of trajectories terminate on infeasible designs. The oracle scores
+      those ``-inf``, so each one occupies a well of the plate and returns no
+      measurement -- a direct loss of oracle budget, in the currency the whole
+      benchmark is indexed by.
+    * Training does not push back on them. The policy is trained against a
+      surrogate proxy, which has no notion of feasibility and will happily assign
+      a dead-end design a high reward; the correction only arrives when the
+      design reaches the assay.
+    * The dead-end rate is a property of the transition matrix and the budget,
+      not of the method, so it is a confound between arms whenever the two
+      differ. It goes to zero as the alphabet's permitted adjacencies get denser
+      and rises as the budget gets tighter, since a tight budget leaves no room
+      to mutate out of a broken adjacency.
+
+    `is_reachable` deliberately keeps refusing those designs. It is read by the
+    replay buffer and the genetic teacher to decide what is worth constructing a
+    path to, and an infeasible design is worth none: a dead-end is something a
+    trajectory can stumble into, not something anything should aim at.
+    [reachable_terminal_states][evogfn.env.mutation.MutationEnvironment.reachable_terminal_states]
+    reports them, because it walks this environment's own masks and its contract
+    is what a trajectory can *actually* end on -- which is the support a
+    distributional comparison must normalise over.
+
+    Nothing changes without a transition matrix. With ``transitions=None`` there
+    is no adjacency to enforce or defer, so this class and its base describe the
+    identical graph, and the flag that selects it is a no-op on an unconstrained
+    landscape rather than a silent second effect.
+    """
+
+    def _substitution_mask(
+        self, state: State, capacity_left: npt.NDArray[np.bool_]
+    ) -> npt.NDArray[np.bool_]:
+        """Which substitutions are edges out of each state, adjacency ignored.
+
+        Args:
+            state: The current state.
+            capacity_left: ``(n,)``, whether the trajectory may still mutate.
+
+        Returns:
+            An ``(n, length, v)`` boolean array, allowed where the position is
+            untouched, the token is a genuine change, and budget remains. The
+            transition matrix is not consulted: an intermediate is a notepad
+            entry rather than a molecule.
+        """
+        untouched = state.sequences == self._parent[None, :]
+        differs = self._parent[None, :, None] != np.arange(self._alphabet.size)[None, None, :]
+        allowed: npt.NDArray[np.bool_] = (
+            untouched[:, :, None] & differs & capacity_left[:, None, None]
+        )
+        return allowed
+
+    def _may_stop(
+        self, state: State, capacity_left: npt.NDArray[np.bool_]
+    ) -> npt.NDArray[np.bool_]:
+        """Which trajectories are entitled to stop: the feasible ones.
+
+        This is where the deferred constraint lands. A trajectory on an
+        infeasible sequence is not entitled to stop and must mutate on; one that
+        has also run out of budget has no legal action at all, and `forward_mask`
+        forces the stop, terminating it on an infeasible design.
+
+        Args:
+            state: The current state.
+            capacity_left: ``(n,)``, whether the trajectory may still mutate.
+
+        Returns:
+            An ``(n,)`` boolean array.
+        """
+        return super()._may_stop(state, capacity_left) & self._feasible_rows(state.sequences)
+
+    def _revertible(self, sequences: Tokens) -> npt.NDArray[np.bool_]:
+        """Every mutated position, since no intermediate is refused.
+
+        The mirror of `_substitution_mask`. Keeping the base class's check --
+        that reverting lands on a feasible state -- would make ``P_B`` describe a
+        graph with fewer edges than ``P_F`` walks, and the balance condition
+        would be fitted to a graph that is not the one being sampled.
+
+        Args:
+            sequences: An ``(n, length)`` array of token indices.
+
+        Returns:
+            An ``(n, length)`` all-true boolean array.
+        """
+        return np.ones(sequences.shape, dtype=np.bool_)
+
+    def _feasible_rows(self, sequences: Tokens) -> npt.NDArray[np.bool_]:
+        """Whether each sequence satisfies the transition constraint.
+
+        Args:
+            sequences: An ``(n, length)`` array of token indices.
+
+        Returns:
+            An ``(n,)`` boolean array, all true where no constraint is set or
+            where a sequence is too short to have an adjacency.
+        """
+        if self._transitions is None or self._length < 2:  # noqa: PLR2004 - a pair needs two
+            return np.ones(sequences.shape[0], dtype=np.bool_)
+        permitted = self._transitions > 0
+        return np.asarray(
+            np.all(permitted[sequences[:, :-1], sequences[:, 1:]], axis=1), dtype=np.bool_
+        )

@@ -25,6 +25,7 @@ from evogfn.benchmark.methods import (
     default_methodologies,
     flow_objectives,
     gflownet,
+    variant_arms,
 )
 from evogfn.benchmark.multi_objective import (
     ARMS,
@@ -160,4 +161,5 @@ __all__ = [
     "run_tier",
     "seeds_needed",
     "set_indicators",
+    "variant_arms",
 ]

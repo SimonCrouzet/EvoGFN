@@ -57,6 +57,7 @@ from evogfn.algorithms.base import Sampler
 from evogfn.algorithms.gflownet.genetic_gfn import train_genetic_gfn
 from evogfn.algorithms.gflownet.sampling import sample_trajectories
 from evogfn.algorithms.gflownet.training import TrainingConfig, train_trajectory_balance
+from evogfn.models.policy import AnchorConditionedPolicy
 
 if TYPE_CHECKING:
     from evogfn.algorithms.baselines.genetic import GeneticAlgorithm
@@ -110,6 +111,7 @@ class GFlowNetSampler(Sampler):
         super().__init__()
         self._env = env
         self._policy = policy
+        self._bind_anchor(env, policy)
         self._proxy = proxy
         self._reward = reward
         self._config = config or TrainingConfig()
@@ -122,6 +124,34 @@ class GFlowNetSampler(Sampler):
         self._proxy_calls = 0
         self._bred_designs = 0
         self._unconstructible_designs = 0
+
+    @staticmethod
+    def _bind_anchor(env: SequenceEnvironment, policy: SequencePolicy) -> None:
+        """Point an anchor-conditioned policy at the graph it is about to walk.
+
+        [AnchorConditionedPolicy][evogfn.models.policy.AnchorConditionedPolicy]
+        reads the anchor as an input, so it holds one, and a held anchor can
+        disagree with the environment's. The disagreement is silent -- the policy
+        conditions on a parent nobody is searching from, the loss stays finite,
+        and the only symptom is a worse result -- so it is made impossible here
+        instead of documented as a caution. This is the one place an environment
+        and a policy are married, and a campaign that moves its anchor arrives
+        here again by constructing a new sampler.
+
+        An unconditioned policy is left alone entirely, which is what keeps the
+        variant an added arm rather than a change to every existing one.
+
+        Args:
+            env: The graph the sampler will walk. Only its anchor is read, and
+                only when there is a policy that wants one; an environment with
+                no parent -- one that builds from nothing -- is left alone.
+            policy: The policy to bind.
+        """
+        if not isinstance(policy, AnchorConditionedPolicy):
+            return
+        parent = getattr(env, "parent", None)
+        if parent is not None:
+            policy.set_anchor(parent)
 
     @property
     def name(self) -> str:
@@ -201,6 +231,16 @@ class GFlowNetSampler(Sampler):
         already mutates it in place across rounds, and the campaign's factory
         fallback closes over the same instance, so copying here would introduce a
         second set of weights that no other path has.
+
+        **An anchor-conditioned policy mentions the parent in its input, and is
+        re-bound rather than exempted.** The paragraph above says the network's
+        input does not mention the parent, and for
+        [AnchorConditionedPolicy][evogfn.models.policy.AnchorConditionedPolicy]
+        that is false by design: the anchor is fed to it. Its *weights* are still
+        anchor-free -- the anchor arrives as input, not as a parameter -- so they
+        transfer for exactly the same reason, and what has to move is the input.
+        Constructing the moved sampler is what moves it, so a policy is never
+        walking one graph while conditioned on another.
 
         **``log Z`` is the one anchor-relative parameter, and it is carried
         deliberately.** It estimates the total flow through the DAG -- the

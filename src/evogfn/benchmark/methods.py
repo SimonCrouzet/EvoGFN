@@ -107,9 +107,9 @@ from evogfn.algorithms.gflownet.objectives import ContrastiveBalance, Trajectory
 from evogfn.algorithms.gflownet.sampler import GFlowNetSampler
 from evogfn.algorithms.gflownet.training import TrainingConfig
 from evogfn.algorithms.inner_loop import ProxyOptimising
-from evogfn.env.mutation import MutationEnvironment
+from evogfn.env.mutation import MutationEnvironment, TerminalFeasibilityEnvironment
 from evogfn.loop.campaign import Campaign
-from evogfn.models.policy import SequencePolicy
+from evogfn.models.policy import AnchorConditionedPolicy, SequencePolicy
 from evogfn.rewards.base import TemperedReward
 from evogfn.surrogate.ensemble import DeepEnsemble
 from evogfn.surrogate.proxy import ProxyLandscape
@@ -272,7 +272,9 @@ def _anchor_seed(seed: int, generation: int) -> int:
     return int(np.random.SeedSequence([seed, generation]).generate_state(1)[0])
 
 
-def _parts(task: Task, seed: int) -> tuple[object, MutationEnvironment, DeepEnsemble]:
+def _parts(
+    task: Task, seed: int, *, terminal_feasibility: bool = False
+) -> tuple[object, MutationEnvironment, DeepEnsemble]:
     """Everything a campaign needs that is not the method itself.
 
     Built identically for every methodology on a given task and seed, which is
@@ -282,9 +284,25 @@ def _parts(task: Task, seed: int) -> tuple[object, MutationEnvironment, DeepEnse
     makes masked sampling possible at all. Omitting it does not raise: it
     silently switches feasibility-by-construction off, so every proposal scores
     minus infinity and the surrogate has nothing finite to fit.
+
+    Args:
+        task: Fixes the landscape, the wild type and the search radius.
+        seed: Seeds the surrogate's initialisation.
+        terminal_feasibility: Build
+            [TerminalFeasibilityEnvironment][evogfn.env.mutation.TerminalFeasibilityEnvironment]
+            instead, which defers the transition constraint from every
+            intermediate to the terminal. Off by default and reachable only from
+            an arm that names it, because the two classes describe *different
+            search spaces*: an arm that acquired this silently would not be
+            comparable to the arm it is tabled against, and nothing in the
+            numbers would say so.
+
+    Returns:
+        The landscape, the environment and an unfitted surrogate.
     """
     landscape = task.landscape()
-    env = MutationEnvironment(
+    build_env = TerminalFeasibilityEnvironment if terminal_feasibility else MutationEnvironment
+    env = build_env(
         task.parent(landscape),
         landscape.alphabet,
         max_mutations=task.max_mutations,
@@ -365,7 +383,12 @@ def _campaign(  # noqa: PLR0913 - a campaign is defined by its protocol
 
 
 def _policy(
-    env: MutationEnvironment, *, hidden_dim: int, learn_flow: bool, seed: int
+    env: MutationEnvironment,
+    *,
+    hidden_dim: int,
+    learn_flow: bool,
+    seed: int,
+    anchor_conditioned: bool = False,
 ) -> SequencePolicy:
     """A policy sized to an environment's action space.
 
@@ -381,10 +404,28 @@ def _policy(
         hidden_dim: Width of the trunk.
         learn_flow: Whether to build a flow head.
         seed: Seeds the initialisation.
+        anchor_conditioned: Feed the anchor alongside the state, making the
+            policy a function over anchors rather than a policy for the one it
+            was built at. Off by default: it widens the trunk's input, so the
+            two are not the same network and a table that mixed them would be
+            comparing capacities as well as conditioning. This is the one
+            argument for which the environment's *anchor* is read and not only
+            its shape -- and the anchor moves, so the sampler re-binds it rather
+            than this being the last word on it.
 
     Returns:
         The policy.
     """
+    if anchor_conditioned:
+        return AnchorConditionedPolicy(
+            anchor=env.parent,
+            n_actions=env.n_actions,
+            sequence_length=env.sequence_length,
+            n_tokens=env.alphabet.size,
+            hidden_dim=hidden_dim,
+            learn_flow=learn_flow,
+            seed=seed,
+        )
     return SequencePolicy(
         n_actions=env.n_actions,
         sequence_length=env.sequence_length,
@@ -598,6 +639,8 @@ def gflownet(  # noqa: PLR0913 - an arm is defined by its hyperparameters
     learn_flow: bool = False,
     hidden_dim: int = DEFAULT_HIDDEN_DIM,
     carry_policy: bool = True,
+    terminal_feasibility: bool = False,
+    anchor_conditioned: bool = False,
 ) -> Methodology:
     """A GFlowNet trained against the surrogate proxy.
 
@@ -622,20 +665,43 @@ def gflownet(  # noqa: PLR0913 - an arm is defined by its hyperparameters
             the same before and after the move -- and so is the control the
             claim needs. It changes nothing on a task whose anchor never moves,
             because nothing is ever rebuilt there.
+        terminal_feasibility: Enforce the transition constraint on the design
+            rather than on every intermediate, through
+            [TerminalFeasibilityEnvironment][evogfn.env.mutation.TerminalFeasibilityEnvironment].
+            Off is the shipped method. On, the arm searches a strictly larger
+            space -- every feasible design within the budget, rather than only
+            those with a feasible construction order -- and pays for it with
+            trajectories that dead-end on infeasible designs, which the assay
+            scores ``-inf``. It is inert on a landscape with no transition
+            matrix, so an arm that sets it differs from one that does not only
+            where feasibility is actually constrained.
+        anchor_conditioned: Feed the anchor to the policy, through
+            [AnchorConditionedPolicy][evogfn.models.policy.AnchorConditionedPolicy].
+            Off is the shipped method, which sees only the resulting sequence and
+            so cannot tell a substitution from an inherited residue. On, the
+            policy fits a function over anchors, which is something only an arm
+            with a policy can do at all: a genetic algorithm's representation of
+            where it is *is* its population.
 
     Returns:
         A methodology, carrying its settings for the record.
     """
 
     def methodology(task: Task, seed: int) -> Campaign:
-        landscape, env, ensemble = _parts(task, seed)
+        landscape, env, ensemble = _parts(task, seed, terminal_feasibility=terminal_feasibility)
         # Built once and closed over when the policy is carried, so a rebuild
         # for a moved anchor keeps the trained weights. It survives the move
         # because its action space -- length * |alphabet| + 1 indices -- and its
         # input, the state sequence, are both properties of the space rather
         # than of the anchor. Only the masks move.
         carried = (
-            _policy(env, hidden_dim=hidden_dim, learn_flow=learn_flow, seed=seed)
+            _policy(
+                env,
+                hidden_dim=hidden_dim,
+                learn_flow=learn_flow,
+                seed=seed,
+                anchor_conditioned=anchor_conditioned,
+            )
             if carry_policy
             else None
         )
@@ -656,7 +722,13 @@ def gflownet(  # noqa: PLR0913 - an arm is defined by its hyperparameters
                 anchored,
                 carried
                 if carried is not None
-                else _policy(anchored, hidden_dim=hidden_dim, learn_flow=learn_flow, seed=stream),
+                else _policy(
+                    anchored,
+                    hidden_dim=hidden_dim,
+                    learn_flow=learn_flow,
+                    seed=stream,
+                    anchor_conditioned=anchor_conditioned,
+                ),
                 proxy=proxy,
                 reward=TemperedReward(beta=beta),
                 # Identical whether or not the policy is carried, which is what
@@ -686,6 +758,8 @@ def gflownet(  # noqa: PLR0913 - an arm is defined by its hyperparameters
             "hidden_dim": hidden_dim,
             "pool_size": DEFAULT_POOL,
             "carry_policy": carry_policy,
+            "terminal_feasibility": terminal_feasibility,
+            "anchor_conditioned": anchor_conditioned,
         },
     )
 
@@ -989,6 +1063,60 @@ def anchor_arms() -> dict[str, Methodology]:
         "gfn-tb": OBJECTIVES["gfn-tb"],
         "gfn-tb-rebuilt": gflownet(TrajectoryBalance(), carry_policy=False),
         "genetic": BASELINES["genetic"],
+    }
+
+
+def variant_arms() -> dict[str, Methodology]:
+    """The GFlowNet ladder: two mechanisms, each one rung above plain ``gfn-tb``.
+
+    The same shape as the ``genetic+`` ladder in `BASELINES` and for the same
+    reason. Each rung adds exactly one thing to a base arm that is *looked up*
+    rather than re-declared, so the store's ``(task, arm)`` cell for ``gfn-tb``
+    is shared with every table that already paid for it, and the comparison is
+    against the identical configuration by construction rather than by two
+    expressions agreeing:
+
+    ==========================  =======================================================
+    arm                         what it adds
+    ==========================  =======================================================
+    ``gfn-tb``                  nothing; feasibility is masked at every intermediate
+    ``gfn-tb+terminal``         feasibility is required of the design, not of the order
+    ``gfn-tb+anchor``           the policy is told which parent it is evolving from
+    ``gfn-tb+terminal+anchor``  both
+    ==========================  =======================================================
+
+    The both-on rung is not decoration. Unlike the ``genetic+`` ladder, whose
+    rungs are nested -- each contains the one above it -- these two mechanisms
+    are *orthogonal*: one changes the graph the policy walks, the other changes
+    what the policy reads at each state. Three arms would report two main effects
+    and leave the interaction unmeasured, which is exactly where the interesting
+    answer could be. Conditioning on the anchor is what lets a policy tell an
+    inherited residue from a substitution, and terminal feasibility is what makes
+    the substitution orders unconstrained; a policy that can see which positions
+    are its own is the one with something to do with that freedom. It is also the
+    configuration the method would ship if both rungs win, so it has to have been
+    run rather than inferred by addition.
+
+    Kept out of `OBJECTIVES` deliberately. That mapping is read as a set of
+    *training objectives* -- the configuration sweep resolves each of its keys to
+    an objective instance by name -- and none of these varies the objective. All
+    are plain trajectory balance; what differs is the graph one of them walks and
+    the input another one reads.
+
+    No rung is available to a classical arm, and that is a property of the
+    methods rather than of this module: conditioning needs a policy to condition,
+    and nothing in `BASELINES` has one.
+
+    Returns:
+        Methodologies by name.
+    """
+    return {
+        "gfn-tb": OBJECTIVES["gfn-tb"],
+        "gfn-tb+terminal": gflownet(TrajectoryBalance(), terminal_feasibility=True),
+        "gfn-tb+anchor": gflownet(TrajectoryBalance(), anchor_conditioned=True),
+        "gfn-tb+terminal+anchor": gflownet(
+            TrajectoryBalance(), terminal_feasibility=True, anchor_conditioned=True
+        ),
     }
 
 
