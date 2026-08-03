@@ -165,7 +165,16 @@ def selected_gflownet() -> dict[str, object]:
     if not CHOICE_FILE.exists():
         return {}
     choice = json.loads(CHOICE_FILE.read_text())
-    missing = [key for key in ("objective", "arm", "beta", "steps") if key not in choice]
+    # Every axis the selection moved has to be here, including the ones whose
+    # value may legitimately be null. Absent and null are different claims: null
+    # says this objective reads no such knob, absent says the file predates the
+    # stage that chose it -- and rebuilding the arm from a file missing an axis
+    # would silently run the default on it and report the result as selected.
+    missing = [
+        key
+        for key in ("objective", "arm", "beta", "steps", "lam", "mix", "hidden_dim")
+        if key not in choice
+    ]
     if missing:
         # Loudly, rather than falling back to the untuned defaults. A file
         # written by a selection that stopped partway describes a configuration
@@ -178,7 +187,14 @@ def selected_gflownet() -> dict[str, object]:
         )
     arm = str(choice["arm"])
     return {
-        arm: _build_objective(str(choice["objective"]), float(choice["beta"]), int(choice["steps"]))
+        arm: _build_objective(
+            str(choice["objective"]),
+            float(choice["beta"]),
+            int(choice["steps"]),
+            lam=None if choice["lam"] is None else float(choice["lam"]),
+            mix=None if choice["mix"] is None else float(choice["mix"]),
+            hidden_dim=int(choice["hidden_dim"]),
+        )
     }
 
 
