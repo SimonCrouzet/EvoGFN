@@ -5,24 +5,35 @@ tuned. A GFlowNet run at inherited defaults against that field is not being
 compared to it, so this phase runs first and its answer is an input to the
 headline tables rather than one of their rows.
 
-Two stages, because the full cross of objectives and reward exponents is far
-more compute than the question needs:
-
 **Stage A** compares the six training objectives at the default exponent, at
 `SELECTION_SEEDS` seeds per arm -- enough that a gap worth acting on can be
 separated from noise, and enough to state honestly that the rest are tied.
 
 **Stage B** scans the reward exponent for whichever objective stage A chose. It
 runs second because the winner is not known until stage A finishes, and it scans
-only the winner because scanning all six would cost six times the compute. The
-cost of that economy is real and worth naming: an objective that loses at the
-default exponent and would have won at another is invisible to this design.
+only the winner because scanning all six would cost six times the compute.
+
+**Stage C** stops moving one axis at a time. A one-axis-at-a-time design cannot
+see interactions, and -- worse -- it never reaches the parameters that make the
+leading objectives *families* rather than points, since those were never on any
+of its axes. So stage C samples a joint space at random and does it in two
+halves that must not be confused with each other:
+
+*The screen* runs many configurations at `SCREEN_SEEDS` seeds. Its only output
+is a shortlist. It cannot rank anything, no number it produces is reported, and
+the shortlist is a human's call rather than this script's -- the finalists are
+named on the command line.
+
+*The confirmation* runs the shortlist at the full seed count through the same
+pre-declared rule every earlier stage used, **plus the incumbent, always**. That
+last part is what makes the screen safe: it can only add a better configuration,
+never displace the standing one on evidence too thin to displace anything.
 
 The rule is in [evogfn.benchmark.selection][], written down before the numbers
-arrived. Both stages run on the diagnostic landscape, which no headline task
+arrived. Every stage runs on the diagnostic landscape, which no headline task
 uses, so nothing here is tuning on the test set.
 
-    uv run python experiments/select_configuration.py            # both stages
+    uv run python experiments/select_configuration.py            # every stage
     uv run python experiments/select_configuration.py --report   # read, no runs
 """
 
@@ -37,7 +48,26 @@ from typing import cast
 
 from evogfn.benchmark.determinism import configure_determinism, is_deterministic
 from evogfn.benchmark.methods import OBJECTIVES, flow_objectives
-from evogfn.benchmark.selection import Scored, Selection, beta_arms, select, steps_arms
+from evogfn.benchmark.selection import (
+    CONFIRM_FLOOR,
+    CONFIRM_SLOTS,
+    SCREEN_SAMPLING_SEED,
+    SCREEN_SEEDS,
+    SCREEN_SIZE,
+    SCREENED_OBJECTIVES,
+    Configuration,
+    Scored,
+    Screen,
+    Selection,
+    beta_arms,
+    confirmation_set,
+    incumbent,
+    propose_allocation,
+    rank_screen,
+    sample_screen,
+    screen_arms,
+    select,
+)
 from evogfn.benchmark.store import ResultStore
 from evogfn.benchmark.suite import Purpose, Tier, objective_task, run_tier
 
@@ -140,9 +170,63 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--stage",
-        choices=("a", "b", "c", "both"),
+        choices=("a", "b", "c", "c-screen", "c-confirm", "both"),
         default="both",
-        help="Which stage to run. Shards use 'a', then one process runs 'b'.",
+        help="Which stage to run. Shards use 'a', then one process runs 'b'. "
+        "Stage C splits: 'c-screen' samples and runs the joint screen, "
+        "'c-confirm' re-measures the finalists named by --confirm, and 'c' does "
+        "both -- which in practice stops after the screen, since the finalists "
+        "are chosen once the screen has landed.",
+    )
+    parser.add_argument(
+        "--screen-size",
+        type=int,
+        default=SCREEN_SIZE,
+        help="Configurations drawn per screened objective.",
+    )
+    parser.add_argument(
+        "--screen-seeds",
+        type=int,
+        default=SCREEN_SEEDS,
+        help="Seeds per screened configuration. Low on purpose: the screen "
+        "nominates and the confirmation measures, so resolution bought here is "
+        "bought where no claim is drawn.",
+    )
+    parser.add_argument(
+        "--screen-seed",
+        type=int,
+        default=SCREEN_SAMPLING_SEED,
+        help="Seed for the draw. The candidate set is a function of this and "
+        "the declared grids, so it can be reproduced and checked.",
+    )
+    parser.add_argument(
+        "--screen-shown",
+        type=int,
+        default=15,
+        help="How much of each screen's ordering to print.",
+    )
+    parser.add_argument(
+        "--confirm",
+        action="append",
+        default=[],
+        help="A finalist's arm name. Repeatable, and required before the "
+        "confirmation runs: allocating a fixed budget between the screens is a "
+        "judgement rather than an arithmetic, so it is made by a person and "
+        "written down here. The incumbent is confirmed regardless and does not "
+        "need naming.",
+    )
+    parser.add_argument(
+        "--confirm-slots",
+        type=int,
+        default=CONFIRM_SLOTS,
+        help="Finalists the printed allocation proposal splits between screens.",
+    )
+    parser.add_argument(
+        "--confirm-floor",
+        type=int,
+        default=CONFIRM_FLOOR,
+        help="Fewest finalists the proposal gives any screen, so a ten-seed "
+        "screen cannot write an objective off entirely.",
     )
     parser.add_argument(
         "--print-winner",
@@ -167,29 +251,45 @@ def main(argv: list[str] | None = None) -> int:
     if not isinstance(exponent, Selection):
         return exponent
     beta = float(exponent.chosen.rsplit("-", 1)[1])
-    gradient = _stage_c(store, args, wanted, objective, beta)
-    if not isinstance(gradient, Selection):
-        return gradient
+    confirmed = _stage_c(store, args, wanted, objective, beta)
+    if not isinstance(confirmed, Selection):
+        return confirmed
 
+    # Read back from the winning arm's stored settings rather than from its
+    # name. The record carries what the methodology closed over, so it is what
+    # actually ran; `from_record` still parses the name and refuses when the two
+    # disagree, which is the only way that disagreement is ever visible.
+    winner = store.usable(objective_task().name, confirmed.chosen)
+    chosen = Configuration.from_record(confirmed.chosen, next(iter(winner.values())).parameters)
     choice = {
         # Explicit fields rather than a name to be parsed. `run_suite` reads
         # these to rebuild the arm, and picking a configuration apart from a
         # string breaks the moment the naming scheme grows a component.
-        "beta": beta,
-        "steps": int(gradient.chosen.rsplit("-", 1)[1]),
-        "objective": objective.chosen,
+        "beta": chosen.beta,
+        "steps": chosen.steps,
+        "lam": chosen.lam,
+        "mix": chosen.mix,
+        "hidden_dim": chosen.hidden_dim,
+        "objective": chosen.objective,
         "objective_reason": objective.reason,
         "objective_tied": list(objective.tied),
-        "arm": gradient.chosen,
+        "arm": confirmed.chosen,
         "arm_reason": exponent.reason,
-        "steps_reason": gradient.reason,
+        "confirmed_reason": confirmed.reason,
+        # The screen's provenance, so the candidate set can be redrawn. Its
+        # numbers are deliberately absent: it nominated, and nothing it measured
+        # is reported.
+        "screen_seed": args.screen_seed,
+        "screen_size": args.screen_size,
+        "screen_seeds": args.screen_seeds,
+        "finalists": sorted(args.confirm),
         "seeds": args.seeds,
         "task": objective_task().name,
     }
     if not args.report:
         CHOICE_FILE.parent.mkdir(parents=True, exist_ok=True)
         CHOICE_FILE.write_text(json.dumps(choice, indent=2) + "\n")
-    _flush(f"\nselected {gradient.chosen}")
+    _flush(f"\nselected {confirmed.chosen}")
     _flush(f"total {time.perf_counter() - started:.0f}s")
     return 0
 
@@ -272,6 +372,51 @@ def _stage_b(
     return exponent
 
 
+def _screen_arms(args: argparse.Namespace) -> dict[str, dict[str, object]]:
+    """The sampled configurations of every screened objective, by objective."""
+    return {
+        name: cast(
+            "dict[str, object]",
+            screen_arms(sample_screen(name, size=args.screen_size, seed=args.screen_seed)),
+        )
+        for name in SCREENED_OBJECTIVES
+    }
+
+
+def _screen_slice(args: argparse.Namespace) -> range:
+    """Which screen seeds this process runs.
+
+    Clipped to the screen's own seed count rather than the confirmation's, so a
+    shard sharding the confirmation does not silently ask the screen for seeds
+    no arm there is meant to hold.
+    """
+    return range(
+        min(args.seed_from, args.screen_seeds),
+        min(args.seed_to or args.screen_seeds, args.screen_seeds),
+    )
+
+
+def describe_screen(screen: Screen, *, shown: int) -> str:
+    """Lay out the top of one screen, and state how little of it is resolved."""
+    lines = [
+        f"\n--- screen: {screen.objective} "
+        f"({len(screen.ranked)} configurations x {len(screen.seeds)} seeds) ---",
+        "  NOT A RESULT. These means nominate candidates and nothing else.",
+    ]
+    for entry in screen.ranked[:shown]:
+        mark = "" if entry.separated else "within noise of the leader"
+        lines.append(
+            f"  {entry.name:<34} regret {entry.regret:7.4f} +-{entry.spread:6.4f}  "
+            f"div {entry.diversity:6.2f}  {mark}"
+        )
+    tied = len(screen.indistinguishable)
+    lines.append(
+        f"  resolution: {tied} of {len(screen.ranked)} configurations cannot be "
+        f"separated from this screen's leader at {len(screen.seeds)} seeds"
+    )
+    return "\n".join(lines)
+
+
 def _stage_c(
     store: ResultStore,
     args: argparse.Namespace,
@@ -279,31 +424,115 @@ def _stage_c(
     objective: Selection,
     beta: float,
 ) -> Selection | int:
-    """Scan gradient steps -- the GFlowNet's proxy budget -- for the chosen arm.
+    """Screen a joint space, then confirm a shortlist of it.
 
-    Runs last because it depends on both earlier choices. Proxy spend is a
-    reported column in the results table, so `steps` is a number the paper
-    prints and is decided here rather than inherited as an internal default.
+    Two halves with different standing. The screen samples many configurations
+    at few seeds and produces candidates; the confirmation re-measures the
+    shortlist at the full seed count through the same rule every earlier stage
+    used. Nothing the screen prints is a result, and the shortlist is named on
+    the command line rather than derived here, because allocating a fixed
+    confirmation budget between objectives is a judgement rather than an
+    arithmetic.
+
+    Returns:
+        The choice, or a process exit code when this shard cannot make one.
     """
-    arms = steps_arms(objective.chosen, beta)
-    if args.stage in {"c", "both"}:
-        shard = _shard(arms, wanted, "C")  # type: ignore[arg-type]
+    if objective.chosen not in SCREENED_OBJECTIVES:
+        print(
+            f"stage A chose {objective.chosen}, which stage C does not screen; the "
+            f"incumbent would then be outside every screened space",
+            file=sys.stderr,
+        )
+        return 2
+
+    screened = _screen_arms(args)
+    if args.stage in {"c", "c-screen", "both"}:
+        shard = _shard({k: v for arms in screened.values() for k, v in arms.items()}, wanted, "C")
         if shard is None:
             return 2
         run_stage(
-            "select-steps",
+            "screen-joint",
+            shard,
+            store,
+            report=args.report,
+            seeds=args.screen_seeds,
+            runnable=_screen_slice(args),
+        )
+
+    screens = []
+    for name, arms in screened.items():
+        stored = held(store, arms)
+        if [n for n in arms if len(stored.get(n, {})) < args.screen_seeds]:
+            _flush(f"screen shard done; {name} is not complete yet")
+            return 0
+        screens.append(rank_screen(name, stored))
+
+    for screen in screens:
+        _flush(describe_screen(screen, shown=args.screen_shown))
+    _flush(_allocation_note(screens, args))
+
+    if not args.confirm:
+        _flush(
+            "\nstage C is waiting on a shortlist: re-run with --confirm ARM per "
+            "finalist. The incumbent is added regardless and does not need naming."
+        )
+        return 0
+    return _confirm(store, args, wanted, incumbent(objective.chosen, beta))
+
+
+def _allocation_note(screens: list[Screen], args: argparse.Namespace) -> str:
+    """Put a proposed split of the confirmation budget on the screen.
+
+    A proposal and nothing more: it is printed, never acted on, and the finalists
+    still have to be named. Allocating slots to an objective whose screen looked
+    worse is a decision about how much a ten-seed ranking is worth, and that is
+    not a decision to take mechanically.
+    """
+    proposal = propose_allocation(screens, slots=args.confirm_slots, floor=args.confirm_floor)
+    split = ", ".join(f"{name} {count}" for name, count in proposal.items())
+    return (
+        f"\n  proposed split of {args.confirm_slots} finalists: {split} "
+        f"(floor {args.confirm_floor} each; a proposal, not a decision -- "
+        f"name the finalists with --confirm)"
+    )
+
+
+def _confirm(
+    store: ResultStore,
+    args: argparse.Namespace,
+    wanted: set[str] | None,
+    standing: Configuration,
+) -> Selection | int:
+    """Re-measure the shortlist, and the incumbent, at the full seed count.
+
+    This is the measurement. Everything before it in stage C exists to decide
+    what goes into it.
+    """
+    try:
+        configurations = confirmation_set(args.confirm, standing)
+    except ValueError as error:
+        print(f"--confirm names something that is not a screened arm: {error}", file=sys.stderr)
+        return 2
+    arms = cast("dict[str, object]", screen_arms(configurations))
+
+    if args.stage in {"c", "c-confirm", "both"}:
+        shard = _shard(arms, wanted, "C")
+        if shard is None:
+            return 2
+        run_stage(
+            "confirm-joint",
             shard,
             store,
             report=args.report,
             seeds=args.seeds,
             runnable=range(args.seed_from, args.seed_to or args.seeds),
         )
-    stored = held(store, arms)  # type: ignore[arg-type]
+    stored = held(store, arms)
     if [n for n in arms if len(stored.get(n, {})) < args.seeds]:
-        _flush("stage C shard done; not every step count is complete yet")
+        _flush("confirmation shard done; not every finalist is complete yet")
         return 0
     chosen = select(stored)
-    _flush(describe("stage C: gradient steps (proxy budget)", chosen))
+    _flush(describe("stage C: joint configuration (confirmed)", chosen))
     return chosen
 
 
