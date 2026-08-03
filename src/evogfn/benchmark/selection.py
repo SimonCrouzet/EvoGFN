@@ -268,7 +268,7 @@ def select(records: Mapping[str, Mapping[int, Scored]]) -> Selection:
 #: cost is not eligible, since only statistical ties go to diversity. Widening
 #: until the answer is agreeable would not be legitimate, so this grid is fixed
 #: and the whole curve gets reported either way.
-SELECTION_BETAS: tuple[float, ...] = (0.1, 0.3, 0.5, 1.0, 2.0, 3.0, 10.0, 30.0, 100.0)
+SELECTION_BETAS: tuple[float, ...] = (0.1, 0.2, 0.3, 0.4, 0.5, 1.0, 2.0, 3.0, 10.0, 30.0, 100.0)
 
 
 #: Objectives that read a sub-trajectory length weighting. Everything else
