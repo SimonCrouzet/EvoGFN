@@ -126,7 +126,7 @@ The phase writes `results/selected.json`. The benchmark **reads** that file rath
 the choice, so a moved seed count or arm list cannot silently swap the arm a table reports.
 **No selection is currently recorded** — the previous one was made under a superseded rule and has
 been deleted — so the suite will fall back to the untuned defaults and say so. Full procedure, and
-what a staged design cannot see, in [`docs/selection.md`](docs/selection.md).
+what it cannot see, in [`docs/selection.md`](docs/selection.md).
 
 ### Then the suite
 
