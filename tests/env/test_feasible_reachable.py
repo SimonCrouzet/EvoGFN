@@ -57,9 +57,11 @@ def measure(density, seed):
     ball = env.enumerate_terminal_states()
     feasible = ball[landscape.is_feasible(ball)]
     reachable = env.reachable_terminal_states()
+    constructible = ball[env.is_constructible(ball)]
     return {
         "feasible": {row.tobytes() for row in feasible},
         "reachable": {row.tobytes() for row in reachable},
+        "constructible": {row.tobytes() for row in constructible},
         "best_feasible": float(landscape.evaluate(feasible)[:, 0].max()),
         "best_reachable": float(landscape.evaluate(reachable)[:, 0].max()),
     }
@@ -106,6 +108,37 @@ class TestExclusionGrowsAsTheConstraintTightens:
         loosest = statistics.fmean([excluded(r) for r in sweep[DENSITIES[0]]])
         tightest = statistics.fmean([excluded(r) for r in sweep[DENSITIES[-1]]])
         assert tightest > loosest + 0.05
+
+
+class TestTheLocalConstructibilityTestIsExact:
+    """`is_constructible` must agree with the forward search, not approximate it.
+
+    The search is the definition -- it walks the environment's own masks -- but it
+    is exponential and cannot be run on a real task, so anything that needs to
+    know whether a design is in the search space uses the local test instead. If
+    the two ever disagree, the local test is admitting designs no trajectory can
+    build or excluding ones it can, and every caller that trusted it is deciding
+    membership of the wrong set.
+    """
+
+    def test_it_reproduces_the_forward_search_on_every_instance(self, sweep):
+        # Set equality rather than counts: two sets of the same size that differ
+        # in their members would pass a size check and still be wrong.
+        for density, results in sweep.items():
+            for index, result in enumerate(results):
+                assert result["constructible"] == result["reachable"], (density, index)
+
+    def test_it_is_strictly_stronger_than_endpoint_feasibility(self, sweep):
+        # Without this the agreement above could be vacuous: a test that simply
+        # returned `is_reachable` would satisfy it on any instance where the two
+        # sets happen to coincide.
+        narrowed = [
+            result
+            for results in sweep.values()
+            for result in results
+            if result["constructible"] < result["feasible"]
+        ]
+        assert narrowed
 
 
 class TestTheExcludedSetCanContainTheOptimum:

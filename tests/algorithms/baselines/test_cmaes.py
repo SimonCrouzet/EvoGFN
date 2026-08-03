@@ -18,7 +18,8 @@ from evogfn.algorithms.base import Sampler
 from evogfn.algorithms.baselines import CMAES
 from evogfn.algorithms.baselines.cmaes import _project_onto_constructible
 from evogfn.core import Alphabet
-from evogfn.env.mutation import MutationEnvironment
+from evogfn.env.mutation import MutationEnvironment, TerminalFeasibilityEnvironment
+from evogfn.landscapes.ehrlich import EhrlichLandscape
 
 
 def make_env(length=6, symbols="ABCD", max_mutations=3, transitions=None):
@@ -236,6 +237,25 @@ def sparse_transitions(vocab, seed=0):
     return matrix
 
 
+def open_transitions(vocab, forbidden_share=0.4, seed=1):
+    """A matrix that binds without emptying the construction graph.
+
+    The counterpart of `sparse_transitions`, and needed because the two ask
+    different questions. Sparse enough and the *constructible* set collapses to
+    the anchor -- correctly, since almost nothing can be built -- which makes it
+    the wrong instance on which to ask whether the projection searches. Here the
+    Hamiltonian cycle is laid over a mostly-permissive matrix, so a design many
+    substitutions from the anchor has a construction order and the projection has
+    somewhere to go.
+    """
+    rng = np.random.default_rng(seed)
+    matrix = np.ones((vocab, vocab), dtype=np.float64)
+    matrix[rng.random((vocab, vocab)) < forbidden_share] = 0.0
+    order = rng.permutation(vocab)
+    matrix[order, np.roll(order, -1)] = 1.0
+    return matrix
+
+
 def feasible_start(transitions, length, seed=0):
     """A sequence the transition matrix admits, walked out of the chain itself."""
     rng = np.random.default_rng(seed)
@@ -281,17 +301,34 @@ class TestFeasibility:
         sampler = CMAES(env, seed=0)
         for _ in range(3):
             proposals = sampler.propose(64)
-            assert env.is_reachable(proposals).all()
+            assert env.is_constructible(proposals).all()
             sampler.observe(proposals, toy_landscape(proposals))
+
+    def open_env(self, length=24, vocab=8, budget=8):
+        transitions = open_transitions(vocab)
+        parent = feasible_start(transitions, length)
+        return MutationEnvironment(
+            parent,
+            Alphabet.from_string("ABCDEFGH"[:vocab]),
+            max_mutations=budget,
+            transitions=transitions,
+        )
 
     def test_the_repair_does_not_collapse_onto_the_anchor(self):
         # Emitting the parent every time would also be "buildable" and would be
         # a useless search. The projection maximises the logits over the
-        # feasible set, so it should stay well out in the ball.
-        env = self.sparse_env()
+        # constructible set, so where that set is wide it should stay well out in
+        # the ball. Asked on `open_env` rather than `sparse_env`: on an instance
+        # where the environment can build almost nothing, returning the anchor is
+        # the right answer and the assertion would be pinning an escape from the
+        # construction graph rather than a search of it.
+        env = self.open_env()
         proposals = CMAES(env, seed=0).propose(64)
         distances = (proposals != env.parent[None, :]).sum(axis=1)
+        assert env.is_constructible(proposals).all()
         assert distances.mean() > env.sequence_length / 4
+        # Not one design repeated: a collapsed search would also travel far.
+        assert len({row.tobytes() for row in np.ascontiguousarray(proposals)}) > 1
 
     def test_the_projection_costs_no_extra_proposals(self):
         # The cost of repair is wall clock, not proposals and not oracle calls.
@@ -335,9 +372,102 @@ class TestFeasibility:
             best = max(
                 logits[row, np.arange(4), np.array(candidate)].sum()
                 for candidate in product(range(3), repeat=4)
-                if env.is_reachable(np.array(candidate)[None, :])[0]
+                if env.is_constructible(np.array(candidate)[None, :])[0]
             )
             assert achieved == pytest.approx(best)
+
+    def test_the_projection_lands_inside_the_enumerated_construction_graph(self):
+        # The invariant, against the environment's own forward search rather
+        # than against any predicate the projection might share a mistake with.
+        # `reachable_terminal_states` walks `forward_mask` and `step`, so it is
+        # the definition of what a trajectory can end on; a design outside it is
+        # one no masked arm could have proposed, and an arm allowed to propose it
+        # is being compared on a larger search space than the rest.
+        for length, budget, forbidden in [
+            (7, 3, [(0, 1), (1, 2), (2, 0), (1, 1)]),
+            (6, 4, [(0, 2), (2, 1), (1, 0), (2, 2)]),
+        ]:
+            transitions = constrained_transitions(3, forbidden)
+            env = MutationEnvironment(
+                np.zeros(length, dtype=np.int32),
+                Alphabet.from_string("ABC"),
+                max_mutations=budget,
+                transitions=transitions,
+            )
+            graph = {row.tobytes() for row in env.reachable_terminal_states().astype(np.int32)}
+            rng = np.random.default_rng(1)
+            logits = rng.standard_normal((48, length, 3))
+            decoded = _project_onto_constructible(logits, env.parent, transitions > 0, budget)
+            outside = [r for r in decoded.astype(np.int32) if r.tobytes() not in graph]
+            assert not outside, (length, budget, len(graph))
+            # Not vacuous: the endpoint condition alone admits strictly more, so
+            # a projection targeting it would have had somewhere to escape to.
+            ball = env.enumerate_terminal_states()
+            assert int(env.is_reachable(ball).sum()) > len(graph)
+
+    def test_repairing_does_not_narrow_a_terminal_feasibility_environment(self):
+        # The mirror of the invariant above. Where the environment defers the
+        # rule to the terminal, every feasible design in the budget is buildable
+        # by any ordering, so imposing an ordering condition would confine this
+        # arm to a strict subset of what that environment lets everything else
+        # propose -- an error in the opposite direction and just as invisible.
+        transitions = constrained_transitions(3, [(0, 1), (1, 2), (2, 0)])
+        deferred = TerminalFeasibilityEnvironment(
+            np.zeros(6, dtype=np.int32),
+            Alphabet.from_string("ABC"),
+            max_mutations=4,
+            transitions=transitions,
+        )
+        rng = np.random.default_rng(2)
+        logits = rng.standard_normal((32, 6, 3))
+        decoded = _project_onto_constructible(
+            logits, deferred.parent, transitions > 0, 4, ordered=False
+        )
+        assert deferred.is_constructible(decoded).all()
+        for row in range(32):
+            achieved = logits[row, np.arange(6), decoded[row]].sum()
+            best = max(
+                logits[row, np.arange(6), np.array(candidate)].sum()
+                for candidate in product(range(3), repeat=6)
+                if deferred.is_constructible(np.array(candidate)[None, :])[0]
+            )
+            assert achieved == pytest.approx(best)
+
+    def test_regret_against_an_enumerated_optimum_cannot_go_negative(self):
+        # What the invariant is *for*. The attainable optimum on a constrained
+        # task is the maximum over the enumerated construction graph, so an arm
+        # confined to that graph can match it and cannot beat it. A negative
+        # regret is not a strong result, it is proof the arm left the space --
+        # and it is the only symptom the harness would ever show.
+        landscape = EhrlichLandscape(
+            sequence_length=10,
+            vocab_size=4,
+            n_motifs=2,
+            motif_length=2,
+            quantization=2,
+            max_spacing=3,
+            transition_density=0.4,
+            seed=3,
+        )
+        env = MutationEnvironment(
+            landscape.feasible_sequence(3),
+            landscape.alphabet,
+            max_mutations=3,
+            transitions=landscape.transition_matrix,
+        )
+        attainable = float(landscape.evaluate(env.reachable_terminal_states())[:, 0].max())
+
+        sampler = CMAES(env, seed=0)
+        best = -np.inf
+        for _ in range(4):
+            proposals = sampler.propose(64)
+            values = landscape.evaluate(proposals)
+            best = max(best, float(values[:, 0].max()))
+            sampler.observe(proposals, values)
+        assert best <= attainable + 1e-12
+        # The task has to be able to separate arms, or the bound holds trivially
+        # for a sampler that emits the anchor forever.
+        assert attainable > float(landscape.evaluate(env.parent[None, :])[0, 0])
 
     def test_a_constraint_admitting_only_the_anchor_returns_the_anchor(self):
         # Every adjacency but (0, 0) forbidden, and the parent is all zeros, so

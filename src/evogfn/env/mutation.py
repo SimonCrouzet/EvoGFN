@@ -198,6 +198,28 @@ class MutationEnvironment(SequenceEnvironment):
         """Index of the action that terminates a trajectory."""
         return self.n_mutation_actions
 
+    @property
+    def constrains_intermediates(self) -> bool:
+        """Whether the adjacency rule is enforced at every state, not just the end.
+
+        The third of the decisions a variant of this graph may change, alongside
+        `_substitution_mask` and `_may_stop`, and the one that cannot be read off
+        either of them cheaply. It exists because a *caller* -- a projection, an
+        enumeration, an audit -- has to know which set it is targeting before it
+        starts, and probing the masks cannot tell it: a mask only ever reports
+        the rows and columns the states it was handed happen to touch, so an
+        environment that constrains nothing and one whose anchor is far from
+        every forbidden pair look identical from the outside.
+
+        Returns:
+            ``True`` when a transition matrix is set, since this class masks it
+            at every step. A subclass that defers the rule to the terminal must
+            say so here as well as in its masks; leaving this ``True`` would let
+            a caller narrow itself to a subset of what that subclass can build,
+            and the loss would look like a search failure rather than a bug.
+        """
+        return self._transitions is not None
+
     def reanchored(self, parent: Tokens) -> Self:
         """Return the same environment anchored at a new parent.
 
@@ -429,13 +451,22 @@ class MutationEnvironment(SequenceEnvironment):
         return mask
 
     def is_reachable(self, sequences: Tokens) -> npt.NDArray[np.bool_]:
-        """Report which sequences this environment can actually construct.
+        """Report which sequences clear the budget and the endpoint constraint.
 
         A sequence outside the mutation budget, or infeasible under the
         transition constraint, is not in the space the policy is defined over.
         Scoring one is meaningless rather than merely inaccurate, so callers
         that accept sequences from elsewhere -- a replay buffer, a genetic
         algorithm, an assay -- should check first.
+
+        **This is a necessary condition and not a sufficient one.** Where
+        intermediates are constrained it admits designs that are feasible where
+        they stand and that no trajectory can build, because every ordering of
+        their substitutions passes through a forbidden state. A caller deciding
+        what belongs to the search space -- rather than merely filtering out what
+        obviously does not -- wants
+        [is_constructible][evogfn.env.mutation.MutationEnvironment.is_constructible],
+        which adds the ordering condition and costs the same.
 
         Args:
             sequences: An ``(n, length)`` array of token indices.
@@ -450,6 +481,87 @@ class MutationEnvironment(SequenceEnvironment):
         permitted = self._transitions > 0
         feasible = np.all(permitted[array[:, :-1], array[:, 1:]], axis=1)
         return np.asarray(within_budget & feasible, dtype=np.bool_)
+
+    def is_constructible(self, sequences: Tokens) -> npt.NDArray[np.bool_]:
+        """Report which sequences some trajectory can actually build.
+
+        The condition
+        [is_reachable][evogfn.env.mutation.MutationEnvironment.is_reachable]
+        checks -- inside the budget, feasible at the endpoint -- is necessary and
+        **not sufficient**. Mutations are applied one at a time, so a design is
+        constructible only when some ordering of its substitutions keeps every
+        intermediate feasible too, and a design can satisfy the transition rule
+        perfectly while every order of writing it down passes through a state the
+        masks refuse. Anything that decides membership of this environment's
+        search space by endpoint feasibility alone is targeting a strictly larger
+        set than the one the policy is defined over, and a method allowed to
+        leave the construction graph is not being compared to methods confined to
+        it.
+
+        Why a local test is exact
+        -------------------------
+
+        The obvious test -- search the orderings -- is factorial in the number of
+        substitutions. It is not needed, because the constraint decomposes:
+
+        1. Every intermediate is *fully* feasible, not merely feasible at the
+           adjacency just written. The anchor is feasible, and a substitution
+           disturbs only the two pairs it sits between, which is exactly what
+           `_substitution_mask` checks. Feasibility of a whole state is therefore
+           the conjunction over its adjacent pairs.
+        2. An adjacent pair ``(i, i + 1)`` changes value only when one of its two
+           positions is substituted, so the value combinations it passes through
+           are decided entirely by which of the two comes first. Three of them
+           are fixed regardless of the order: both at the anchor, which is
+           feasible, and both at the destination, which is feasible by
+           assumption. Only the mixed combination depends on the ordering.
+        3. So each pair imposes at most one condition, and only when *both* its
+           positions are substituted: the mixed state reached by doing the left
+           one first, or the one reached by doing the right one first, must be
+           permitted. A pair with an unsubstituted position imposes nothing --
+           its mixed state is the destination or the anchor.
+        4. Those conditions are orderings of adjacent positions, so the graph
+           they constrain is a path. Any orientation of a path is acyclic, hence
+           has a topological order, and no condition couples two different pairs.
+           Satisfying every pair separately therefore yields a genuine global
+           ordering, and each maximal run of consecutive substituted positions
+           can be constructed to completion before the next one is begun.
+
+        The same argument read the other way is the run decomposition: two
+        maximal runs are separated by at least one position that never changes,
+        so no adjacent pair straddles them and no run constrains another.
+
+        Args:
+            sequences: An ``(n, length)`` array of token indices.
+
+        Returns:
+            An ``(n,)`` boolean array. Where the environment does not constrain
+            intermediates this is `is_reachable` unchanged, because then every
+            ordering is legal and the two sets coincide.
+
+        Note:
+            This answers whether a trajectory can *reach* a design, which is
+            what a search space is. Under ``allow_stop_before_max`` it is also
+            whether the design can be a terminal state; without it, a reachable
+            design short of the budget is a state the policy passes through
+            rather than one it can emit.
+        """
+        array = np.asarray(sequences)
+        reachable = self.is_reachable(array)
+        transitions = self._transitions
+        if (
+            transitions is None or not self.constrains_intermediates or self._length < 2  # noqa: PLR2004 - a pair needs two
+        ):
+            return reachable
+
+        permitted = transitions > 0
+        substituted = array != self._parent[None, :]
+        # The only pairs that can constrain an ordering, per step 3 above.
+        coupled = substituted[:, :-1] & substituted[:, 1:]
+        left_first = permitted[array[:, :-1], self._parent[None, 1:]]
+        right_first = permitted[self._parent[None, :-1], array[:, 1:]]
+        orderable = ~coupled | left_first | right_first
+        return np.asarray(reachable & orderable.all(axis=1), dtype=np.bool_)
 
     def _revertible(self, sequences: Tokens) -> npt.NDArray[np.bool_]:
         """Which mutated positions have the reversion as a genuine parent state.
@@ -632,6 +744,15 @@ class MutationEnvironment(SequenceEnvironment):
         Ehrlich toy with a transition matrix and a budget of two mutations, the
         Hamming ball holds 277 sequences, 26 of them feasible, and 18 reachable:
         eight feasible designs the policy can never emit.
+
+        Filtering it through
+        [is_constructible][evogfn.env.mutation.MutationEnvironment.is_constructible]
+        *is* equivalent under ``allow_stop_before_max``, and that predicate is
+        local and costs nothing, so anything asking whether a design it already
+        holds is in the search space should ask there rather than enumerate. This
+        method remains the definition, and the one that stays affordable on an
+        instance too large to enumerate is the one that has to be checked against
+        it.
 
         Terminality is read from the mask rather than from the mutation count, so
         the result also respects ``allow_stop_before_max``: where stopping early
@@ -864,6 +985,19 @@ class TerminalFeasibilityEnvironment(MutationEnvironment):
     identical graph, and the flag that selects it is a no-op on an unconstrained
     landscape rather than a silent second effect.
     """
+
+    @property
+    def constrains_intermediates(self) -> bool:
+        """Never: the rule is deferred to the terminal.
+
+        Returns:
+            ``False``, whether or not a transition matrix is set. This is the
+            declaration that makes
+            [is_constructible][evogfn.env.mutation.MutationEnvironment.is_constructible]
+            collapse onto `is_reachable` here, which is the whole content of this
+            class: no ordering is refused, so no ordering has to be found.
+        """
+        return False
 
     def _substitution_mask(
         self, state: State, capacity_left: npt.NDArray[np.bool_]
