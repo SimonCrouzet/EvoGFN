@@ -68,3 +68,6 @@ Thumbs.db
 !.vscode/extensions.json
 results/
 logs/
+
+# Agent worktrees, created and removed per task.
+.claude/worktrees/

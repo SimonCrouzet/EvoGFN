@@ -11,6 +11,24 @@ is enough. With a few hundred observations in a space of 10^14, the members are
 unconstrained almost everywhere and diverge freely off the observed manifold --
 which is exactly the signal wanted.
 
+Bootstrapping is opt-in, and it is a different estimator
+--------------------------------------------------------
+
+``bootstrap`` draws each member's training set with replacement from the
+measurements, so the spread between members reflects which *data* they saw and
+not only which initialisation they started from. That is the frequentist reading
+of an ensemble, and it is what an arm claiming its ensemble is calibrated needs.
+
+It is off by default, and deliberately so: turning it on changes what the spread
+*means*, so an arm that acquired it silently would be ranked on an uncertainty
+estimate different from the one every arm it is tabled against was ranked on, and
+nothing in the numbers would say which. An arm asks for it by name.
+
+The term is ALDE's, describing the configuration they took to the bench --
+one-hot encodings, a five-member DNN ensemble with bootstrapping, and Thompson
+sampling. Resampling with replacement is the conventional reading of that word
+rather than a mechanism they spell out, and it is the reading implemented here.
+
 One-hot rather than learned embeddings
 --------------------------------------
 
@@ -50,7 +68,11 @@ class DeepEnsemble(Surrogate):
         n_layers: Hidden layers per member.
         epochs: Training passes per fit.
         learning_rate: Optimiser rate.
-        seed: Seeds initialisation and batch order.
+        bootstrap: Draw each member's training set with replacement, making the
+            spread a resampling estimate rather than an initialisation one. Off
+            by default; see the module docstring for why it is not a free
+            improvement to be switched on everywhere.
+        seed: Seeds initialisation, batch order and the resampling.
         device: Where to train.
 
     Raises:
@@ -67,6 +89,7 @@ class DeepEnsemble(Surrogate):
         n_layers: int = 2,
         epochs: int = 200,
         learning_rate: float = 1e-3,
+        bootstrap: bool = False,
         seed: int = 0,
         device: torch.device | str = "cpu",
     ) -> None:
@@ -86,6 +109,7 @@ class DeepEnsemble(Surrogate):
         self._length = sequence_length
         self._epochs = epochs
         self._learning_rate = learning_rate
+        self._bootstrap = bootstrap
         self._device = device
         self._fitted = False
         # Standardisation statistics, set at fit time. Fitness scales differ by
@@ -124,11 +148,24 @@ class DeepEnsemble(Surrogate):
         """Number of networks in the ensemble."""
         return len(self._members)
 
+    @property
+    def bootstraps(self) -> bool:
+        """Whether members are fitted to resamples rather than to the same data.
+
+        Worth reading off the object rather than off the arm's name: two
+        campaigns whose ensembles differ here are ranked on uncertainties that
+        mean different things, and the predictions alone cannot say which.
+        """
+        return self._bootstrap
+
     def fit(self, sequences: Tokens, values: Fitness) -> None:
         """Train every member on the accumulated measurements.
 
         Each member sees the data in a different order, which together with a
-        different initialisation is what makes them disagree off-manifold.
+        different initialisation is what makes them disagree off-manifold. Under
+        ``bootstrap`` each also sees a *different sample* of it, drawn with
+        replacement, so the disagreement carries information about the data as
+        well as about the initialisation.
 
         Args:
             sequences: An ``(n, length)`` array of measured sequences.
@@ -161,11 +198,21 @@ class DeepEnsemble(Surrogate):
 
         for index, member in enumerate(self._members):
             generator = torch.Generator().manual_seed(self._seed + index)
+            # Drawn once per fit rather than per epoch: a member's bootstrap
+            # sample is *its training set*, and redrawing it every pass would
+            # make every member converge on the same full dataset and give back
+            # exactly the spread the resampling is there to create.
+            member_x, member_y = x, y
+            if self._bootstrap:
+                picks = torch.randint(0, x.shape[0], (x.shape[0],), generator=generator).to(
+                    self._device
+                )
+                member_x, member_y = x[picks], y[picks]
             optimiser = torch.optim.Adam(member.parameters(), lr=self._learning_rate)
             for _ in range(self._epochs):
-                order = torch.randperm(x.shape[0], generator=generator).to(self._device)
-                predicted = member(x[order])
-                loss = nn.functional.mse_loss(predicted, y[order])
+                order = torch.randperm(member_x.shape[0], generator=generator).to(self._device)
+                predicted = member(member_x[order])
+                loss = nn.functional.mse_loss(predicted, member_y[order])
                 optimiser.zero_grad()
                 loss.backward()  # type: ignore[no-untyped-call]
                 optimiser.step()

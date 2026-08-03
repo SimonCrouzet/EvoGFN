@@ -132,6 +132,63 @@ class TestFitting:
             surrogate.fit(np.zeros((8, 9), dtype=np.int32), np.zeros((8, 1)))
 
 
+class TestBootstrapping:
+    """The estimator ALDE's bench configuration names, and why it is opt-in.
+
+    Resampling changes what the spread *means*: without it the members disagree
+    because they started from different weights, with it they disagree because
+    they saw different data. Two arms ranked on uncertainty either side of this
+    flag are not ranked on the same quantity, and nothing in a results table
+    would say which -- which is why the flag defaults off and why an arm has to
+    name it.
+    """
+
+    def fitted(self, *, bootstrap):
+        rng = np.random.default_rng(12)
+        train = rng.integers(0, 5, size=(96, 4))
+        surrogate = DeepEnsemble(
+            n_tokens=5, sequence_length=4, epochs=60, bootstrap=bootstrap, seed=0
+        )
+        surrogate.fit(train, additive_landscape(train))
+        return surrogate, train
+
+    def test_it_is_off_by_default(self):
+        # Every arm in the suite that does not name it must keep the estimator
+        # it was measured under, or existing results stop being comparable to
+        # new ones without any of them moving.
+        assert not DeepEnsemble(n_tokens=5, sequence_length=4).bootstraps
+
+    def test_the_flag_is_readable_off_the_object(self):
+        # An arm's name cannot carry this, so a test that wants to check the
+        # configuration a campaign actually ran under has to be able to ask.
+        assert DeepEnsemble(n_tokens=5, sequence_length=4, bootstrap=True).bootstraps
+
+    def test_resampling_changes_the_fit(self):
+        # If the members still saw the same data, the flag would be a no-op that
+        # an arm could claim without getting.
+        plain, train = self.fitted(bootstrap=False)
+        resampled, _ = self.fitted(bootstrap=True)
+        assert not np.allclose(plain.predict(train)[0], resampled.predict(train)[0])
+
+    def test_it_still_disagrees_where_it_has_no_data(self):
+        # The property acquisition depends on has to survive the change of
+        # estimator, or the arm that asks for it is ranking on noise. Trained
+        # only on tokens 0 and 1, as in the non-bootstrapped case above.
+        rng = np.random.default_rng(13)
+        train = rng.integers(0, 2, size=(200, 4))
+        surrogate = DeepEnsemble(n_tokens=5, sequence_length=4, epochs=150, bootstrap=True, seed=0)
+        surrogate.fit(train, additive_landscape(train))
+
+        _, near = surrogate.predict(rng.integers(0, 2, size=(200, 4)))
+        _, far = surrogate.predict(np.full((200, 4), 4))
+        assert far.mean() > near.mean()
+
+    def test_it_is_still_reproducible_from_the_seed(self):
+        first, train = self.fitted(bootstrap=True)
+        second, _ = self.fitted(bootstrap=True)
+        assert np.allclose(first.predict(train)[0], second.predict(train)[0])
+
+
 class TestReproducibility:
     def test_the_same_seed_gives_the_same_predictions(self):
         rng = np.random.default_rng(8)
