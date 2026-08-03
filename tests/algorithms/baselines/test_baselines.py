@@ -13,10 +13,13 @@ from evogfn.algorithms.base import Sampler
 from evogfn.algorithms.baselines import (
     CMAES,
     MLDE,
+    AdaLead,
     GeneticAlgorithm,
     HillClimbing,
     RandomMutagenesis,
+    Recombination,
     SimulatedAnnealing,
+    SingleStepWalk,
 )
 from evogfn.core import Alphabet
 from evogfn.env.mutation import MutationEnvironment
@@ -269,6 +272,9 @@ OBSERVERS = [
     lambda env: SimulatedAnnealing(env, seed=0),
     lambda env: CMAES(env, seed=0),
     lambda env: MLDE(env, training_size=16, seed=0),
+    lambda env: SingleStepWalk(env, seed=0),
+    lambda env: Recombination(env, rounds=4, batch_size=16, seed=0),
+    lambda env: AdaLead(env, seed=0),
 ]
 
 

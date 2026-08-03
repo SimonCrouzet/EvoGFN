@@ -1880,11 +1880,11 @@ def _as_multi_objective(task: Task) -> MultiObjectiveTask:
 #: ==================  =============================  ========
 #:
 #: What is missing against the sibling list is missing on purpose: ``hill-climb``,
-#: ``annealing``, ``cmaes``, ``mlde`` and ``genetic-feasible`` are single-objective
-#: pipelines whose published forms say nothing about a front, and
-#: ``genetic+distinct`` is a plate rule this module's `_campaign` does not yet
-#: expose. Adding any of them is a decision about what the multi-objective table
-#: claims, not a gap to be filled quietly.
+#: ``cmaes``, ``mlde``, ``alde``, ``adalead``, ``single-step``, ``recomb`` and
+#: ``genetic-feasible`` are single-objective pipelines whose published forms say
+#: nothing about a front, and ``genetic+distinct`` is a plate rule this module's
+#: `_campaign` does not yet expose. Adding any of them is a decision about what
+#: the multi-objective table claims, not a gap to be filled quietly.
 ARMS: dict[str, MultiObjectiveMethodology] = {
     "random": classical_arm(_random),
     "nsga2": nsga2_arm(),

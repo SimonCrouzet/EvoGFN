@@ -21,11 +21,19 @@ the same point against the loop in isolation lives in
 screening a 2048-candidate pool down to a plate -- a step in none of their
 papers -- and the reference arm the headline table paired against was one of
 those hybrids. The published pipeline is now the default and every addition is a
-named rung, so `test_every_published_arm_is_bare` and
+named rung, so `test_every_bare_published_arm_is_bare` and
 `test_each_arm_gets_the_pool_its_paper_specifies` pin the thing that was wrong
 rather than the code that fixed it: an arm silently
 regaining a surrogate, or regaining the one global pool size, is a table of
 hybrids again and nothing in the numbers would say so.
+
+**Bare is not the same as published.** One arm's *own paper* specifies a
+surrogate and a named acquisition rule, so testing it for bareness would enforce
+the opposite of the principle. `BARE` and `MODELLED` split the two cases, and
+`test_alde_carries_exactly_the_configuration_its_paper_names` is where the
+components that would otherwise go missing are written down -- an arm still
+called ALDE with a greedy rule and an initialisation-variance ensemble is MLDE
+with extra rounds.
 """
 
 from types import SimpleNamespace
@@ -33,6 +41,8 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
+from evogfn.acquisition.rules import Thompson
+from evogfn.algorithms.baselines import SimulatedAnnealing
 from evogfn.algorithms.gflownet.flow_objectives import SubTrajectoryBalance
 from evogfn.algorithms.gflownet.objectives import TrajectoryBalance
 from evogfn.algorithms.inner_loop import ProxyOptimising
@@ -51,6 +61,8 @@ from evogfn.env.mutation import MutationEnvironment, TerminalFeasibilityEnvironm
 from evogfn.landscapes.ehrlich import EhrlichLandscape
 from evogfn.loop.campaign import ReanchorableSampler
 from evogfn.models import AnchorConditionedPolicy, SequencePolicy
+from evogfn.surrogate.ensemble import DEFAULT_MEMBERS as PUBLISHED_ENSEMBLE_MEMBERS
+from evogfn.surrogate.ensemble import DeepEnsemble
 
 #: Rounds and plate for the end-to-end runs. Small, because the property under
 #: test is accounting rather than optimisation, and two rounds is the fewest that
@@ -74,9 +86,11 @@ TOY = {
 #: What each arm's own paper says its candidate pool is. `PLATE_POOL` resolves
 #: against the task, so the expectation is written the same way: a genetic
 #: algorithm's population is its evaluation batch (Stanton et al.), CMA-ES's is
-#: lambda, hill climbing and annealing propose a neighbourhood of the current
-#: point, and MLDE's is an exhaustive library it screens on purpose (Wittmann et
-#: al.). Three orders of magnitude apart, which is why one global value could
+#: lambda, hill climbing proposes a neighbourhood of the current point, the two
+#: site-saturation walks propose exactly the designs their protocol names,
+#: AdaLead's screening happens inside its own rollout so what it hands up is
+#: already a plate, and MLDE's and ALDE's is an exhaustive library they screen on
+#: purpose. Three orders of magnitude apart, which is why one global value could
 #: not have been right for more than one of them.
 #:
 #: The screened ablations keep the library pool because a screen with nothing to
@@ -85,21 +99,46 @@ TOY = {
 EXPECTED_POOL = {
     "random": BATCH,
     "hill-climb": BATCH,
+    "single-step": BATCH,
+    "recomb": BATCH,
     "genetic": BATCH,
     "genetic-feasible": BATCH,
-    "annealing": BATCH,
     "cmaes": BATCH,
+    "adalead": BATCH,
     "mlde": DEFAULT_POOL,
+    "alde": DEFAULT_POOL,
     "random+screen": DEFAULT_POOL,
     "genetic+screen": DEFAULT_POOL,
     "genetic+search": DEFAULT_POOL,
     "genetic+distinct": BATCH,
 }
 
-#: The arms that are pipelines as published -- bare, and the comparison the
-#: paper is actually about. Everything else in `BASELINES` is a decomposition
-#: row and says so in its own name.
-PUBLISHED = ("random", "hill-climb", "genetic", "genetic-feasible", "annealing", "cmaes", "mlde")
+#: Published pipelines whose own papers describe no model at all, so a surrogate
+#: in front of them would be a step nobody proposed. This is most of the table,
+#: and the comparison the paper is actually about.
+BARE = (
+    "random",
+    "hill-climb",
+    "single-step",
+    "recomb",
+    "genetic",
+    "genetic-feasible",
+    "cmaes",
+    "adalead",
+    "mlde",
+)
+
+#: Published pipelines that *contain* a model, so bareness is the wrong test for
+#: them. ``mlde`` and ``adalead`` are in `BARE` above and not here on purpose:
+#: both fit their own regressor internally, so the campaign still hands them
+#: nothing. ``alde`` is the one arm whose published configuration is a campaign
+#: surrogate read through a stated acquisition rule, which is why it is the only
+#: name here.
+MODELLED = ("alde",)
+
+#: Every arm that is somebody's published pipeline rather than a decomposition
+#: row. Read by the ladder test, which pins the rest of `BASELINES` as rungs.
+PUBLISHED = (*BARE, *MODELLED)
 
 
 def toy_task(*, reanchor: bool = True) -> Task:
@@ -173,7 +212,9 @@ class TestTheLadderIsWhatItSaysItIs:
 
     def test_the_arms_are_exactly_the_published_pipelines_plus_the_ladder(self):
         # Pinned as a set so that adding an arm is a deliberate edit here. An arm
-        # that appears without a rung to stand on is a hybrid back in the table.
+        # that appears without a rung to stand on is a hybrid back in the table,
+        # and an arm that disappears is a comparator a reviewer expects going
+        # missing without anyone deciding it should.
         assert set(BASELINES) == set(PUBLISHED) | {
             "random+screen",
             "genetic+screen",
@@ -181,8 +222,8 @@ class TestTheLadderIsWhatItSaysItIs:
             "genetic+distinct",
         }
 
-    @pytest.mark.parametrize("name", PUBLISHED)
-    def test_every_published_arm_is_bare(self, name):
+    @pytest.mark.parametrize("name", BARE)
+    def test_every_bare_published_arm_is_bare(self, name):
         # The failure: a deep ensemble in front of a baseline whose paper has
         # none, which made the headline comparison a comparison between hybrids
         # and made the reference arm one of them.
@@ -193,6 +234,61 @@ class TestTheLadderIsWhatItSaysItIs:
             f"{name} was allowed to optimise against a model its paper has none of"
         )
         assert not campaign._distinct_batch
+
+    @pytest.mark.parametrize("name", BARE)
+    def test_no_bare_arm_ranks_on_anything_but_the_prediction(self, name):
+        # Greedy is the shipped rule and the axis `alde` is defined by moving.
+        # An arm that acquired an uncertainty-reading rule silently would be
+        # ranked on a different quantity from the arms beside it, and the only
+        # trace would be in results nobody could attribute.
+        assert settings(BASELINES[name])["acquisition"] == "Greedy"
+        assert settings(BASELINES[name])["bootstrap"] is False
+
+    def test_alde_carries_exactly_the_configuration_its_paper_names(self):
+        # Its own authors' bench configuration: one-hot encodings, a five-member
+        # DNN ensemble with bootstrapping, and Thompson sampling. Every one of
+        # those is a claim about the arm that the arm's name cannot carry, and
+        # three of them are settings any refactor could quietly drop -- at which
+        # point the row would still be called ALDE and would be MLDE with extra
+        # rounds.
+        campaign = BASELINES["alde"](toy_task(), 0)
+        recorded = settings(BASELINES["alde"])
+        ensemble = campaign._surrogate
+
+        assert isinstance(campaign._acquisition, Thompson)
+        assert recorded["acquisition"] == "Thompson"
+        assert isinstance(ensemble, DeepEnsemble)
+        assert ensemble.bootstraps
+        assert ensemble.n_members == PUBLISHED_ENSEMBLE_MEMBERS
+        # The library screen, not a plate: ALDE ranks a combinatorial library and
+        # measures its top, which at a pool of one plate would rank BATCH
+        # candidates into BATCH wells and be no screen at all.
+        assert campaign._pool_size == DEFAULT_POOL
+
+    def test_the_screened_ablation_and_alde_are_not_the_same_arm(self):
+        # They share a surrogate over a library pool, and a reader who took them
+        # for one another would read a published pipeline as a decomposition row
+        # or the reverse. Three things separate them, and this is where that is
+        # written down.
+        ablation = BASELINES["genetic+screen"](toy_task(), 0)
+        alde = BASELINES["alde"](toy_task(), 0)
+        ensemble = ablation._surrogate
+
+        assert type(ablation._acquisition) is not type(alde._acquisition)
+        assert isinstance(ensemble, DeepEnsemble)
+        assert not ensemble.bootstraps
+        assert (
+            settings(BASELINES["genetic+screen"])["sampler"]
+            != settings(BASELINES["alde"])["sampler"]
+        )
+
+    def test_annealing_is_not_an_arm(self):
+        # It appears in no baseline table of either lineage this suite is
+        # measured against, so it is nobody's expected comparator and must not
+        # occupy a results row. The sampler itself is still importable, which is
+        # the whole of the difference between "removed" and "not run".
+        assert "annealing" not in BASELINES
+        assert SimulatedAnnealing is not None
 
     def test_the_ladder_adds_exactly_one_thing_per_rung(self):
         # Read down the column: nothing, then a screen, then search against the

@@ -23,14 +23,28 @@ it is being handed.
 The baselines are the pipelines their papers describe
 -----------------------------------------------------
 
-Which means bare: no deep ensemble screening their pool, no proxy to optimise
-against, and a candidate pool their own paper would recognise. Handing a
-classical arm all three makes it a hybrid nobody published, and pairing a
-headline number against such an arm compares against something that does not
-exist in the literature. A published simulated annealing has no surrogate; nor
-does published CMA-ES, nor a feasibility-rejecting genetic algorithm, nor MLDE --
-which fits its own kernel ensemble and would otherwise be handed a second model
-to fit predictions to.
+Which means: exactly the components their own papers name, and nothing else.
+For most of them that is bare -- no deep ensemble screening their pool, no proxy
+to optimise against, and a candidate pool their own paper would recognise.
+Handing a classical arm all three makes it a hybrid nobody published, and
+pairing a headline number against such an arm compares against something that
+does not exist in the literature. Published CMA-ES has no surrogate; nor does a
+feasibility-rejecting genetic algorithm, nor either site-saturation walk, nor
+MLDE -- which fits its own kernel ensemble and would otherwise be handed a
+second model to fit predictions to. AdaLead fits its own too.
+
+`alde` is the exception that proves the rule, and it is bare in the same sense.
+Its published configuration *is* a five-member bootstrapped ensemble read through
+Thompson sampling over an exhaustively screened library, so the surrogate and the
+acquisition rule are constitutive of that pipeline rather than extras handed to
+it -- the same standing the proxy has for a GFlowNet. Taking them away would
+leave an arm called ALDE that is not ALDE.
+
+What is *not* here is as much a decision as what is. Simulated annealing appears
+in no baseline table of either lineage this suite is measured against, so it is
+not an arm; [SimulatedAnnealing][evogfn.algorithms.baselines.annealing.SimulatedAnnealing]
+remains available to anyone who wants the comparison, and a registry entry is
+what would put it in a results row.
 
 What replaces the silent default is a named ladder on one representative
 baseline, `BASELINES`. It answers the attribution question a reviewer will ask
@@ -41,14 +55,17 @@ Pool size is part of the method
 -------------------------------
 
 A genetic algorithm's pool is its population, and Stanton et al. run population
-== evaluation batch == one plate. CMA-ES's is ``lambda``. Hill climbing and
-annealing propose a neighbourhood of the current point. MLDE's is an exhaustive
-library, deliberately, and it excludes measured designs internally because that
-is its protocol. These differ by three orders of magnitude, so one global
-``max(2048, batch * 4)`` could not be right for more than one of them -- and a
-pool that large always holds enough distinct candidates to fill a plate no
-matter how badly a method has converged, which hides convergence rather than
-reporting it.
+== evaluation batch == one plate. CMA-ES's is ``lambda``. Hill climbing proposes
+a neighbourhood of the current point, and the site-saturation walks propose
+exactly the designs their protocol names. MLDE's is an exhaustive library,
+deliberately, and it excludes measured designs internally because that is its
+protocol; ALDE's is the same library, for the same reason. AdaLead's is one
+plate, because its screening happens *inside* its own rollout and what it hands
+up is already the batch it would assay. These differ by three orders of
+magnitude, so one global ``max(2048, batch * 4)`` could not be right for more
+than one of them -- and a pool that large always holds enough distinct candidates
+to fill a plate no matter how badly a method has converged, which hides
+convergence rather than reporting it.
 
 A consequence worth naming: `genetic-feasible`'s rejection burden and the
 threshold at which it declares rejection sampling impractical both key on how
@@ -95,10 +112,14 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
-from evogfn.acquisition.rules import Greedy, TopK
+from evogfn.acquisition.rules import Greedy, Thompson, TopK
 from evogfn.algorithms.base import Sampler
-from evogfn.algorithms.baselines.annealing import SimulatedAnnealing
+from evogfn.algorithms.baselines.adalead import AdaLead
 from evogfn.algorithms.baselines.cmaes import CMAES
+from evogfn.algorithms.baselines.directed_evolution import (
+    replicated_recombination,
+    replicated_walk,
+)
 from evogfn.algorithms.baselines.genetic import GeneticAlgorithm
 from evogfn.algorithms.baselines.mlde import MLDE
 from evogfn.algorithms.baselines.mutagenesis import HillClimbing, RandomMutagenesis
@@ -117,12 +138,32 @@ from evogfn.surrogate.proxy import ProxyLandscape
 if TYPE_CHECKING:
     import numpy.typing as npt
 
+    from evogfn.acquisition.base import Acquisition
     from evogfn.algorithms.gflownet.objectives import GFlowNetObjective
+    from evogfn.benchmark.protocol import Protocol
     from evogfn.benchmark.tasks import Task
     from evogfn.core.types import Fitness, Tokens
 
 #: A methodology turns a task and a seed into a runnable campaign.
 Methodology = Callable[["Task", int], Campaign]
+
+#: How a classical arm's sampler is built: from the environment it searches, the
+#: seed it runs at, and the protocol it runs under.
+#:
+#: The protocol is there for the one thing an environment cannot say. A published
+#: DE protocol has a design count fixed by the *library* -- so many sites, so many
+#: substitutions each -- which bears no relation to the plates a campaign offers,
+#: and an arm that has to lay its designs out across those plates cannot do so
+#: without knowing how many there are. Most builders ignore it, and say so by
+#: naming the parameter as unused rather than by omitting it: one signature keeps
+#: `classical` a single factory, and a second one would be a second place for the
+#: surrogate and pool rules to drift.
+ClassicalBuilder = Callable[["MutationEnvironment", int, "Protocol"], Sampler]
+
+#: How an arm's acquisition rule is built from the campaign's seed. Seeded rather
+#: than shared, because [Thompson][evogfn.acquisition.rules.Thompson] draws, and
+#: an unseeded draw would make a campaign irreproducible from its own seed.
+AcquisitionBuilder = Callable[[int], "Acquisition"]
 
 #: A resolved arm setting, in the types a JSON record round-trips unchanged.
 #: Anything richer -- an objective instance, a sampler class -- is recorded by
@@ -273,7 +314,11 @@ def _anchor_seed(seed: int, generation: int) -> int:
 
 
 def _parts(
-    task: Task, seed: int, *, terminal_feasibility: bool = False
+    task: Task,
+    seed: int,
+    *,
+    terminal_feasibility: bool = False,
+    bootstrap: bool = False,
 ) -> tuple[object, MutationEnvironment, DeepEnsemble]:
     """Everything a campaign needs that is not the method itself.
 
@@ -296,9 +341,18 @@ def _parts(
             search spaces*: an arm that acquired this silently would not be
             comparable to the arm it is tabled against, and nothing in the
             numbers would say so.
+        bootstrap: Fit each ensemble member to a resample of the measurements
+            rather than to all of them. Off by default and reachable only from an
+            arm that names it, on the same reasoning: it changes what the spread
+            *means*, so two arms ranked on uncertainty either side of this flag
+            are not ranked on the same quantity.
 
     Returns:
-        The landscape, the environment and an unfitted surrogate.
+        The landscape, the environment and an unfitted surrogate. The ensemble
+        takes [DeepEnsemble][evogfn.surrogate.ensemble.DeepEnsemble]'s own
+        default width, which is the five members Jain et al. use and the five
+        ALDE's bench configuration names -- so the arm that requires exactly five
+        inherits it here rather than restating it and risking the two drifting.
     """
     landscape = task.landscape()
     build_env = TerminalFeasibilityEnvironment if terminal_feasibility else MutationEnvironment
@@ -312,6 +366,7 @@ def _parts(
         n_tokens=landscape.alphabet.size,
         sequence_length=landscape.sequence_length,
         epochs=150,
+        bootstrap=bootstrap,
         seed=seed,
     )
     return landscape, env, surrogate
@@ -337,6 +392,7 @@ def _campaign(  # noqa: PLR0913 - a campaign is defined by its protocol
     *,
     pool_size: int = DEFAULT_POOL,
     distinct_batch: bool = False,
+    acquisition: Acquisition | None = None,
 ) -> Campaign:
     """Assemble a campaign under the task's protocol, anchored where it says.
 
@@ -361,6 +417,13 @@ def _campaign(  # noqa: PLR0913 - a campaign is defined by its protocol
             proposals. The plate rule is a method property in exactly the way
             the pool is, and the arm that sets it exists to measure what the
             other rule costs.
+        acquisition: How predictions and uncertainty become one score, or
+            ``None`` for [Greedy][evogfn.acquisition.rules.Greedy]. Greedy is the
+            right default rather than merely the conventional one: every other
+            arm here either has no surrogate at all or -- like MLDE -- publishes
+            a protocol that ranks on the prediction and nothing else. An arm
+            whose own paper names a different rule states it, which is exactly
+            the axis the MLDE/ALDE comparison turns on.
 
     Returns:
         The campaign, which refuses at construction if the task asks to
@@ -370,7 +433,7 @@ def _campaign(  # noqa: PLR0913 - a campaign is defined by its protocol
         landscape=landscape,  # type: ignore[arg-type]
         sampler=build(env),
         surrogate=surrogate,
-        acquisition=Greedy(),
+        acquisition=acquisition or Greedy(),
         selector=TopK(),
         rounds=task.protocol.rounds,
         batch_size=task.protocol.batch_size,
@@ -542,28 +605,40 @@ class _RebuiltOnMove(Sampler):
         return f"_RebuiltOnMove({self._inner!r}, anchors={len(self._built)})"
 
 
-def classical(
-    build: Callable[[MutationEnvironment, int], Sampler],
+def classical(  # noqa: PLR0913 - each argument names one published component
+    build: ClassicalBuilder,
     *,
     surrogate: bool = False,
     proxy_access: bool = False,
     pool_size: int = PLATE_POOL,
     distinct_batch: bool = False,
+    acquisition: AcquisitionBuilder | None = None,
+    bootstrap: bool = False,
 ) -> Methodology:
     """A classical baseline, as published or with a named piece added.
 
-    The defaults are the published pipeline: no surrogate, no proxy, and a pool
-    the size of the plate. Defaulting the other way would put a deep ensemble in
-    front of every classical baseline in the suite -- a step in none of their
-    papers -- and make the headline table a comparison between hybrids nobody
-    proposed. So anything beyond the published pipeline is something a caller
-    has to ask for by name, and every arm that asks says so in its own name.
+    The defaults are the bare pipeline: no surrogate, no proxy, greedy ranking,
+    an ensemble whose spread comes from initialisation alone, and a pool the size
+    of the plate. Defaulting the other way would put a deep ensemble in front of
+    every classical baseline in the suite -- a step in none of their papers --
+    and make the headline table a comparison between hybrids nobody proposed.
+
+    So every argument below is something a caller has to ask for by name. Two
+    quite different kinds of caller do: an *ablation*, which adds a rung to a
+    published pipeline and says so in its arm name, and a *published pipeline
+    that contains the component already*, which asks for it because its own paper
+    does. The arguments cannot tell those apart, and nothing here tries to --
+    which is which is recorded in the arm's parameters and asserted in the
+    registry below, where the claim can be read against the source.
 
     Args:
-        build: Makes the sampler from an environment and a seed.
-        surrogate: Whether a surrogate screens the proposal pool. This is the
-            ``+screen`` rung: the model filters what gets measured and the search
-            itself stays blind.
+        build: Makes the sampler from an environment, a seed and the protocol it
+            will run under. See `ClassicalBuilder` for why the protocol is in
+            that signature even though most builders ignore it.
+        surrogate: Whether a surrogate screens the proposal pool. For an
+            ablation this is the ``+screen`` rung -- the model filters what gets
+            measured and the search itself stays blind. For ``alde`` it is the
+            method.
         proxy_access: Whether the sampler may also *optimise* against the
             surrogate, as the GFlowNet does. This is the ``+search`` rung, and it
             is what separates "the surrogate won" from "the constructive sampler
@@ -573,6 +648,14 @@ def classical(
             screened arm needs more than a plate or there is nothing to screen.
         distinct_batch: Fill the plate with distinct designs rather than with
             proposals.
+        acquisition: Builds the rule that turns predictions and uncertainty into
+            one score, from the campaign's seed. ``None`` is greedy ranking.
+            Exposed because "greedy versus a rule that reads the uncertainty" is
+            the axis separating the two published active-learning protocols this
+            suite runs, and an axis a caller cannot set is an axis nobody can
+            measure.
+        bootstrap: Fit each ensemble member to a resample of the measurements.
+            Inert without ``surrogate``, since there is then no ensemble to fit.
 
     Returns:
         A methodology, carrying the settings above so that a record written by
@@ -581,7 +664,7 @@ def classical(
     """
 
     def methodology(task: Task, seed: int) -> Campaign:
-        landscape, env, ensemble = _parts(task, seed)
+        landscape, env, ensemble = _parts(task, seed, bootstrap=bootstrap)
         # One proxy for the whole campaign, closed over rather than rebuilt: it
         # wraps the surrogate instance the campaign refits in place, and a fresh
         # one per anchor would still see the same model but would make that
@@ -596,7 +679,7 @@ def classical(
 
         def make(anchored: MutationEnvironment) -> Sampler:
             """Build the baseline against whichever anchor the campaign is at."""
-            sampler = build(anchored, _anchor_seed(seed, next(generation)))
+            sampler = build(anchored, _anchor_seed(seed, next(generation)), task.protocol)
             return sampler if proxy is None else ProxyOptimising(sampler, proxy=proxy)
 
         return _campaign(
@@ -607,6 +690,7 @@ def classical(
             ensemble if surrogate else None,
             pool_size=pool_size,
             distinct_batch=distinct_batch,
+            acquisition=None if acquisition is None else acquisition(seed),
         )
 
     return Arm(
@@ -627,6 +711,12 @@ def classical(
             # Resolving it here would need a task this arm has not been handed.
             "pool_size": pool_size,
             "distinct_batch": distinct_batch,
+            # By name rather than by instance, and resolved from an arbitrary
+            # seed: a record is read back long after the object is gone, and what
+            # a reader needs from it is which *rule* ranked the pool, not which
+            # draw it made.
+            "acquisition": "Greedy" if acquisition is None else type(acquisition(0)).__name__,
+            "bootstrap": bootstrap,
         },
     )
 
@@ -843,27 +933,34 @@ def genetic_gflownet(
     )
 
 
-def _random(env: MutationEnvironment, seed: int) -> Sampler:
+def _random(env: MutationEnvironment, seed: int, _protocol: Protocol) -> Sampler:
     return RandomMutagenesis(env, seed=seed)
 
 
-def _hill_climb(env: MutationEnvironment, seed: int) -> Sampler:
+def _hill_climb(env: MutationEnvironment, seed: int, _protocol: Protocol) -> Sampler:
+    """Random single-substitution neighbours of the incumbent, with restarts.
+
+    The *other* thing the field calls directed evolution: HDBO's greedy
+    incumbent search, which draws a random substitution anywhere in the sequence
+    and keeps no record of which positions it has already changed. Kept clearly
+    apart from
+    [SingleStepWalk][evogfn.algorithms.baselines.directed_evolution.SingleStepWalk],
+    which saturates a site before committing to it and then never returns to it.
+    Collapsing the two would leave the suite with one arm where two different
+    published comparators are expected.
+    """
     return HillClimbing(env, seed=seed)
 
 
-def _genetic(env: MutationEnvironment, seed: int) -> Sampler:
+def _genetic(env: MutationEnvironment, seed: int, _protocol: Protocol) -> Sampler:
     return GeneticAlgorithm(env, seed=seed)
 
 
-def _annealing(env: MutationEnvironment, seed: int) -> Sampler:
-    return SimulatedAnnealing(env, seed=seed)
-
-
-def _cmaes(env: MutationEnvironment, seed: int) -> Sampler:
+def _cmaes(env: MutationEnvironment, seed: int, _protocol: Protocol) -> Sampler:
     return CMAES(env, seed=seed)
 
 
-def _mlde(env: MutationEnvironment, seed: int) -> Sampler:
+def _mlde(env: MutationEnvironment, seed: int, _protocol: Protocol) -> Sampler:
     """Machine-learning-directed evolution, the method protein engineers run.
 
     The most important baseline here after the genetic algorithm: it is what
@@ -873,7 +970,49 @@ def _mlde(env: MutationEnvironment, seed: int) -> Sampler:
     return MLDE(env, seed=seed)
 
 
-def _feasible_genetic(env: MutationEnvironment, seed: int) -> Sampler:
+def _single_step(env: MutationEnvironment, seed: int, protocol: Protocol) -> Sampler:
+    """Traditional directed evolution, to ALDE's specification.
+
+    The comparator every "MLDE beats DE" claim in the wet-lab literature is
+    measured against, and the half of the two lineages' shared intersection this
+    suite would otherwise be missing.
+
+    One walk costs a fraction of a plate, so the arm runs as many walks
+    concurrently as the plate holds, each at its own site order. The plate is
+    what it reads from the protocol; the walk itself needs nothing from it, since
+    a walk advances one site per set of results and the mutation budget decides
+    how far down its order it can get.
+    """
+    return replicated_walk(env, batch_size=protocol.batch_size, seed=seed)
+
+
+def _recomb(env: MutationEnvironment, seed: int, protocol: Protocol) -> Sampler:
+    """Li et al.'s recombination arm: saturate every site, then combine winners.
+
+    Reads the whole protocol, not just the plate. The arm's design count is fixed
+    by how many sites it saturates, which their own budget formula states as a
+    free parameter -- so how many sites it can afford, how to lay the saturations
+    out so a plate is left for the recombinant, and how many replicates the
+    campaign can carry are all questions only the campaign's shape can answer.
+    """
+    return replicated_recombination(
+        env, rounds=protocol.rounds, batch_size=protocol.batch_size, seed=seed
+    )
+
+
+def _adalead(env: MutationEnvironment, seed: int, _protocol: Protocol) -> Sampler:
+    """FLEXS' recommended benchmark algorithm, at the paper's own rates.
+
+    It carries its own surrogate, which is the whole difference from `_genetic`:
+    the rollout keeps a mutant only where the model scores it at or above the
+    sequence it came from, so the search is screened at every step rather than
+    only at the plate. Given no campaign surrogate for that reason -- a second
+    model filtering its output would make the arm a hybrid.
+    """
+    return AdaLead(env, seed=seed)
+
+
+def _feasible_genetic(env: MutationEnvironment, seed: int, _protocol: Protocol) -> Sampler:
     """A genetic algorithm that rejection-samples until its offspring are legal.
 
     The control for the feasibility claim. Where masking is free, rejection
@@ -892,12 +1031,35 @@ def _feasible_genetic(env: MutationEnvironment, seed: int) -> Sampler:
 #: The classical baselines, each as its own paper published it. Directed
 #: evolution *is* a genetic algorithm, so these are the incumbents rather than
 #: strawmen to be cleared -- and an incumbent is a whole pipeline, which is what
-#: a lab chooses between. Every arm here is bare: no surrogate, no proxy, and a
-#: pool the method's own paper would recognise.
+#: a lab chooses between. Every arm here carries exactly the components its own
+#: source names, and a pool that source would recognise.
+#:
+#: The set is drawn from the two baseline tables this work is read against, and
+#: the two overlap in only two places -- a random floor and a greedy incumbent
+#: search -- so most rows answer to one lineage or the other:
+#:
+#: =====================  ===================================================
+#: arm                    what expects it
+#: =====================  ===================================================
+#: ``random``             both; the near-universal floor
+#: ``hill-climb``         the in-silico lineage's greedy incumbent search
+#: ``single-step``        the wet-lab lineage's DE walk, and the other half
+#:                        of the intersection
+#: ``recomb``             the wet-lab lineage's independent-site DE variant
+#: ``mlde``               the supervised protein-engineering reference
+#: ``alde``               its active-learning successor, on this suite's own
+#:                        landscapes and budget shape
+#: ``genetic``            the Ehrlich lineage's only baseline, and the arm the
+#:                        GA criterion says must be beaten or conceded
+#: ``adalead``            the sequence-design lineage's default model-guided
+#:                        comparator
+#: ``cmaes``              the continuous relaxation the in-silico lineage runs
+#: ``genetic-feasible``   ours; the control for the feasibility claim
+#: =====================  ===================================================
 #:
 #: The four ``genetic+`` arms are a **ladder on one representative baseline**
-#: rather than a silent default on all nine. Each rung adds exactly one thing to
-#: the rung above it, so the table reads as a decomposition:
+#: rather than a silent default on all of them. Each rung adds exactly one thing
+#: to the rung above it, so the table reads as a decomposition:
 #:
 #: ===================  =====================================================
 #: arm                  what it adds
@@ -910,19 +1072,46 @@ def _feasible_genetic(env: MutationEnvironment, seed: int) -> Sampler:
 #:
 #: ``random+screen`` is the same first rung on the floor, which is what says
 #: whether a screen helps at all or only helps a method that was already
-#: searching. A silent deep ensemble on all nine arms would answer none of
-#: these questions and would make every one of them a hybrid.
+#: searching. A silent deep ensemble on every arm would answer none of these
+#: questions and would make every one of them a hybrid.
+#:
+#: Note what ``genetic+screen`` and ``alde`` are *not*: the same arm. They share
+#: a surrogate over a library pool and differ in the sampler, the acquisition
+#: rule and the ensemble's estimator -- and only one of them is a pipeline
+#: somebody published.
 BASELINES: dict[str, Methodology] = {
     "random": classical(_random),
     "hill-climb": classical(_hill_climb),
+    # Site saturation, one site at a time, fixing as it goes. Bare and
+    # plate-pooled: the walk proposes exactly the designs its protocol names, so
+    # there is nothing for a screen to screen and no pool to widen.
+    "single-step": classical(_single_step),
+    "recomb": classical(_recomb),
     "genetic": classical(_genetic),
     "genetic-feasible": classical(_feasible_genetic),
-    "annealing": classical(_annealing),
     "cmaes": classical(_cmaes),
+    # AdaLead's model is inside its own rollout, so the campaign hands it none
+    # and its pool is one plate: what it proposes has already been screened and
+    # ranked by the arm itself.
+    "adalead": classical(_adalead),
     # MLDE's pool is its library and it excludes measured designs internally --
     # its published protocol, not a favour from the harness. Shrinking it to a
     # plate would leave an arm called MLDE that is not MLDE.
     "mlde": classical(_mlde, pool_size=DEFAULT_POOL),
+    # ALDE: the same library screen, and then the three things its own authors
+    # name as what it adds over MLDE -- rounds, an uncertainty-bearing surrogate,
+    # and a non-greedy rule to read that uncertainty with. Their bench
+    # configuration is one-hot encodings, a five-member DNN ensemble with
+    # bootstrapping, and Thompson sampling; the encoding and the width are
+    # `DeepEnsemble`'s own, the other two are named here. Rounds come free from
+    # the campaign, which is what a campaign is.
+    "alde": classical(
+        _random,
+        surrogate=True,
+        bootstrap=True,
+        acquisition=lambda seed: Thompson(seed=seed),
+        pool_size=DEFAULT_POOL,
+    ),
     # Ablations. Each keeps the library pool because a screen with nothing to
     # screen is not a screen: at a pool of one plate the model would rank 96
     # candidates into 96 wells and change nothing.
