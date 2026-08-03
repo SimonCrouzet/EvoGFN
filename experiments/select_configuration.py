@@ -57,8 +57,14 @@ def stage_a_methods() -> dict[str, object]:
     return {**OBJECTIVES, **flow_objectives()}
 
 
-def run_stage(
-    name: str, methods: dict[str, object], store: ResultStore, *, report: bool, seeds: int
+def run_stage(  # noqa: PLR0913 - a stage is named, scoped, and told what to run
+    name: str,
+    methods: dict[str, object],
+    store: ResultStore,
+    *,
+    report: bool,
+    seeds: int,
+    runnable: range | None = None,
 ) -> None:
     """Run one stage's arms on the diagnostic landscape.
 
@@ -67,11 +73,16 @@ def run_stage(
         methods: The arms this process is running.
         store: Where campaigns are written.
         report: Read without running.
+        runnable: Which seeds this process runs. A slice rather than a count,
+            because sharding by arm alone leaves the slowest arm running its
+            hundred seeds inside one process while every other core idles --
+            and a stage cannot finish faster than its slowest single arm.
         seeds: How many seeds to run. Taken from the caller rather than read
             from `SELECTION_SEEDS` here, so that `--seeds` governs what actually
             runs and not merely the completeness check.
     """
-    tier = Tier(name, (objective_task(),), tuple(range(seeds)), Purpose.SELECTION)
+    runnable = range(seeds) if runnable is None else runnable
+    tier = Tier(name, (objective_task(),), tuple(runnable), Purpose.SELECTION)
     if not report:
         ran = run_tier(tier, methods, store, report=_flush)  # type: ignore[arg-type]
         _flush(f"{name}: ran {ran} campaigns")
@@ -106,6 +117,17 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--report", action="store_true", help="Read the store without running.")
     parser.add_argument("--results", default="results", help="Where results live.")
     parser.add_argument("--seeds", type=int, default=SELECTION_SEEDS, help="Seeds per arm.")
+    parser.add_argument(
+        "--seed-from",
+        type=int,
+        default=0,
+        help="First seed this process runs. Sharding by arm alone leaves the "
+        "slowest arm on one core while the rest of the machine idles; a seed "
+        "slice lets several processes share one arm. The completeness check "
+        "still reads `--seeds`, so a shard that finishes its slice stops "
+        "rather than choosing on a fraction of the evidence.",
+    )
+    parser.add_argument("--seed-to", type=int, default=None, help="One past the last seed.")
     parser.add_argument(
         "--only",
         action="append",
@@ -202,6 +224,7 @@ def _stage_a(
             store,
             report=args.report or args.print_winner,
             seeds=args.seeds,
+            runnable=range(args.seed_from, args.seed_to or args.seeds),
         )
 
     stored = held(store, objectives)
@@ -232,7 +255,14 @@ def _stage_b(
         shard = _shard(exponents, wanted, "B")  # type: ignore[arg-type]
         if shard is None:
             return 2
-        run_stage("select-beta", shard, store, report=args.report, seeds=args.seeds)
+        run_stage(
+            "select-beta",
+            shard,
+            store,
+            report=args.report,
+            seeds=args.seeds,
+            runnable=range(args.seed_from, args.seed_to or args.seeds),
+        )
     stored = held(store, exponents)  # type: ignore[arg-type]
     if [n for n in exponents if len(stored.get(n, {})) < args.seeds]:
         _flush("stage B shard done; not every exponent is complete yet")
@@ -260,7 +290,14 @@ def _stage_c(
         shard = _shard(arms, wanted, "C")  # type: ignore[arg-type]
         if shard is None:
             return 2
-        run_stage("select-steps", shard, store, report=args.report, seeds=args.seeds)
+        run_stage(
+            "select-steps",
+            shard,
+            store,
+            report=args.report,
+            seeds=args.seeds,
+            runnable=range(args.seed_from, args.seed_to or args.seeds),
+        )
     stored = held(store, arms)  # type: ignore[arg-type]
     if [n for n in arms if len(stored.get(n, {})) < args.seeds]:
         _flush("stage C shard done; not every step count is complete yet")
