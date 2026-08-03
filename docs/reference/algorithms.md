@@ -34,6 +34,10 @@ to be cleared.
 
 ::: evogfn.algorithms.baselines.genetic
 
+::: evogfn.algorithms.baselines.directed_evolution
+
+::: evogfn.algorithms.baselines.adalead
+
 ::: evogfn.algorithms.baselines.annealing
 
 ::: evogfn.algorithms.baselines.cmaes

@@ -186,13 +186,45 @@ surrogate or starting point than another.
 | Arm | What it is |
 |---|---|
 | `random` | the floor: mutate at random inside the budget |
-| `hill-climb` | neighbours of the incumbent, restarting after a patience window |
+| `hill-climb` | neighbours of the incumbent, restarting after a patience window — HDBO's greedy incumbent search, *not* the wet-lab DE walk |
+| `single-step` | traditional directed evolution to ALDE's specification: saturate one site, fix its best residue, never revisit it |
+| `recomb` | Li et al.'s other DE arm: saturate every site independently on one background, then combine the winners |
 | `genetic` | the Ehrlich paper's own algorithm, at its own rates — the reference every arm is paired against |
 | `genetic-feasible` | a GA that rejection-samples until its offspring are legal — the feasibility control |
-| `annealing`, `cmaes` | simulated annealing and CMA-ES, as published |
+| `cmaes` | CMA-ES over a continuous relaxation, as published |
+| `adalead` | FLEXS' recommended benchmark algorithm — evolutionary search whose rollout screens every candidate against its own surrogate |
 | `mlde` | machine-learning-directed evolution — what protein engineers actually run, at almost exactly this budget |
+| `alde` | its active-learning successor, at the configuration its authors took to the bench: one-hot encodings, a five-member bootstrapped ensemble, Thompson sampling |
 | `gfn-tb`, `gfn-contrastive`, `genetic-gfn` | GFlowNet objectives |
 | `gfn-db`, `gfn-subtb`, `gfn-fldb` | the detailed-balance family, which needs a policy with a flow head |
+
+Two arms in that list are the two different things the field calls directed evolution, and keeping
+them apart is deliberate: `hill-climb` draws a random single substitution anywhere in the sequence
+and keeps no record of which positions it has changed, while `single-step` exhausts one position
+before committing to it and then never touches it again. Every "MLDE beats DE" claim in the wet-lab
+literature is measured against the second.
+
+**Simulated annealing is not an arm.** It appears in no baseline table of either lineage this suite
+is read against, so it is nobody's expected comparator. `SimulatedAnnealing` remains importable from
+`evogfn.algorithms.baselines` for anyone who wants the comparison; what was removed is the results
+row, not the sampler.
+
+**The two DE arms cost a fraction of the campaign, and the surplus goes to replicates.** Li et al.
+cost `single-step` at `19 x n_site + 1` samples and `recomb` at `19 x n_site + 2` — one plate's worth
+against a campaign of four. Neither source says what to do with the difference, because in their
+setting there is none: they report each DE arm at its own fixed cost. **Our choice** is to run
+several copies of the protocol at different site orders and pool them into each plate, and to start
+another when they all finish with budget left. That is the same protocol run again rather than a new
+mechanism — Li et al.'s own simulation enumerates every site order and every starting variant — and
+it is the direction a forced deviation in a baseline should run: filling the plate with repeats
+instead would handicap the arm by most of its budget.
+
+Two consequences for reading such a row. It is a **best over site orders at the campaign's budget**,
+where the sources report an **average over site orders at one walk's cost**; a comparison against a
+published DE number has to say which it is. And on a library whose sites are the whole sequence —
+`gb1-anchor` — the replicates cannot differ, the pooled request deduplicates back to the protocol's
+own cost, and the surplus shows up as duplicate wells. That is the honest answer there rather than a
+gap. Read the DE arms' real spend off `requested`, not off the oracle-call column.
 
 **GFlowNets train against a proxy, never the oracle.** Each builds a `ProxyLandscape` over the
 same surrogate instance the campaign refits, so training costs proxy evaluations and never

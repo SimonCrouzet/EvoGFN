@@ -5,8 +5,9 @@ Networks (GFlowNets). It generates batches of sequence variants that are diverse
 high-fitness at the same time, rather than many near-copies of a single best hit.
 
 Use it to run directed-evolution campaigns against a fitness landscape — your own, or one of
-the built-in benchmarks — and to compare a GFlowNet against classical baselines (genetic
-algorithm, hill climbing, simulated annealing, CMA-ES, MLDE) on equal terms.
+the built-in benchmarks — and to compare a GFlowNet against classical baselines (traditional
+directed evolution, MLDE, ALDE, AdaLead, a genetic algorithm, hill climbing, CMA-ES) on equal
+terms.
 
 !!! warning "Early development, and no results on this site"
     The API is not stable, and the benchmark suite is mid-change: the search radius, the

@@ -5,8 +5,8 @@
 time, rather than many near-copies of a single best hit.
 
 Use it to run directed-evolution campaigns against a fitness landscape — your own, or one of the
-built-in benchmarks — and to compare a GFlowNet against classical baselines (genetic algorithm, hill
-climbing, simulated annealing, CMA-ES, MLDE) on equal terms.
+built-in benchmarks — and to compare a GFlowNet against classical baselines (traditional directed
+evolution, MLDE, ALDE, AdaLead, a genetic algorithm, hill climbing, CMA-ES) on equal terms.
 
 > [!NOTE]
 > Early development. The API is not stable, and the benchmark suite is mid-change: the search radius,
@@ -156,7 +156,7 @@ multithreaded reduction sums in completion order, and both scripts refuse to run
 code 3) for that reason.
 
 ```bash
-for arm in random genetic hill-climb annealing cmaes mlde; do
+for arm in random genetic hill-climb single-step recomb mlde alde adalead cmaes; do
   uv run python experiments/run_suite.py --tier main --method "$arm" &
 done
 wait
@@ -236,7 +236,8 @@ printed as a p-value.
 Ehrlich) with noise/budget/cache wrappers; a mutation environment with feasibility masking;
 GFlowNet training objectives (trajectory balance, contrastive balance, detailed balance,
 sub-trajectory balance, forward-looking DB, Genetic-GFN); classical baselines (random, hill climbing,
-genetic, simulated annealing, CMA-ES, MLDE, NSGA-II); deep-ensemble surrogate and acquisition rules;
+traditional directed evolution as `single-step` and `recomb`, MLDE, ALDE, AdaLead, genetic,
+simulated annealing, CMA-ES, NSGA-II); deep-ensemble surrogate and acquisition rules;
 the design–build–test–learn campaign loop with re-anchoring; multi-objective rewards and Pareto
 metrics; the benchmark harness, result store and selection phase; a Hydra CLI (`evogfn train`,
 `evogfn campaign`).
