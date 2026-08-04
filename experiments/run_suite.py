@@ -73,7 +73,14 @@ from typing import TYPE_CHECKING
 import numpy as np
 
 from evogfn.benchmark.determinism import configure_determinism, is_deterministic
-from evogfn.benchmark.methods import BASELINES, OBJECTIVES, flow_objectives, sensitivity
+from evogfn.benchmark.methods import (
+    BASELINES,
+    OBJECTIVES,
+    anchor_arms,
+    flow_objectives,
+    sensitivity,
+    variant_arms,
+)
 from evogfn.benchmark.selection import _build_objective
 from evogfn.benchmark.statistics import compare, seeds_needed
 from evogfn.benchmark.store import ResultStore
@@ -81,16 +88,19 @@ from evogfn.benchmark.suite import (
     MAIN,
     Purpose,
     Tier,
+    anchor_study,
     budget_gradient,
+    constraint_density_tier,
     objective_task,
     records_to_metric,
     replication,
     rounds_curve,
+    run_anchor_study,
     run_tier,
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping, Sequence
+    from collections.abc import Callable, Mapping, Sequence
 
     from evogfn.benchmark.attainable import AttainableOptimum
     from evogfn.benchmark.store import RunRecord
@@ -115,6 +125,45 @@ VACUOUS_SHARE = 0.5
 #: How close to the attainable optimum an arm has to sit to count as on it.
 SOLVED_TOLERANCE = 1e-9
 
+#: Named once because four places have to agree on it, and one of them is the
+#: branch in `main` that sends this tier to `run_anchor_study` instead of
+#: `run_tier`. A typo there does not raise -- it silently falls through to the
+#: generic path, which runs the *cross* of the study's tasks and arms, and the
+#: cross contains a campaign the study exists to keep out. A misspelling would
+#: therefore cost compute and produce a duplicate row rather than an error.
+ANCHOR_TIER = "anchor-study"
+
+#: What the constructibility sweep runs. Spelled out rather than left to the
+#: default, for two reasons that both silently produce a readable-looking table
+#: full of nothing:
+#:
+#: * `genetic-gfn` is the only arm here that **breeds**, and
+#:   ``unconstructible_fraction`` counts offspring a teacher proposed and the
+#:   policy could not construct. Every other arm stores a share of nothing, which
+#:   is zero -- so without this arm the curve the tier exists to draw is a column
+#:   of zeros, and a column of zeros reads as "no gap" rather than "nothing bred".
+#:   The default path would drop it: once a selection has been recorded,
+#:   `methods_for` replaces *every* untuned GFlowNet arm with the chosen one.
+#: * The other three are what the share has to be read against: `gfn-tb` masks at
+#:   every step and so can only reach the constructible part in the first place,
+#:   `genetic-feasible` pays for the same set by rejection, and `genetic` ignores
+#:   the constraint entirely and is the reference the tier pairs against.
+DENSITY_ARMS = ("genetic", "genetic-feasible", "gfn-tb", "genetic-gfn")
+
+
+def _anchor_tasks() -> tuple[Task, ...]:
+    """The distinct tasks of the anchor study, in cell order.
+
+    Derived from the cells rather than listed here: the study names both of its
+    tasks, and a second list would be right only until one of them moved.
+    Deduplicated because both tasks carry more than one cell, and a tier
+    repeating a task runs it twice.
+    """
+    seen: dict[str, Task] = {}
+    for cell in anchor_study():
+        seen.setdefault(cell.task.name, cell.task)
+    return tuple(seen.values())
+
 
 def tiers(main_seeds: int, diagnostic_seeds: int) -> list[Tier]:
     """The suite, split by what each tier is for.
@@ -135,6 +184,28 @@ def tiers(main_seeds: int, diagnostic_seeds: int) -> list[Tier]:
         # protocol, same seeds, so a setting's effect and an objective's are
         # measured against each other rather than across two configurations.
         Tier("sensitivity", (objective_task(),), tuple(range(diagnostic_seeds)), Purpose.SELECTION),
+        # `Purpose.SELECTION` and not `DIAGNOSTIC`, which is the distinction the
+        # enum exists to hold: both rungs are off by default, so what this tier
+        # returns *chooses the configuration the method ships* rather than
+        # describing how methods behave. Called a diagnostic it would be eligible
+        # to appear in the results table as a mechanism finding while the same
+        # campaigns had already fixed our own configuration -- a choice reported
+        # as a result. On the diagnostic landscape, which no headline task uses,
+        # so the choice is not being made on the test set.
+        #
+        # On `objective_task` for the reason the ladder is built by lookup: its
+        # base rung is the stored `(objectives, gfn-tb)` cell, so the control the
+        # three rungs are read against is the identical configuration by
+        # construction, and its first `diagnostic_seeds` are already banked.
+        #
+        # Seeded like the headline rather than like a diagnostic, because the
+        # rung that justifies the fourth arm is an *interaction*:
+        # `+terminal+anchor` earns its compute only by beating what the two
+        # single rungs predict by addition, and a difference of differences
+        # carries about twice the standard error of either main effect. At the
+        # diagnostic count that rung comes back inconclusive against its own
+        # prediction, which is the one answer this tier must not return.
+        Tier("variant-ladder", (objective_task(),), tuple(range(main_seeds)), Purpose.SELECTION),
         Tier("main", cheap, tuple(range(main_seeds)), Purpose.BENCHMARK),
         # Same arms and the same seed count as `main`, because it answers a
         # question about `main`: every constrained comparison there rests on one
@@ -147,6 +218,36 @@ def tiers(main_seeds: int, diagnostic_seeds: int) -> list[Tier]:
         Tier(
             "budget-gradient", budget_gradient(), tuple(range(diagnostic_seeds)), Purpose.DIAGNOSTIC
         ),
+        # The sweep's own helper rather than a `Tier` assembled here: its task
+        # list and its standing are properties of the sweep, and restating either
+        # at the call site is how the two drift apart.
+        #
+        # Diagnostic seeds, and the same count as `objectives`, because the rung
+        # at `DIAGNOSTIC_DENSITY` **is** the objectives task -- so at this count
+        # the point the curve passes through is the very measurement the
+        # objectives table reports, rather than a second estimate of it at a
+        # different power that a reader would have to reconcile. Nothing here
+        # argues for more: four of the five rungs declare no attainable optimum,
+        # so their regret column is empty by design and this family is read on
+        # the constructibility columns. Seeds bought for a regret comparison
+        # would be buying precision on a column the tier does not report.
+        constraint_density_tier(range(diagnostic_seeds)),
+        # A tier for *reporting* that is **run** cell by cell -- see the branch
+        # in `main`. The cross of these two tasks with `anchor_arms` is six
+        # campaigns and the study is five: the cross also contains a rebuilt
+        # policy on the task whose anchor never moves, and since nothing is ever
+        # rebuilt there that is the carried arm's campaign under a second name.
+        # Running the cross would pay twice for one experiment and put two
+        # identically-valued rows in the table with nothing to say which was
+        # which. Listing the tier anyway is what gets the study into `--report`,
+        # where the unrun cell simply has no records and prints no row.
+        #
+        # Diagnostic seeds, and again the objectives count, because the
+        # moved-and-carried cell *is* `(objectives, gfn-tb)`: it is the control
+        # the other four cells are read against, and it is already stored at this
+        # count. Asking for another would leave the control powered differently
+        # from everything it controls.
+        Tier(ANCHOR_TIER, _anchor_tasks(), tuple(range(diagnostic_seeds)), Purpose.DIAGNOSTIC),
         # Last, and on fewer seeds for the same reason: a campaign at L=256
         # costs far more than one on the cheap tiers.
         Tier("large-space", expensive, tuple(range(LARGE_SPACE_SEEDS)), Purpose.BENCHMARK),
@@ -213,11 +314,33 @@ def methods_for(tier: Tier) -> dict[str, object]:
     no training objective to vary; the sensitivity tier is narrower still, being
     one GFlowNet with one setting moved at a time; everything else compares
     methods.
+
+    Every branch here sits **above** the selection lookup, and that placement is
+    the point rather than an accident of ordering. Below it, a recorded selection
+    replaces the untuned GFlowNet arms wholesale -- which is right for a tier
+    comparing methods and fatal for the three tiers whose arms are defined
+    *relative to* an untuned one. A ladder whose base rung had been swapped for
+    the selected arm would report every rung as the difference between two
+    configurations, and an anchor study missing `gfn-tb` would lose the cell its
+    other four are read against.
     """
-    if tier.name == "objectives":
-        return {**OBJECTIVES, **flow_objectives()}
-    if tier.name == "sensitivity":
-        return dict(sensitivity())
+    fixed: dict[str, Callable[[], dict[str, object]]] = {
+        "objectives": lambda: {**OBJECTIVES, **flow_objectives()},
+        "sensitivity": lambda: dict(sensitivity()),
+        # The four-arm ladder, not the baseline set: no arm in `BASELINES` has a
+        # policy, so neither rung is even definable for one, and a table mixing
+        # them would answer "does a GFlowNet beat a GA" -- which `main` already
+        # answers -- in place of "does this rung add anything".
+        "variant-ladder": lambda: dict(variant_arms()),
+        # By name out of the shipped table rather than rebuilt, so these are the
+        # same objects, and therefore the same store cells, that every other tier
+        # runs. A name that stopped existing raises here instead of quietly
+        # sweeping a smaller set.
+        "constraint-density": lambda: {name: MAIN_METHODS[name] for name in DENSITY_ARMS},
+        ANCHOR_TIER: lambda: dict(anchor_arms()),
+    }
+    if build := fixed.get(tier.name):
+        return build()
     chosen = selected_gflownet()
     if not chosen:
         return dict(MAIN_METHODS)
@@ -294,6 +417,21 @@ REFERENCES = {
     "sensitivity": "steps-300",
     # Trajectory balance, the objective the others are alternatives to.
     "objectives": "gfn-tb",
+    # The ladder's own base rung, which is what each rung is one step above.
+    # `genetic` is not in this tier at all, so without an entry here the whole
+    # paired section would be replaced by one line saying there was no reference
+    # -- three rungs run and nothing compared.
+    "variant-ladder": "gfn-tb",
+    # The policy-carrying arm, so the pair that gets printed on the re-anchored
+    # task is rebuilt-against-carried: the amortisation cell, and the only cell
+    # in this study that a paired test can reach. Against the default reference
+    # the study's own axis would never appear in a comparison, because `genetic`
+    # has no learned state and so sits on neither side of it.
+    #
+    # The other axis -- moved against fixed -- is across two *tasks*, and
+    # `report` pairs only within one. It is read off the two tables rather than
+    # tested here.
+    ANCHOR_TIER: "gfn-tb",
 }
 
 #: The Ehrlich paper's own algorithm, at its own hyperparameters. The reference
@@ -580,12 +718,49 @@ def main(argv: list[str] | None = None) -> int:
                 _flush(f"{tier.name}: no seed in [{args.seed_from}, {stop}), skipping")
                 continue
             running = Tier(tier.name, tier.tasks, mine, tier.purpose)
-            ran = run_tier(running, arms, store, report=_flush)  # type: ignore[arg-type]
+            ran = _run(running, arms, store, by_method=bool(args.method))
+            if ran is None:
+                continue
             _flush(f"{tier.name}: ran {ran} campaigns")
         _flush(report(store, tier))
     _flush(f"\ntotal {time.perf_counter() - started:.0f}s")
     _flush(store.summarise())
     return 0
+
+
+def _run(
+    running: Tier, arms: dict[str, object], store: ResultStore, *, by_method: bool
+) -> int | None:
+    """Run one tier's outstanding campaigns, however that tier is shaped.
+
+    A tier is normally the cross of its tasks with its arms, and `run_tier` runs
+    that cross. The anchor study is the exception, and is the reason this
+    function exists rather than a call: its five cells are a *subset* of the
+    cross, so running the cross would add a rebuilt policy on the task whose
+    anchor never moves -- which, since nothing is ever rebuilt there, is the
+    carried arm's campaign stored a second time under another name.
+
+    Args:
+        running: The tier, already sliced to the seeds this process owns.
+        arms: What to run, for the tiers that are a cross.
+        store: Where results go.
+        by_method: Whether the caller passed ``--method``.
+
+    Returns:
+        Campaigns run, or ``None`` where the tier was skipped and has already
+        said so.
+    """
+    if running.name != ANCHOR_TIER:
+        return run_tier(running, arms, store, report=_flush)  # type: ignore[arg-type]
+    if by_method:
+        # Refused rather than applied. The study is a list of ``(task, arm)``
+        # cells and not an arm set, so an arm filter would drop whole cells
+        # silently -- and the cells it would drop are the ones whose absence
+        # turns "carrying the policy helps" into a column with nothing paired
+        # against it. Run this tier without ``--method``.
+        _flush(f"{running.name}: runs named cells, so --method cannot select within it")
+        return None
+    return run_anchor_study(store, running.seeds, report=_flush)
 
 
 def _flush(message: str) -> None:
