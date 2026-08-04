@@ -110,6 +110,7 @@ re-run has ever confirmed.
 from __future__ import annotations
 
 import ast
+import fcntl
 import hashlib
 import json
 from dataclasses import asdict, dataclass, field, replace
@@ -643,13 +644,33 @@ class ResultStore:
         Appending per campaign rather than per run is what makes an interrupted
         suite keep everything it had finished.
 
+        The append is taken under an exclusive lock because a record is far
+        larger than the size at which the kernel makes an append atomic -- these
+        run to several kilobytes, against a limit of four -- so two processes
+        writing the same arm can interleave mid-record and leave a line that
+        parses as nothing. That failure is silent in both directions:
+        [load][evogfn.benchmark.store.ResultStore.load] skips what it cannot
+        parse, so the campaign disappears rather than being reported as damaged,
+        and the seed simply looks unrun.
+
+        Sharding a suite by task or by arm gives one writer per file and needs no
+        lock at all. Sharding by *seed* does not, and it is the natural way to
+        fill a machine when a tier has fewer tasks than cores -- so the lock is
+        here rather than in a rule about how to shard, which is a rule that
+        would be broken by whoever next needed the cores.
+
         Args:
             record: The result to store.
         """
         path = self._path(record.task, record.method)
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("a") as handle:
-            handle.write(json.dumps(asdict(record)) + "\n")
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            try:
+                handle.write(json.dumps(asdict(record)) + "\n")
+                handle.flush()
+            finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
     def dependencies(self, depends_on: Sequence[str]) -> dict[str, str]:
         """Fingerprint of the closure of some entry points.

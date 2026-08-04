@@ -9,6 +9,8 @@ answer is known by construction.
 """
 
 import json
+import multiprocessing
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -421,3 +423,51 @@ def test_bless_leaves_an_unfingerprinted_record_alone(store):
     assert reopened.bless("t", "m", modules=["pkg.leaf"]) == 0
     assert reopened.load("t", "m")[0].source == {}
     assert reopened.blessed("t", "m") == {}
+
+
+def _hammer(args):
+    """One writer process, appending oversized records to a shared arm file."""
+    root, tag, count = args
+    store = ResultStore(Path(root))
+    for seed in range(count):
+        store.append(
+            RunRecord(
+                task="race",
+                method="arm",
+                seed=seed * 100 + tag,
+                protocol="p",
+                best=1.0,
+                regret=0.0,
+                diversity=1.0,
+                feasible_fraction=1.0,
+                oracle_calls=1,
+                proposals=1,
+                # Deliberately far past the size at which the kernel makes an
+                # append atomic. A small record would pass this test whether or
+                # not the lock existed, which is how the bug reached the store
+                # in the first place.
+                top_sequences=[[i % 7 for i in range(600)] for _ in range(10)],
+            )
+        )
+    return tag
+
+
+def test_concurrent_writers_never_tear_a_record(tmp_path):
+    """Guards the failure that is silent in both directions.
+
+    Sharding a suite by seed puts several processes on one arm's file. A record
+    here runs to tens of kilobytes against a four-kilobyte atomicity limit, so
+    without a lock two appends interleave and leave a line that parses as
+    nothing -- and `load` skips what it cannot parse, so the campaign does not
+    come back damaged, it simply disappears and the seed looks unrun.
+    """
+    writers, each = 4, 15
+    with multiprocessing.Pool(writers) as pool:
+        pool.map(_hammer, [(str(tmp_path), tag, each) for tag in range(writers)])
+
+    lines = [
+        line for line in (tmp_path / "race" / "arm.jsonl").read_text().splitlines() if line.strip()
+    ]
+    for line in lines:
+        json.loads(line)  # raises if any record was torn
+    assert len(lines) == writers * each
