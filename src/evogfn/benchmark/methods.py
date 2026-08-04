@@ -1163,9 +1163,11 @@ BASELINES: dict[str, Methodology] = {
 #: practitioner would write. This one decodes exactly, which is stronger than
 #: the literature specifies, so a table containing both would be reporting our
 #: engineering under a citation to Hansen. It stays here until the comparison
-#: between the two has been made and can be described as what it is.
+#: between the two has been made and can be described as what it is. Named
+#: with the ``+`` the ablation rungs use, because it is the same kind of thing:
+#: a published pipeline plus a component we added, which is not that pipeline.
 DECODER_STUDY: dict[str, Methodology] = {
-    "cmaes-exact": classical(_cmaes_exact),
+    "cmaes+dp": classical(_cmaes_exact),
 }
 
 
