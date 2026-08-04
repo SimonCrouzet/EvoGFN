@@ -293,7 +293,7 @@ class TestFeasibility:
         # The diagnosis, kept as a test so the fix cannot be mistaken for having
         # always worked. This is the behaviour that produced -inf on 100 seeds.
         env = self.sparse_env()
-        proposals = CMAES(env, repair=False, seed=0).propose(64)
+        proposals = CMAES(env, repair="none", seed=0).propose(64)
         assert not env.is_reachable(proposals).any()
 
     def test_repairing_makes_every_design_buildable(self):
@@ -314,7 +314,7 @@ class TestFeasibility:
             transitions=transitions,
         )
 
-    def test_the_repair_does_not_collapse_onto_the_anchor(self):
+    def test_the_exact_repair_does_not_collapse_onto_the_anchor(self):
         # Emitting the parent every time would also be "buildable" and would be
         # a useless search. The projection maximises the logits over the
         # constructible set, so where that set is wide it should stay well out in
@@ -323,12 +323,43 @@ class TestFeasibility:
         # the right answer and the assertion would be pinning an escape from the
         # construction graph rather than a search of it.
         env = self.open_env()
-        proposals = CMAES(env, seed=0).propose(64)
+        proposals = CMAES(env, repair="exact", seed=0).propose(64)
         distances = (proposals != env.parent[None, :]).sum(axis=1)
         assert env.is_constructible(proposals).all()
         assert distances.mean() > env.sequence_length / 4
         # Not one design repeated: a collapsed search would also travel far.
         assert len({row.tobytes() for row in np.ascontiguousarray(proposals)}) > 1
+
+    def test_the_greedy_repair_searches_without_reaching_as_far(self):
+        # The shipped decoder, and it must clear the same collapse bar: a repair
+        # that returned the anchor would make the arm a fixed point rather than
+        # a search. It is held to a share of the *budget* rather than of the
+        # sequence length, because what greedy can spend is bounded by the
+        # budget and not by how long the sequence is.
+        env = self.open_env()
+        proposals = CMAES(env, repair="greedy", seed=0).propose(64)
+        distances = (proposals != env.parent[None, :]).sum(axis=1)
+        assert env.is_constructible(proposals).all()
+        assert distances.mean() > env.max_mutations / 2
+        assert len({row.tobytes() for row in np.ascontiguousarray(proposals)}) > 1
+
+    def test_greedy_repair_stops_short_of_what_the_exact_one_reaches(self):
+        # The characterising property, and the reason both exist. Greedy commits
+        # to the largest gain available at each step, so an early substitution
+        # can foreclose a pair a later one needed and the row ends below budget;
+        # the dynamic program solves for the whole sequence at once and cannot.
+        #
+        # Asserted as a bound rather than as a fixed gap: were the two ever to
+        # come out equal, the exact projection would be buying nothing and the
+        # extra machinery would not be worth carrying. Were greedy to come out
+        # *ahead*, one of the two is not solving the problem it claims to.
+        env = self.open_env()
+        greedy = CMAES(env, repair="greedy", seed=0).propose(64)
+        exact = CMAES(env, repair="exact", seed=0).propose(64)
+        moved = lambda rows: (rows != env.parent[None, :]).sum(axis=1).mean()  # noqa: E731
+
+        assert env.is_constructible(greedy).all()
+        assert moved(greedy) < moved(exact)
 
     def test_the_projection_costs_no_extra_proposals(self):
         # The cost of repair is wall clock, not proposals and not oracle calls.
@@ -495,11 +526,11 @@ class TestFeasibility:
             transitions=constrained_transitions(4, forbidden),
         )
         with pytest.raises(RuntimeError, match="feasible"):
-            CMAES(env, repair=False, feasible_only=True, max_attempts=3, seed=0).propose(32)
+            CMAES(env, repair="none", feasible_only=True, max_attempts=3, seed=0).propose(32)
 
     def test_the_label_marks_an_unrepaired_run(self):
         env = self.sparse_env()
-        assert CMAES(env, repair=False).name == "CMAES (unrepaired)"
+        assert CMAES(env, repair="none").name == "CMAES (unrepaired)"
 
 
 class TestValidation:

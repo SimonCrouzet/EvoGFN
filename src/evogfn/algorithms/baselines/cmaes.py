@@ -144,12 +144,26 @@ author chose rather than one convenient to us.
 from __future__ import annotations
 
 import math
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 import numpy as np
 
 from evogfn.algorithms.base import Sampler
 from evogfn.algorithms.baselines._values import single_objective
+
+#: How a decoded design that the environment cannot build is dealt with.
+#:
+#: ``"none"`` emits it anyway, which on a constrained instance means emitting
+#: nothing usable and is the published method's own behaviour. ``"greedy"``
+#: accepts substitutions by descending gain while the design stays legal --
+#: the obvious adaptation, and the reported default, so the baseline's score is
+#: what a practitioner would get. ``"exact"`` returns the highest-scoring legal
+#: design by dynamic programming, which is stronger than anything the literature
+#: specifies and is kept for measuring what an engineered decoder is worth
+#: rather than for reporting the method.
+RepairPolicy = Literal["none", "greedy", "exact"]
+
+_REPAIR_POLICIES: frozenset[str] = frozenset({"none", "greedy", "exact"})
 
 if TYPE_CHECKING:
     import numpy.typing as npt
@@ -316,6 +330,91 @@ def _transition_barrier(
             | right_first[:, :, None]
         )
     return np.where(allowed, 0.0, -np.inf)
+
+
+#: Candidate substitutions the greedy repair tries per unit of mutation budget.
+#: Each costs one batched constructibility check, so this trades decode time
+#: against how often the repair gives up below budget on a dense instance.
+_GREEDY_ATTEMPTS_PER_SUBSTITUTION = 12
+
+
+def _greedy_repair(
+    logits: npt.NDArray[np.float64],
+    parent: Tokens,
+    env: MutationEnvironment,
+    budget: int,
+) -> Tokens:
+    """Accept substitutions by descending logit gain, keeping the design legal.
+
+    The straightforward repair, and the one a practitioner reaches for: start at
+    the parent -- feasible by definition, and at zero substitutions it constrains
+    no ordering -- then take the highest-gain substitution that leaves the design
+    constructible, and repeat until the budget is spent or nothing legal is left.
+
+    It is **approximate**, and that is the point of having it. A substitution
+    taken early can foreclose a pair that a later, larger gain needed, so the
+    result can score below the best legal sequence; the exact projection beside
+    it never does. Reporting a baseline through this decoder therefore states
+    what the method achieves under an obvious adaptation rather than under an
+    engineered one, and the gap between the two decoders is the cost of that
+    obviousness rather than a property of the search distribution.
+
+    Legality is re-checked against the environment after each accepted
+    substitution rather than argued from the previous state. The condition is
+    pairwise, so a substitution can only break the pairs it touches -- but a
+    decoder that tracked that itself would be a second implementation of the
+    constraint, and the two would drift.
+
+    Args:
+        logits: An ``(n, length, vocabulary)`` array of per-position scores.
+        parent: The anchor, which every row starts from.
+        env: The environment whose graph the result must lie in.
+        budget: Substitutions allowed per row.
+
+    Returns:
+        An ``(n, length)`` array, every row constructible.
+    """
+    rows, length, size = logits.shape
+    current = np.tile(parent, (rows, 1))
+    if budget <= 0 or rows == 0:
+        return current
+
+    # Gain of each substitution against staying put. Reverting to the parent's
+    # own token is not a substitution, so it is scored at negative infinity
+    # rather than at zero, which would let a row spend budget on a change it did
+    # not make.
+    held = np.broadcast_to(parent[None, :, None], (rows, length, 1))
+    gains = logits - np.take_along_axis(logits, held, axis=2)
+    gains[:, np.arange(length), parent] = -np.inf
+    flat = gains.reshape(rows, -1)
+
+    # Only the strongest candidates are tried. Each attempt costs one batched
+    # constructibility check, so scanning the whole (length x vocabulary) list
+    # would cost thousands of them per round for substitutions no greedy rule
+    # would reach anyway -- the budget is spent long before. A row whose top
+    # candidates are all illegal ends with fewer substitutions than the budget
+    # allows, which is a real weakness of greedy repair and is left visible
+    # rather than papered over by widening the scan.
+    attempts = int(min(flat.shape[1], _GREEDY_ATTEMPTS_PER_SUBSTITUTION * budget))
+    order = np.argpartition(-flat, attempts - 1, axis=1)[:, :attempts]
+    ranked = np.argsort(-np.take_along_axis(flat, order, axis=1), axis=1)
+    order = np.take_along_axis(order, ranked, axis=1)
+
+    index = np.arange(rows)
+    spent = np.zeros(rows, dtype=np.int64)
+    for step in range(attempts):
+        live = spent < budget
+        if not live.any():
+            break
+        choice = order[:, step]
+        position, token = choice // size, choice % size
+        candidate = current.copy()
+        offered = live & np.isfinite(flat[index, choice])
+        candidate[index[offered], position[offered]] = token[offered]
+        legal = env.is_constructible(candidate) & offered
+        current[legal] = candidate[legal]
+        spent += legal
+    return current
 
 
 def _project_onto_constructible(
@@ -629,7 +728,7 @@ class CMAES(Sampler):
         env: MutationEnvironment,
         *,
         initial_sigma: float = 1.0,
-        repair: bool = True,
+        repair: RepairPolicy = "greedy",
         feasible_only: bool = False,
         max_attempts: int = 50,
         seed: int = 0,
@@ -639,9 +738,14 @@ class CMAES(Sampler):
         if initial_sigma <= 0.0:
             raise ValueError(f"initial_sigma must be positive, got {initial_sigma}")
 
+        if repair not in _REPAIR_POLICIES:
+            raise ValueError(
+                f"repair must be one of {sorted(_REPAIR_POLICIES)}, got {repair!r}; "
+                f"the decoder decides how much of this arm's result is its own"
+            )
         self._env = env
         self._repair = repair
-        self._permitted = _permitted_adjacencies(env) if repair else None
+        self._permitted = _permitted_adjacencies(env) if repair == "exact" else None
         # Which of the two search spaces the projection targets. Read from the
         # environment rather than assumed, because the two differ by exactly the
         # designs this arm used to be able to reach and the others could not.
@@ -683,8 +787,8 @@ class CMAES(Sampler):
     def name(self) -> str:
         """Short label, marking any deviation from the default configuration."""
         label = "CMAES"
-        if not self._repair:
-            label += " (unrepaired)"
+        if self._repair != "greedy":
+            label += f" ({self._repair} repair)" if self._repair != "none" else " (unrepaired)"
         if self._feasible_only:
             label += " (feasible)"
         return label
@@ -979,7 +1083,18 @@ class CMAES(Sampler):
         budget = self._env.max_mutations
         decoded = _budgeted_argmax(logits, parent, length, budget)
         self._decoded += int(decoded.shape[0])
-        if self._permitted is None:
+        if self._repair == "none":
+            return decoded
+
+        # Counted before either repair runs, and against the same test both
+        # repairs have to satisfy, so the share is comparable between the two
+        # decoders and says the same thing about the relaxation under each.
+        unbuildable = ~self._env.is_constructible(decoded)
+        self._unbuildable += int(unbuildable.sum())
+        if not unbuildable.any():
+            return decoded
+        if self._repair == "greedy":
+            decoded[unbuildable] = _greedy_repair(logits[unbuildable], parent, self._env, budget)
             return decoded
 
         # A row whose unconstrained argmax is already constructible needs no
@@ -987,12 +1102,10 @@ class CMAES(Sampler):
         # logits over the whole ball, so it maximises them over the feasible
         # part of the ball too. Only the rest are handed to the dynamic program,
         # which is what keeps a loosely constrained landscape cheap.
-        unbuildable = ~self._env.is_constructible(decoded)
-        self._unbuildable += int(unbuildable.sum())
-        if unbuildable.any():
-            decoded[unbuildable] = _project_onto_constructible(
-                logits[unbuildable], parent, self._permitted, budget, ordered=self._ordered
-            )
+        assert self._permitted is not None  # noqa: S101 - built for this policy
+        decoded[unbuildable] = _project_onto_constructible(
+            logits[unbuildable], parent, self._permitted, budget, ordered=self._ordered
+        )
         return decoded
 
     def _remember(self, sequences: Tokens, draws: npt.NDArray[np.float64]) -> None:

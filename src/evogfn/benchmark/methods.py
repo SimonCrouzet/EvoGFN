@@ -957,7 +957,35 @@ def _genetic(env: MutationEnvironment, seed: int, _protocol: Protocol) -> Sample
 
 
 def _cmaes(env: MutationEnvironment, seed: int, _protocol: Protocol) -> Sampler:
-    return CMAES(env, seed=seed)
+    """CMA-ES under the straightforward decoder, which is what gets reported.
+
+    A separable Gaussian over per-position logits cannot represent a transition
+    constraint, so on a constrained instance the raw decode is not buildable and
+    something has to repair it. Which repair is chosen is a choice *we* make on
+    the baseline's behalf, and it is not specified anywhere in the literature --
+    so the reported arm takes the obvious one: accept substitutions by
+    descending gain while the design stays legal.
+
+    The exact alternative is a dynamic program that returns the best legal
+    design outright. It scores better, and that is precisely why it is not here:
+    it is a stronger decoder than any published account of this method uses, and
+    a baseline reported through machinery of our own devising is no longer the
+    published method. It is kept beside this one, as a study rather than as a
+    baseline, so the difference between them can be measured.
+    """
+    return CMAES(env, repair="greedy", seed=seed)
+
+
+def _cmaes_exact(env: MutationEnvironment, seed: int, _protocol: Protocol) -> Sampler:
+    """CMA-ES handed an exact constrained decoder, for the study only.
+
+    Not a baseline, and it must not enter a table that reports published
+    methods. What it measures is how much of a constrained-decoding result
+    belongs to the search distribution and how much to the decoder -- a question
+    worth answering, and a different question from how the published method
+    performs.
+    """
+    return CMAES(env, repair="exact", seed=seed)
 
 
 def _mlde(env: MutationEnvironment, seed: int, _protocol: Protocol) -> Sampler:
@@ -1129,6 +1157,18 @@ BASELINES: dict[str, Methodology] = {
 
 #: GFlowNet objectives, each behind the same interface. Comparing them is a
 #: configuration change rather than a rewrite, which is the point of the seam.
+#: Decoder variants of CMA-ES, kept out of `BASELINES` on purpose.
+#:
+#: The reported arm decodes greedily because that is the adaptation a
+#: practitioner would write. This one decodes exactly, which is stronger than
+#: the literature specifies, so a table containing both would be reporting our
+#: engineering under a citation to Hansen. It stays here until the comparison
+#: between the two has been made and can be described as what it is.
+DECODER_STUDY: dict[str, Methodology] = {
+    "cmaes-exact": classical(_cmaes_exact),
+}
+
+
 OBJECTIVES: dict[str, Methodology] = {
     "gfn-tb": gflownet(TrajectoryBalance()),
     "gfn-contrastive": gflownet(ContrastiveBalance(prune_threshold=0.1)),
