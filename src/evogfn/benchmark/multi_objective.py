@@ -2166,6 +2166,12 @@ def run_multi_objective_task(
                     unconstructible_fraction=float(
                         getattr(method_sampler, "unconstructible_fraction", 0.0)
                     ),
+                    # Carries the same caveat as `bred_designs` above: read off
+                    # the ensemble's representative sampler, which understates an
+                    # arm that decoded inside several members. No arm in `ARMS`
+                    # decodes a relaxation today, so the field is zero here and
+                    # stays honest; one that did would have to sum the counters.
+                    repaired_fraction=float(getattr(method_sampler, "repaired_fraction", 0.0)),
                     cpu_seconds=cpu_seconds,
                     wall_seconds=wall_seconds,
                     # Also by attribute, and from the campaign rather than the

@@ -392,6 +392,16 @@ class RunRecord:
             ``bred_designs``: a
             share of nothing is zero, and so is a run that bred thousands and
             could construct them all.
+        repaired_fraction: For an arm that decodes a continuous relaxation, the
+            share of its designs whose raw decode the environment could not
+            construct and which therefore reached the plate only through a
+            repair. This is an *attribution* field rather than a performance
+            one: at 0.0 the search distribution is finding the constructible set
+            unaided and the repair is a formality, at 1.0 every design credited
+            to the method was chosen by the repair subject to the method's
+            preferences, and the two cases warrant different sentences about
+            whose result it is. Zero for every arm that decodes nothing, which is
+            most of them -- so it is read beside the arm's name, not alone.
         parameters: The arm's resolved configuration -- what the methodology
             closed over, one scalar per setting. Provenance only: nothing
             compares it, and no value of it can make a record stale.
@@ -448,6 +458,7 @@ class RunRecord:
     # campaign.
     bred_designs: int = 0
     unconstructible_fraction: float = 0.0
+    repaired_fraction: float = 0.0
     cpu_seconds: float = 0.0
     wall_seconds: float = 0.0
     duplicate_fraction: float = 0.0

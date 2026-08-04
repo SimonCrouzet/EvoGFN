@@ -346,6 +346,50 @@ def test_a_real_campaign_stores_what_it_cost(tmp_path):
     assert record.cpu_seconds <= record.wall_seconds + 1e-6
 
 
+def test_an_arm_that_repairs_its_decode_stores_how_often_it_had_to(tmp_path):
+    """Guards the attribution field reading zero for an arm that repairs constantly.
+
+    The number decides whose result a CMA-ES score is. Its decoder is a
+    per-position argmax over a relaxation that cannot express a transition
+    constraint, so on a constrained task the raw decode is unbuildable and a
+    projection chooses the design instead; at a repaired share near one, every
+    design credited to the method was selected by that projection subject to the
+    method's preferences, which is a different sentence from the one a reader
+    would otherwise write.
+
+    A default of zero is what makes the failure silent: an unwired field and an
+    arm whose relaxation found the constructible set unaided are the same record.
+    So this runs a real campaign on a constrained task rather than stamping a
+    record, and the only way it passes is `run_task` reading the counter off the
+    sampler the campaign finished with.
+    """
+    store = ResultStore(tmp_path)
+    task = toy_task(reanchor=True, attainable=None)
+    run_task(task, {"cmaes": BASELINES["cmaes"]}, store, [0], report=lambda _: None)
+    record = store.load(task.name, "cmaes")[0]
+
+    # Strictly above zero, not merely in range: zero is the default an unwired
+    # field returns, so a bounds check would pass on exactly the bug this is
+    # here to catch. The toy carries a transition constraint, and a separable
+    # Gaussian over per-position logits cannot represent one -- so a raw decode
+    # that satisfied it would be luck, and never satisfying it is the expected
+    # behaviour rather than a defect.
+    assert record.repaired_fraction > 0.0
+    assert record.repaired_fraction <= 1.0
+
+
+def test_an_arm_that_decodes_nothing_stores_a_zero_repaired_share(tmp_path):
+    """The other half: zero must mean "decodes no relaxation", not "unmeasured".
+
+    Read by attribute, so a sampler that carries no such counter stores a plain
+    zero and the column stays comparable. Without this the field would be read
+    as a repair rate for every arm in the table.
+    """
+    record = stored(tmp_path, toy_task(reanchor=True, attainable=None))
+
+    assert record.repaired_fraction == 0.0
+
+
 def test_a_campaign_that_reports_no_duplicates_stores_a_zero_share(tmp_path):
     """Guards the duplicate share landing as `None` or `nan` rather than absent.
 

@@ -951,6 +951,13 @@ def run_task(
                     unconstructible_fraction=float(
                         getattr(method_sampler, "unconstructible_fraction", 0.0)
                     ),
+                    # Read off the *final* sampler, which is what `campaign.sampler`
+                    # returns, and safe under re-anchoring only because the arm that
+                    # reports this carries its repair counters across a move rather
+                    # than restarting them. An arm that reset them would report its
+                    # last round here while looking like it reported the campaign --
+                    # the same silent undercount the proxy spend once had.
+                    repaired_fraction=float(getattr(method_sampler, "repaired_fraction", 0.0)),
                     # Processor time is what the arms are compared on; elapsed
                     # time is kept beside it only so a reader can see how hard
                     # the machine was contended when this ran. A suite is
