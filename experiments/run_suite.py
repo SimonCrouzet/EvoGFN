@@ -503,6 +503,22 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--seeds", type=int, default=MAIN_SEEDS, help="Seeds for main tiers.")
     parser.add_argument(
+        "--seed-from",
+        type=int,
+        default=0,
+        help="First seed this process runs. Sharding by task alone leaves a tier "
+        "with few tasks unable to fill the cores, and one arm's hundred seeds "
+        "then run serially while the rest of the machine idles. Every campaign "
+        "is seeded from its own seed rather than from process order, so a "
+        "sharded run and a serial one produce identical records.",
+    )
+    parser.add_argument(
+        "--seed-to",
+        type=int,
+        default=None,
+        help="One past the last seed this process runs. Defaults to the tier's own count.",
+    )
+    parser.add_argument(
         "--diagnostic-seeds", type=int, default=DIAGNOSTIC_SEEDS, help="Seeds for diagnostics."
     )
     parser.add_argument("--results", default="results", help="Where to store results.")
@@ -546,7 +562,17 @@ def main(argv: list[str] | None = None) -> int:
                 if not arms:
                     _flush(f"{tier.name}: no arm matched --method, skipping")
                     continue
-            ran = run_tier(tier, arms, store, report=_flush)  # type: ignore[arg-type]
+            # Sliced for running only. The report below reads the tier's full
+            # seed set, so a shard says what the store holds rather than what
+            # this process happened to be given -- a shard reporting its own
+            # slice as the tier would read as a complete tier at 33 seeds.
+            stop = len(tier.seeds) if args.seed_to is None else args.seed_to
+            mine = tier.seeds[args.seed_from : stop]
+            if not mine:
+                _flush(f"{tier.name}: no seed in [{args.seed_from}, {stop}), skipping")
+                continue
+            running = Tier(tier.name, tier.tasks, mine, tier.purpose)
+            ran = run_tier(running, arms, store, report=_flush)  # type: ignore[arg-type]
             _flush(f"{tier.name}: ran {ran} campaigns")
         _flush(report(store, tier))
     _flush(f"\ntotal {time.perf_counter() - started:.0f}s")
