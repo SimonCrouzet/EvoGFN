@@ -84,6 +84,7 @@ from evogfn.benchmark.suite import (
     budget_gradient,
     objective_task,
     records_to_metric,
+    replication,
     rounds_curve,
     run_tier,
 )
@@ -135,6 +136,13 @@ def tiers(main_seeds: int, diagnostic_seeds: int) -> list[Tier]:
         # measured against each other rather than across two configurations.
         Tier("sensitivity", (objective_task(),), tuple(range(diagnostic_seeds)), Purpose.SELECTION),
         Tier("main", cheap, tuple(range(main_seeds)), Purpose.BENCHMARK),
+        # Same arms and the same seed count as `main`, because it answers a
+        # question about `main`: every constrained comparison there rests on one
+        # draw from the generator, and a hundred seeds vary the wild type and the
+        # surrogate's initialisation without ever varying the instance. A
+        # lower-powered replicate could not distinguish "the ordering broke" from
+        # "we ran out of seeds", which is the one thing it exists to decide.
+        Tier("replication", replication(), tuple(range(main_seeds)), Purpose.BENCHMARK),
         Tier("rounds-curve", rounds_curve(), tuple(range(diagnostic_seeds)), Purpose.DIAGNOSTIC),
         Tier(
             "budget-gradient", budget_gradient(), tuple(range(diagnostic_seeds)), Purpose.DIAGNOSTIC

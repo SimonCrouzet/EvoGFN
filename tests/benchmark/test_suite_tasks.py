@@ -40,11 +40,13 @@ from evogfn.benchmark.suite import (
     CONSTRAINT_DENSITIES,
     DIAGNOSTIC_DENSITY,
     MAIN,
+    REPLICATION_SEEDS,
     anchor_study,
     budget_gradient,
     constraint_density,
     fixed_anchor_task,
     objective_task,
+    replication,
     rounds_curve,
     run_task,
 )
@@ -600,3 +602,66 @@ def test_a_methodology_that_states_no_settings_stores_an_empty_mapping(tmp_path)
     run_task(task, {"anonymous": unwrapped(BASELINES["random"])}, store, [0], report=lambda _: None)
 
     assert store.load(task.name, "anonymous")[0].parameters == {}
+
+
+def _motifs(task) -> bytes:
+    """The planted motifs, which are what distinguishes one Ehrlich draw."""
+    landscape = task.landscape()
+    assert isinstance(landscape, EhrlichLandscape)
+    return bytes(landscape.motifs.tobytes())
+
+
+class TestReplication:
+    """The replicates exist to vary one thing, so the test is that they vary one thing."""
+
+    def _headline(self, shape):
+        return next(t for t in MAIN if t.name == f"protocol-{shape}")
+
+    @pytest.mark.parametrize("shape", ["alde", "evolvepro"])
+    def test_a_replicate_differs_from_its_headline_task_only_in_the_draw(self, shape):
+        # The whole value of a replicate is that a difference in its result is a
+        # difference between instances. Any other axis drifting -- a radius, a
+        # round count, the anchor rule -- would make the comparison measure that
+        # instead, and would do so invisibly, since both tasks would still run
+        # and still report a number.
+        headline = self._headline(shape)
+        for task in replication():
+            if not task.name.startswith(f"replicate-{shape}-"):
+                continue
+            assert task.protocol.rounds == headline.protocol.rounds
+            assert task.protocol.batch_size == headline.protocol.batch_size
+            assert task.max_mutations == headline.max_mutations
+            assert task.reanchor == headline.reanchor
+
+    @pytest.mark.parametrize("shape", ["alde", "evolvepro"])
+    def test_every_replicate_draws_a_different_landscape(self, shape):
+        # Two replicates on one draw would look like independent evidence and be
+        # a repeat, which is the failure this whole tier was added to fix.
+        #
+        # Compared on the motifs rather than on the optimum: every Ehrlich
+        # instance is built so its optimum is 1.0, so an optimum-based check
+        # would pass on three copies of the same landscape.
+        drawn = {
+            _motifs(task) for task in replication() if task.name.startswith(f"replicate-{shape}-")
+        }
+        assert len(drawn) == len(REPLICATION_SEEDS)
+
+    @pytest.mark.parametrize("shape", ["alde", "evolvepro"])
+    def test_no_replicate_redraws_the_headline_instance(self, shape):
+        # Distinct seeds are necessary and not sufficient: two seeds could in
+        # principle land on the same motifs, and that replicate would be
+        # answering the question by restating it.
+        headline = _motifs(self._headline(shape))
+        for task in replication():
+            if task.name.startswith(f"replicate-{shape}-"):
+                assert _motifs(task) != headline
+
+    def test_no_replicate_reuses_the_shared_instance(self):
+        # Seed 2 is the draw both headline tasks share; a replicate on it would
+        # answer the question by restating it.
+        assert 2 not in REPLICATION_SEEDS
+
+    def test_the_replicates_are_named_apart_from_the_headline_tasks(self):
+        # Store keys are file names, so a collision would append a replicate's
+        # campaigns to the headline task's own record file.
+        assert {t.name for t in replication()}.isdisjoint({t.name for t in MAIN})

@@ -405,6 +405,78 @@ DIAGNOSTIC_ATTAINABLE = Attainable.exactly(
 )
 
 
+#: Landscape draws the protocol comparison is replicated across.
+#:
+#: The two protocol tasks deliberately share one instance so that only campaign
+#: shape differs between them, which is what makes that comparison clean -- and
+#: which leaves every constrained result in the suite resting on a single draw
+#: from the generator. A hundred seeds vary the wild type and the surrogate's
+#: initialisation; not one of them varies the landscape, so "does this ordering
+#: hold on a different instance" is a question the headline tables cannot answer
+#: at any seed count.
+#:
+#: Three further draws, chosen as small odd integers distinct from the shared
+#: instance's seed and fixed before anything was run. Three is enough to see an
+#: ordering break and too few to characterise a distribution over instances,
+#: which is the honest scope: this replicates a result, it does not estimate how
+#: it varies.
+REPLICATION_SEEDS: tuple[int, ...] = (3, 5, 7)
+
+
+def replication() -> tuple[Task, ...]:
+    """The two protocol shapes, on landscape draws other than the shared one.
+
+    Everything except the draw is held at the headline tasks' own settings --
+    same length, alphabet, motif structure, density, protocol and anchor rule --
+    so a difference between a replicate and its headline task is a difference
+    between instances and nothing else.
+
+    Returns:
+        One task per (shape, draw), in a fixed order.
+    """
+    shapes = (
+        ("alde", Protocol(rounds=3, batch_size=132, max_mutations=ALDE_MUTATIONS, label="ALDE")),
+        (
+            "evolvepro",
+            Protocol(
+                rounds=8, batch_size=48, max_mutations=EVOLVEPRO_MUTATIONS, label="EVOLVEpro-like"
+            ),
+        ),
+    )
+    return tuple(
+        _task(
+            f"replicate-{shape}-i{seed}",
+            f"Does the {shape} ordering survive a different landscape draw? Identical "
+            f"to its headline task in every respect but the generator's seed.",
+            _ehrlich(
+                sequence_length=64,
+                vocab_size=20,
+                n_motifs=2,
+                motif_length=4,
+                transition_density=0.5,
+                seed=seed,
+            ),
+            protocol,
+            reanchor=True,
+            # The same declaration the headline task carries, and it transfers
+            # for a stated reason rather than by resemblance: the bound is an
+            # argument about the *budget* -- that this many re-anchored rounds
+            # at this radius reach the budget-split bound -- and the budget,
+            # length, radius and round count are all held fixed here. The draw
+            # decides where the optimum sits, not whether the protocol can walk
+            # far enough to reach one.
+            attainable=Attainable.exactly(
+                1.0,
+                f"pinned: {protocol.rounds} re-anchored rounds of {protocol.max_mutations} "
+                f"reach the budget-split bound; the bound is a property of the budget, "
+                f"which this replicate holds at its headline task's value",
+            ),
+        )
+        for shape, protocol in shapes
+        for seed in REPLICATION_SEEDS
+    )
+
+
 def budget_gradient() -> tuple[Task, ...]:
     """Tasks spanning the wet-lab regime to the machine-learning convention.
 
