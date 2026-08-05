@@ -114,11 +114,32 @@ The pipelines, which are what the headline table compares:
   against something a reviewer does not have to accept.
 * `gfn-tb` -- a trajectory-balance GFlowNet over a **fixed** weighted-sum
   scalarisation. Read the name as GFlowNet-AL under one preference, not as
-  MOGFN-PC: [MOGFN-PC][evogfn.rewards.scalarization] samples a preference per
-  step and conditions the policy on it, and that is out of scope here.
-  `mo-preferences` measures what running several single-preference models costs
-  instead, which is the comparison that has to exist before a conditioned model
-  can be said to beat anything.
+  MOGFN-PC: MOGFN-PC samples a preference per step and conditions the policy on
+  it, and *that arm now exists* --
+  [preference_conditioned_arm][evogfn.benchmark.multi_objective.preference_conditioned_arm],
+  registered as `mogfn-pc` in the `preferences` tier. The two are not the same
+  method and must not be read as one; `gfn-tb`'s name would be better as
+  `gfn-tb-scalar` and the rename is deferred rather than declined, because it is
+  a registry key several test files pin by hand and it costs nothing only while
+  no record is stored under either name.
+
+## The one arm that is not a fixed preference
+
+`mogfn-pc` -- one policy conditioned on the trade-off, trained once over the
+whole simplex, queried across a grid of them. It lives in the `preferences` tier
+rather than in `ARMS` because the row it has to be read against is
+`gfn-tb-pref{N}`, which lives there: one conditioned model on the full budget
+versus ``N`` replicated ones on ``1/N`` each, at the same ``N`` trade-offs. That
+is the only comparison that isolates *amortisation* from everything else a
+GFlowNet does.
+
+It is also the one arm here outside the reduction the rest of this module sits
+inside. Every other arm applies its preference before the surrogate predicts
+anything, so its policy's inner learning problem is the single-objective one;
+`mogfn-pc` carries its own multi-output surrogate and applies the preference at
+reward time. That is why it is worth building, and it is equally why it does not
+license bringing back the scalarised single-objective baselines: nothing about it
+changes what a scalarised hill-climber is.
 
 The ladder, on the two representative pipelines, one thing added per rung:
 
@@ -180,6 +201,7 @@ from evogfn.algorithms.base import Sampler
 from evogfn.algorithms.baselines.genetic import GeneticAlgorithm
 from evogfn.algorithms.baselines.mutagenesis import RandomMutagenesis
 from evogfn.algorithms.baselines.nsga2 import NSGA2
+from evogfn.algorithms.gflownet.preference_sampler import PreferenceConditionedSampler
 from evogfn.algorithms.gflownet.sampler import GFlowNetSampler
 from evogfn.algorithms.gflownet.training import TrainingConfig
 from evogfn.algorithms.inner_loop import ProxyOptimising
@@ -196,9 +218,11 @@ from evogfn.loop.ledger import CampaignResult, RoundRecord
 from evogfn.metrics.diversity import diversity
 from evogfn.metrics.pareto import non_dominated
 from evogfn.models.policy import SequencePolicy
+from evogfn.models.preference_policy import DEFAULT_PREFERENCE_BINS, PreferenceConditionedPolicy
 from evogfn.rewards.base import TemperedReward
-from evogfn.rewards.scalarization import WeightedSum
-from evogfn.surrogate.ensemble import DeepEnsemble
+from evogfn.rewards.scalarization import ScalarizedReward, WeightedSum
+from evogfn.surrogate.ensemble import DEFAULT_MEMBERS, DeepEnsemble
+from evogfn.surrogate.multi_output import MultiObjectiveProxy, MultiOutputEnsemble
 from evogfn.surrogate.proxy import ProxyLandscape
 
 if TYPE_CHECKING:
@@ -314,6 +338,21 @@ OBJECTIVE_COUNTS: tuple[int, ...] = (2, 3, 4)
 #: Preference counts in the diagnostic, at **fixed total budget**. Eight
 #: preferences means eight campaigns of 48 assays, not eight campaigns of 384.
 PREFERENCE_COUNTS: tuple[int, ...] = (1, 4, 8)
+
+#: Trade-offs `mogfn-pc` is *queried* at. The widest rung of `PREFERENCE_COUNTS`,
+#: and it has to be: the arm's claim is that one conditioned policy on the full
+#: budget serves the same N trade-offs that N replicated policies serve on 1/N of
+#: it each. At a different N the two rows of that comparison are covering
+#: different amounts of front and the difference between them is not
+#: amortisation. Derived rather than written as 8, so a change to the ablation's
+#: rungs cannot leave the conditioned arm pointed somewhere else.
+PC_PREFERENCE_COUNT = max(PREFERENCE_COUNTS)
+
+#: Epochs per surrogate fit, matching `_parts`. Restated because `mogfn-pc` fits
+#: its own multi-output model rather than the campaign's, and a conditioned arm
+#: whose surrogate was trained differently from every other arm's would confound
+#: the model with the method.
+SURROGATE_EPOCHS = 150
 
 #: Reference point for the Ehrlich tasks. An Ehrlich value is a product of
 #: quantised motif satisfactions, so zero means "matched nothing" -- a design
@@ -1839,6 +1878,212 @@ def _one_gflownet(  # noqa: PLR0913 - one campaign per preference, and it needs 
     )
 
 
+def preference_conditioned_arm(  # noqa: PLR0913 - the training knobs, plus what F5 needs
+    preferences: int = PC_PREFERENCE_COUNT,
+    objective: GFlowNetObjective | None = None,
+    *,
+    scalarization: Scalarization | None = None,
+    steps: int = DEFAULT_TRAINING_STEPS,
+    beta: float = DEFAULT_BETA,
+    alpha: float = 1.0,
+    n_bins: int = DEFAULT_PREFERENCE_BINS,
+    hidden_dim: int = DEFAULT_HIDDEN_DIM,
+) -> MultiObjectiveMethodology:
+    """MOGFN-PC: one policy conditioned on the trade-off, trained once.
+
+    The arm F2 is about, and the first one in this suite that is genuinely
+    outside F3's reduction. Every other arm here applies its preference *before*
+    the surrogate predicts anything, so the policy's inner learning problem is
+    the single-objective one; this arm carries a multi-output surrogate of its
+    own and applies the preference at reward time, which is what "one model
+    covers the front" requires and what nothing else here does.
+
+    ## The comparison this arm exists for
+
+    | row | arm | model | budget |
+    |---|---|---|---|
+    | conditioned | `mogfn-pc` | one, over ``ω`` | full |
+    | replicated | `gfn-tb-pref{N}` | ``N``, one per fixed ``ω`` | full, split ``N`` ways |
+    | population | `nsga2` | none, ranked by dominance | full |
+
+    The middle row is the *ablation*, not a baseline to be dropped: same
+    landscape, same objective, same total assays, differing in exactly one thing
+    -- whether the model is conditioned or replicated. That is what isolates
+    amortisation from everything else a GFlowNet does, and it is why the
+    evaluation grid here comes from the same
+    [preference_vectors][evogfn.benchmark.multi_objective.preference_vectors] the
+    ablation is built from. Pointed at a different set of trade-offs the two rows
+    would be covering different parts of the front, and nothing in the numbers
+    would say so.
+
+    ## Why it runs without a campaign-level surrogate
+
+    Because handing it one would destroy the arm at the last step, silently. The
+    sampler proposes a preference-balanced pool; a campaign surrogate would score
+    that whole pool under the *single* uniform preference the acquisition rule
+    carries and
+    [TopK][evogfn.acquisition.rules.TopK] would take the best of it, collapsing
+    the plate onto one trade-off after the diversity had been paid for. Every
+    column would look healthy and the indicators would read as "conditioning does
+    not help".
+
+    With ``surrogate=None`` the campaign takes the pool's prefix, which is what
+    it already does for a sampler that ranks its own output. What that costs is
+    two columns, and they are a cost rather than a defect:
+    ``surrogate_correlation`` is ``nan`` for this arm and ``screened`` equals the
+    pool, because there is no campaign-level surrogate to correlate or to screen
+    with. That has to be stated beside the table rather than read off it.
+
+    The acquisition rule is still the uniform-preference
+    [ScalarizedAcquisition][evogfn.acquisition.rules.ScalarizedAcquisition] every
+    other arm gets, and it still drives ``best_so_far``, the ledger and the
+    re-anchoring step -- so the anchor rule stays a property of the protocol
+    rather than of this arm.
+
+    ## The scalarisation is a parameter from the first commit
+
+    Under [WeightedSum][evogfn.rewards.scalarization.WeightedSum] no preference
+    reaches a concave region of the Pareto front (Miettinen, 1999, Thm 3.1.4). A
+    conditioned policy inherits that theorem, so "one model generates any point
+    of the front" would be **false by construction** on a concave front however
+    well the conditioning worked. The default is the weighted sum every other arm
+    ranks under, so this arm and the campaign scoring it share a scale; at least
+    one run has to be
+    [Tchebycheff][evogfn.rewards.scalarization.Tchebycheff], and the confound
+    that carries is smaller here than in general -- Tchebycheff's default
+    reference is zeros, and the Ehrlich tasks' reference point is already
+    ``0.0`` over non-negative objectives. On CH65, whose floor is 6.0, it is not,
+    and the reference would have to be stated.
+
+    Args:
+        preferences: How many trade-offs the trained policy is *queried* at.
+            Training draws from the whole simplex regardless; this is the
+            evaluation grid.
+        objective: How balance violation is measured. Defaults to
+            [ConditionalTrajectoryBalance][evogfn.algorithms.gflownet.preference_conditioned.ConditionalTrajectoryBalance].
+            [ContrastiveBalance][evogfn.algorithms.gflownet.objectives.ContrastiveBalance]
+            is the free robustness check -- ``Z`` cancels exactly there, and it
+            cancels *because* one preference is drawn per batch. An objective
+            measuring against the scalar ``log Z`` is refused.
+        scalarization: How the objectives are combined at reward time. Defaults
+            to `WeightedSum`; see above for why that default is a confound and
+            not a choice.
+        steps: Gradient steps per round. **Not** divided by the grid size:
+            training is free in oracle terms and this arm is compared at equal
+            *budget*. The compute is recorded as ``proxy_calls``, where the
+            amortisation claim's other half is read.
+        beta: Reward exponent.
+        alpha: Dirichlet concentration for the training draw. Below one puts mass
+            at the corners of the simplex, which covers the extremes of a front
+            at the cost of the middle. Nobody has screened it.
+        n_bins: Bins per objective in the thermometer encoding, and the dial on
+            how loud the conditioning is beside the state embedding. The first
+            thing to raise if the front collapses to a point.
+        hidden_dim: Width of the policy trunk, defaulting to
+            [DEFAULT_HIDDEN_DIM][evogfn.benchmark.methods.DEFAULT_HIDDEN_DIM] --
+            imported rather than restated, so a screen that moves the
+            single-objective policy's capacity moves this one too.
+
+    Returns:
+        An arm.
+
+    Raises:
+        ValueError: If ``preferences`` is not positive.
+    """
+    if preferences < 1:
+        raise ValueError(f"preferences must be at least 1, got {preferences}")
+    combine = scalarization if scalarization is not None else WeightedSum()
+
+    def arm(task: Task, seed: int) -> Campaign:
+        # The campaign's own ensemble is built and discarded: this arm fits a
+        # multi-output model at `observe` instead, from the raw objective vectors,
+        # which is the whole difference from every other GFlowNet arm here.
+        # `_parts` is still used so the landscape, the parent and the environment
+        # are byte-identical to what every other arm on this task and seed gets,
+        # which is what makes the comparison paired rather than merely
+        # simultaneous.
+        landscape, env, _ = _parts(task, seed)
+        if landscape.n_objectives < _TWO_OBJECTIVES:
+            raise ValueError(
+                f"{task.name} returns {landscape.n_objectives} objective per design and a "
+                f"preference over one objective is the constant [1.0]; a conditioned arm there "
+                f"is an unconditioned one under a name that claims a trade-off"
+            )
+        # The evaluation grid, from the same function and at the same seed as the
+        # ablation's fixed preferences.
+        weights = preference_vectors(landscape.n_objectives, preferences, seed=seed)
+
+        # One policy and one surrogate for the whole campaign, closed over rather
+        # than rebuilt, so a rebuild for a moved anchor keeps the trained weights
+        # and the fitted model. This is also what test-by-inspection reads to
+        # check the arm has not quietly become an ensemble.
+        policy = PreferenceConditionedPolicy(
+            n_objectives=landscape.n_objectives,
+            n_bins=n_bins,
+            n_actions=env.n_actions,
+            sequence_length=env.sequence_length,
+            n_tokens=env.alphabet.size,
+            hidden_dim=hidden_dim,
+            seed=seed,
+        )
+        surrogate = MultiOutputEnsemble(
+            n_tokens=env.alphabet.size,
+            sequence_length=env.sequence_length,
+            n_objectives=landscape.n_objectives,
+            n_members=DEFAULT_MEMBERS,
+            epochs=SURROGATE_EPOCHS,
+            seed=seed,
+        )
+        proxy = MultiObjectiveProxy(
+            surrogate, alphabet=env.alphabet, sequence_length=env.sequence_length
+        )
+        # Built once and reused: it carries the scalarisation and beta, and the
+        # loop replaces only its preference. Its own preference is never trained
+        # at, so the neutral one is the honest placeholder.
+        reward = ScalarizedReward(
+            combine,
+            preference_vectors(landscape.n_objectives, 1)[0],
+            reward=TemperedReward(beta=beta),
+        )
+        generation = itertools.count()
+
+        def make(anchored: MutationEnvironment) -> Sampler:
+            """Build the sampler against whichever anchor the campaign is at."""
+            stream = _anchor_seed(seed, next(generation))
+            return PreferenceConditionedSampler(
+                anchored,
+                policy,
+                surrogate=surrogate,
+                proxy=proxy,
+                preferences=weights,
+                reward=reward,
+                config=TrainingConfig(steps=steps, batch_size=64, seed=stream),
+                objective=objective,
+                alpha=alpha,
+                seed=stream,
+            )
+
+        return _campaign(
+            _as_multi_objective(task),
+            landscape,
+            env,
+            make,
+            # No campaign-level surrogate, and the reason is in the docstring
+            # above: one here would re-rank the preference-balanced pool under a
+            # single trade-off and undo the arm at the last step.
+            None,
+            preference=preference_vectors(landscape.n_objectives, 1)[0],
+            rounds=task.protocol.rounds,
+            batch_size=task.protocol.batch_size,
+            # The library, exactly as the ablation gets it. A plate-sized pool
+            # would leave one design per preference at eight trade-offs, so the
+            # per-preference ranking would rank nothing.
+            pool_size=DEFAULT_POOL,
+        )
+
+    return arm
+
+
 def _as_multi_objective(task: Task) -> MultiObjectiveTask:
     """Narrow a task to one that states its references, or refuse.
 
@@ -1916,14 +2161,22 @@ ABLATIONS: dict[str, str] = {
 #: the sentence a report has to print beside them. ``gfn-tb`` is the case this
 #: exists for: it is GFlowNet-AL over a *fixed* weighted-sum scalarisation, and a
 #: reader who has met MOGFN-PC will otherwise assume a preference-conditioned
-#: policy -- a different method, with a different claim, that this suite does not
-#: run. Stated in the report rather than folded into the arm's name, because the
-#: name is what every stored record is keyed by and the scope note is longer than
-#: a name should be.
+#: policy. Stated in the report rather than folded into the arm's name, because
+#: the name is what every stored record is keyed by and the scope note is longer
+#: than a name should be.
+#:
+#: The note got sharper rather than shorter when ``mogfn-pc`` was built. A scope
+#: note saying "this suite does not run MOGFN-PC" stops being enough the moment
+#: the suite does, and a name that reads as the other method while sitting two
+#: tiers away from it is worse than one that merely overclaims. Renaming
+#: ``gfn-tb`` to ``gfn-tb-scalar`` is the right fix, it is free while nothing is
+#: stored under either name, and it is deferred here only because the key is
+#: pinned by hand in test files this edit does not own.
 SCOPE_NOTES: dict[str, str] = {
     "gfn-tb": (
         "single-preference GFlowNet-AL over a fixed weighted sum; NOT MOGFN-PC, "
-        "which samples a preference per step and conditions the policy on it"
+        "which samples a preference per step and conditions the policy on it -- "
+        "that arm is `mogfn-pc`, in the preferences tier"
     ),
 }
 
@@ -1952,20 +2205,34 @@ def preference_arms(
             evidence about another, so the diagnostic has to be runnable at
             whatever width the main table runs.
 
+    `mogfn-pc` is here too, and it is the row the rungs are the ablation *for*.
+    One conditioned policy on the full budget against ``N`` replicated ones on
+    ``1/N`` of it each, at the same ``N`` trade-offs -- which is why its grid is
+    [PC_PREFERENCE_COUNT][evogfn.benchmark.multi_objective.PC_PREFERENCE_COUNT]
+    rather than a number of its own. Note the asymmetry in what `learn_flow`
+    means for it: the preference-conditioned loop does not score intermediate
+    states, so a detailed-balance objective is refused there rather than run, and
+    that is a known gap rather than a supported configuration.
+
     Returns:
-        One arm per entry of `PREFERENCE_COUNTS`, named by the count. The names
-        are fixed on the axis the tier varies and do **not** encode the
-        objective, so a diagnostic run under a non-default one is distinguished
-        by the run's configuration rather than by the arm name -- which is what
-        keeps a stored record comparable across the change, and what makes it
-        wrong to read two such runs as the same arm.
+        One arm per entry of `PREFERENCE_COUNTS`, named by the count, plus the
+        conditioned arm they decompose. The names are fixed on the axis the tier
+        varies and do **not** encode the objective, so a diagnostic run under a
+        non-default one is distinguished by the run's configuration rather than
+        by the arm name -- which is what keeps a stored record comparable across
+        the change, and what makes it wrong to read two such runs as the same
+        arm.
     """
-    return {
+    arms: dict[str, MultiObjectiveMethodology] = {
         f"gfn-tb-pref{count}": scalarized_gflownet_arm(
             count, objective, learn_flow=learn_flow, hidden_dim=hidden_dim
         )
         for count in PREFERENCE_COUNTS
     }
+    arms["mogfn-pc"] = preference_conditioned_arm(
+        PC_PREFERENCE_COUNT, objective, hidden_dim=hidden_dim
+    )
+    return arms
 
 
 # --------------------------------------------------------------------------
@@ -2016,14 +2283,28 @@ def multi_objective_tiers(main_seeds: int, explanatory_seeds: int) -> list[Tier]
 def arms_for_tier(tier: Tier) -> dict[str, MultiObjectiveMethodology]:
     """Which arms a tier runs.
 
+    The `preferences` tier carries F2's whole decomposition, which is why it gets
+    two arms from `ARMS` as well as the preference sweep. `nsga2` is the third
+    row -- the population method that picks no trade-off at all -- and without it
+    a conditioned arm beating its own ablation would say amortisation works while
+    leaving "and multi-objective search still does not" unaskable. `random` is
+    the floor, without which a hypervolume is a number rather than a result.
+    They are added here rather than inside
+    [preference_arms][evogfn.benchmark.multi_objective.preference_arms] because
+    neither takes a training objective, and that function's contract is one arm
+    per preference count.
+
     Args:
         tier: The tier being run.
 
     Returns:
-        The preference sweep for the diagnostic tier, the four comparison arms
-        for everything else.
+        The preference sweep, the conditioned arm, the population baseline and
+        the floor for the diagnostic tier; the pipeline table's arms for
+        everything else.
     """
-    return preference_arms() if tier.name == "preferences" else dict(ARMS)
+    if tier.name != "preferences":
+        return dict(ARMS)
+    return {**preference_arms(), "nsga2": ARMS["nsga2"], "random": ARMS["random"]}
 
 
 def set_indicators(task: MultiObjectiveTask, result: CampaignResult) -> dict[str, float | None]:
