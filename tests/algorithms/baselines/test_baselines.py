@@ -257,6 +257,118 @@ class TestRejectionSampling:
             RandomMutagenesis(env, feasible_only=True, max_attempts=3, seed=0).propose(32)
 
 
+class TestTheDrawCounters:
+    """What a rejection rate means, which a rejection rate cannot say on its own.
+
+    The finding these exist to make visible is that a rejection GA on a sparse
+    feasible set survives mostly by proposing the anchor back to itself. At
+    ``p_m = 1/L`` the substitution count per offspring is Poisson(1), so roughly a
+    third of every batch carries no mutation at all -- and an unmutated design is
+    inside every budget and feasible wherever the anchor is, so it is admitted.
+    Those admissions hold the measured rejection rate down to something that
+    reads survivable while the search goes nowhere.
+
+    Every failure below is silent. A missing counter reads as zero, which reads
+    as "this never happened"; a counter reset on a re-anchor reports the last
+    round as the campaign; a counter incremented after the raise is absent from
+    the one run whose numbers explain the failure.
+    """
+
+    def sparse(self):
+        """An environment where most substitutions break the transition rule."""
+        return make_env(
+            length=8,
+            symbols="ABCD",
+            max_mutations=3,
+            transitions=constrained_transitions(4, [(0, 1), (1, 2), (2, 3), (0, 2), (1, 3)]),
+        )
+
+    def test_an_arm_that_rejects_nothing_counts_nothing(self):
+        # Zero here has to mean "this arm runs no rejection loop", not "this arm
+        # rejected nothing", or the column would put a rejection rate of zero
+        # beside every method that never rejects and invite the comparison.
+        ga = GeneticAlgorithm(make_env(), population_size=32, seed=0)
+        ga.propose(32)
+        assert ga.draws_attempted == 0
+        assert ga.draws_rejected == 0
+        assert ga.draws_unmutated == 0
+
+    def test_a_rejection_run_counts_every_draw_it_offered_and_every_one_refused(self):
+        env = self.sparse()
+        ga = GeneticAlgorithm(
+            env, population_size=32, mutation_prob=0.5, feasible_only=True, seed=0
+        )
+        ga.propose(32)
+
+        assert ga.draws_attempted >= 32
+        assert ga.draws_rejected > 0
+        # Every draw offered was a proposal charged, so the two accountings have
+        # to agree. They are incremented at different places and would drift
+        # apart without anything failing.
+        assert ga.draws_attempted == ga.proposals_made
+        assert ga.draws_rejected <= ga.draws_attempted
+
+    def test_the_draws_that_survive_are_mostly_the_anchor_unchanged(self):
+        # The load-bearing one. Without this counter the rejection rate is the
+        # only evidence and it says rejection is coping; with it, the surviving
+        # draws turn out to be copies of the design the arm started from, which
+        # cost a well and buy nothing. Run at the published `p_m = 1/L`, because
+        # that rate is what makes the zero-mutation share large -- a test at a
+        # mutation rate we chose would not be about the shipped configuration.
+        env = self.sparse()
+        ga = GeneticAlgorithm(env, population_size=32, feasible_only=True, seed=0)
+        ga.propose(32)
+        admitted = ga.draws_attempted - ga.draws_rejected
+
+        assert ga.draws_unmutated > 0
+        assert ga.draws_unmutated <= admitted
+        # Strictly a share of the survivors rather than of everything drawn: a
+        # rejected draw cost a proposal and nothing more, while an admitted copy
+        # of the anchor consumed a well.
+        assert ga.draws_unmutated / admitted > 0.1
+
+    def test_the_counters_survive_the_anchor_moving(self):
+        # Carried across `reanchored`, like the proposal count. A campaign that
+        # moves three times would otherwise report its last round's draws as
+        # though they were the whole run -- undercounting silently, and worst on
+        # the runs that moved most, which are the ones anyone would look at.
+        env = self.sparse()
+        ga = GeneticAlgorithm(env, population_size=32, feasible_only=True, seed=0)
+        ga.propose(32)
+        before = (ga.draws_attempted, ga.draws_rejected, ga.draws_unmutated)
+
+        moved = ga.reanchored(env.reanchored(ga.population[0]))
+        assert (moved.draws_attempted, moved.draws_rejected, moved.draws_unmutated) == before
+
+        moved.propose(32)
+        assert moved.draws_attempted > before[0]
+
+    def test_the_run_that_exhausts_keeps_the_numbers_that_explain_it(self):
+        # Incremented before the raise, which is the whole point: the one run
+        # that gives up is the run whose draw counts say why it gave up, and
+        # accounting written after the raise never happens on it.
+        forbidden = [(a, b) for a in range(4) for b in range(4) if (a, b) != (0, 0)]
+        env = make_env(
+            length=8,
+            symbols="ABCD",
+            max_mutations=3,
+            transitions=constrained_transitions(4, forbidden),
+        )
+        ga = GeneticAlgorithm(
+            env,
+            population_size=32,
+            mutation_prob=0.9,
+            feasible_only=True,
+            max_attempts=3,
+            seed=0,
+        )
+        with pytest.raises(RuntimeError, match="feasible"):
+            ga.propose(32)
+
+        assert ga.draws_attempted == 96
+        assert ga.draws_rejected == ga.draws_attempted
+
+
 class TestReproducibility:
     @pytest.mark.parametrize("make", ALL)
     def test_the_same_seed_gives_the_same_proposals(self, make):

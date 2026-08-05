@@ -400,6 +400,40 @@ class TestThePlateRule:
                 pool_size=64,
             ).run()
 
+    def test_the_rounds_that_finished_survive_the_failure(self):
+        # `run` raises, so its ledger is lost with it -- and a caller storing a
+        # record of the failure would then have to write zeros, which say the
+        # campaign measured nothing. It measured one plate. "Gave up in round one
+        # having measured nothing" and "gave up in round four having measured
+        # 288" are different findings, and zeros report them identically.
+        campaign = Campaign(
+            landscape=CountingLandscape(),
+            sampler=CollapsedSampler(),
+            surrogate=surrogate(),
+            rounds=4,
+            batch_size=8,
+            pool_size=64,
+        )
+        with pytest.raises(RuntimeError, match="cannot produce designs"):
+            campaign.run()
+
+        assert len(campaign.completed_rounds) == 1
+        assert sum(record.evaluated for record in campaign.completed_rounds) == 8
+
+    def test_a_campaign_that_finished_reports_every_round(self):
+        # The same field on the ordinary path, so a reader does not need to know
+        # whether the run raised to know what it is looking at.
+        campaign = Campaign(
+            landscape=CountingLandscape(),
+            sampler=RepetitiveSampler(menu=64),
+            rounds=3,
+            batch_size=8,
+            pool_size=32,
+        )
+        result = campaign.run()
+
+        assert campaign.completed_rounds == result.rounds
+
     def test_the_memory_of_earlier_rounds_can_be_turned_off(self):
         landscape = CountingLandscape()
         Campaign(

@@ -356,6 +356,43 @@ class RunRecord:
         bred_designs: Designs a genetic teacher produced and the policy was
             asked to construct a path to. Zero for every method that breeds
             nothing, which is every method except Genetic-GFN.
+        draws_attempted: Offspring a rejection-sampling arm drew before
+            filtering, summed over every attempt of every round. Zero for an arm
+            that does not reject its own output, which is most of them -- so it
+            is read beside the arm's name, like ``bred_designs``.
+        draws_rejected: How many of those the environment refused. The rejection
+            rate this and ``draws_attempted`` give is the cost the feasibility
+            claim is about: a masked policy pays none of it.
+        draws_unmutated: How many of the *admitted* draws were the anchor itself,
+            unchanged. Load-bearing, and not a curiosity: the mutation kernel
+            runs at ``p_m = 1/L``, so the per-offspring mutation count is
+            Poisson(1) and roughly a third of every batch carries no
+            substitution at all. Those draws are trivially reachable, so they
+            pass the filter and hold the rejection rate down to something that
+            reads survivable, while the arm makes no progress. Without this
+            column the rejection rate is the only evidence and it says the
+            wrong thing.
+        exhausted: Whether the campaign that produced this record **failed to
+            finish**: its sampler could not propose designs the campaign had not
+            already measured, so the run raised rather than filling its plate.
+
+            Defaulted to ``False`` so that every record written before this
+            field existed loads as what it was, a completed campaign.
+
+            A record carrying ``True`` is the *evidence of a failure* rather than
+            a result, and the two must never be averaged together. Its ``best``,
+            ``diversity`` and ``feasible_fraction`` are ``nan`` and its ``regret``
+            is ``None`` -- never zero, which would read as a campaign that
+            measured nothing good rather than one that never measured. Its
+            ``rounds``, ``oracle_calls`` and ``proposals`` describe the part of
+            the campaign that *did* run, so the record says how far it got.
+
+            The alternative, and what this replaces, was storing nothing at all:
+            the arm then simply vanished from the store, and an empty cell in a
+            table is an absence that any reader may fill in as they please --
+            including as the sharpest result on it. An absence is also not
+            reproducible, since a re-run produces the same absence for a reason
+            nothing recorded.
         cpu_seconds: Processor time this campaign burned, from
             `time.process_time`. **This is the comparable cost figure.** A
             results table that shows an equal oracle budget and says nothing
@@ -458,6 +495,10 @@ class RunRecord:
     # -- and raising would be read as a corrupt line and silently drop the
     # campaign.
     bred_designs: int = 0
+    draws_attempted: int = 0
+    draws_rejected: int = 0
+    draws_unmutated: int = 0
+    exhausted: bool = False
     unconstructible_fraction: float = 0.0
     repaired_fraction: float = 0.0
     cpu_seconds: float = 0.0

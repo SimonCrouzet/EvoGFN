@@ -88,11 +88,13 @@ from evogfn.metrics.diversity import diversity
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping, Sequence
 
+    from evogfn.algorithms.base import Sampler
     from evogfn.benchmark.attainable import AttainableOptimum
     from evogfn.benchmark.methods import Methodology
     from evogfn.benchmark.store import ResultStore, RunRecord
     from evogfn.landscapes.base import FitnessLandscape
-    from evogfn.loop.ledger import CampaignResult
+    from evogfn.loop.campaign import Campaign
+    from evogfn.loop.ledger import CampaignResult, RoundRecord
 
 #: GB1's four measured sites. Equal to the sequence length, so every variant in
 #: the published table is reachable and the anchor exercises no search radius.
@@ -853,6 +855,13 @@ def _scores(
     bound is evidence about the audit rather than about the arm, and clamping it
     at zero would erase the only signal that a bound needs re-deriving.
 
+    A campaign that never finished does not reach this function at all: it has no
+    `CampaignResult` to be scored from, and `run_task` writes ``nan``/``None``
+    into the same two fields with ``exhausted=True`` beside them. So the pair
+    this returns always means "measured", and the one thing that could break
+    that -- an unfinished run smuggled in under a plausible number -- has no path
+    to it.
+
     Args:
         task: The task being run, named in any error.
         result: The completed campaign.
@@ -913,6 +922,165 @@ def _indicator(result: CampaignResult) -> float | None:
         return float("nan")
 
 
+def _sampler_fields(sampler: Sampler) -> dict[str, object]:
+    """What the sampler itself recorded about how it spent the round.
+
+    Every one is read **by attribute**, so a sampler that does not carry a
+    counter stores the neutral value rather than making the base interface
+    declare a quantity only one method can measure. Zero is then the honest
+    reading in each case: an arm that breeds nothing bred nothing, and an arm
+    that rejects nothing rejected nothing.
+
+    One helper rather than the same block written at two call sites, and the
+    reason is which two: the completed run and the run that raised. The
+    exhausted one is where these numbers matter most -- the counters explaining
+    *why* a sampler ran out live on the sampler, never on the result it failed to
+    produce -- and two copies would drift, with the copy that lost a field being
+    the one nobody reads until a column has a hole in it.
+
+    Args:
+        sampler: The sampler the campaign finished with. Under re-anchoring that
+            is not the object the campaign was built from, so it has to come
+            from [Campaign.sampler][evogfn.loop.campaign.Campaign.sampler].
+
+    Returns:
+        Fields ready to pass to
+        [ResultStore.stamp][evogfn.benchmark.store.ResultStore.stamp].
+    """
+    return {
+        "proxy_calls": int(getattr(sampler, "proxy_calls", 0)),
+        "bred_designs": int(getattr(sampler, "bred_designs", 0)),
+        # The three rejection counters travel together or not at all: two of them
+        # are a rate and the third is what the rate means. A rejection rate that
+        # looks survivable because most admitted draws were the unmutated anchor
+        # is the exact misreading `draws_unmutated` exists to prevent.
+        "draws_attempted": int(getattr(sampler, "draws_attempted", 0)),
+        "draws_rejected": int(getattr(sampler, "draws_rejected", 0)),
+        "draws_unmutated": int(getattr(sampler, "draws_unmutated", 0)),
+        "unconstructible_fraction": float(getattr(sampler, "unconstructible_fraction", 0.0)),
+        # Read off the *final* sampler, and safe under re-anchoring only because
+        # the arm that reports this carries its repair counters across a move
+        # rather than restarting them. An arm that reset them would report its
+        # last round here while looking like it reported the campaign -- the same
+        # silent undercount the proxy spend once had.
+        "repaired_fraction": float(getattr(sampler, "repaired_fraction", 0.0)),
+    }
+
+
+def _round_rows(records: Sequence[RoundRecord]) -> list[dict[str, float]]:
+    """The per-round ledger, flattened for storage.
+
+    Args:
+        records: The rounds that completed. On an exhausted campaign this is
+            short of the protocol's round count, which is itself the record of
+            how far the run got.
+
+    Returns:
+        One dict per round, in order.
+    """
+    return [
+        {
+            "index": float(record.index),
+            "proposed": float(record.proposed),
+            "screened": float(record.screened),
+            "evaluated": float(record.evaluated),
+            "feasible": float(record.feasible),
+            "best_in_round": record.best_in_round,
+            "best_so_far": record.best_so_far,
+            "mean_in_round": record.mean_in_round,
+            "batch_diversity": record.batch_diversity,
+            "surrogate_correlation": record.surrogate_correlation,
+            "hypervolume": record.hypervolume,
+            # How far this round's anchor sat from the wild type. Flat at zero
+            # says the campaign searched one Hamming ball for its whole life,
+            # which is the difference between a budget of `max_mutations` and a
+            # budget of `max_mutations` per round.
+            "anchor_distance": float(record.anchor_distance),
+        }
+        for record in records
+    ]
+
+
+def _exhausted_record(  # noqa: PLR0913 - a record is defined by what it declares
+    store: ResultStore,
+    *,
+    task: Task,
+    method: Methodology,
+    name: str,
+    seed: int,
+    campaign: Campaign,
+    cpu_seconds: float,
+    wall_seconds: float,
+) -> RunRecord:
+    """A record of a campaign that could not finish.
+
+    Same key, same protocol, same fingerprint and same provenance as a completed
+    run, because it is the same experiment -- what differs is that it produced no
+    measurement, and ``exhausted`` is the field that says so. That is the whole
+    design: the seed stays in the store, so the arm keeps its row and the row
+    says what happened, rather than the arm silently having fewer seeds than the
+    table's header claims.
+
+    **Nothing that was not measured is stored as a number.** ``best``,
+    ``diversity`` and ``feasible_fraction`` are ``nan`` and ``regret`` is
+    ``None``. Zero would be a measurement -- "this arm found nothing good", "this
+    arm's designs were never constructible" -- and it would average into a column
+    beside real ones, which is the failure this record exists to prevent and not
+    a lesser version of it. ``nan`` and ``None`` are what the store already uses
+    for a quantity nobody obtained, in ``surrogate_correlation`` and in the
+    regret of an unaudited task.
+
+    What *is* stored as a number is what genuinely happened: the rounds that
+    completed, the oracle calls they charged, the proposals they cost, and every
+    counter the sampler carries. A run that exhausted in round four having
+    measured 288 designs and one that exhausted in round one having measured
+    none are different findings.
+
+    Args:
+        store: Where the record will go, and what stamps it.
+        task: The task being run.
+        method: The methodology, asked by attribute for the settings it closed
+            over -- exactly as on the completed path, so an exhausted row is
+            attributable to a configuration like any other.
+        name: The arm's name, which is half the store's key.
+        seed: The seed that exhausted.
+        campaign: The campaign that raised, read for its final sampler and for
+            the rounds it did complete.
+        cpu_seconds: Processor time spent before the failure.
+        wall_seconds: Elapsed time for the same.
+
+    Returns:
+        The record, ready to append.
+    """
+    completed = campaign.completed_rounds
+    return store.stamp(
+        depends_on=RESULT_DEPENDENCIES,
+        task=task.name,
+        method=name,
+        seed=seed,
+        protocol=repr(task),
+        parameters=dict(getattr(method, "parameters", {})),
+        exhausted=True,
+        best=float("nan"),
+        regret=None,
+        diversity=float("nan"),
+        feasible_fraction=float("nan"),
+        duplicate_fraction=float("nan"),
+        oracle_calls=sum(record.evaluated for record in completed),
+        proposals=sum(record.proposed for record in completed),
+        cpu_seconds=cpu_seconds,
+        wall_seconds=wall_seconds,
+        deterministic=is_deterministic(),
+        # No designs, rather than the best of a partial campaign: these are read
+        # as "what this arm produced", and an arm that did not produce a plate
+        # produced nothing to inspect.
+        top_sequences=[],
+        trace=[record.best_so_far for record in completed],
+        rounds=_round_rows(completed),
+        **_sampler_fields(campaign.sampler),
+    )
+
+
 def run_task(
     task: Task,
     methods: Mapping[str, Methodology],
@@ -923,6 +1091,11 @@ def run_task(
 ) -> int:
     """Run whatever is missing for one task, storing each result as it lands.
 
+    A campaign that cannot finish is stored too, as a record carrying
+    ``exhausted`` and no measurement -- see `_exhausted_record`. That failure is
+    a property of the method on this task and belongs in the store beside the
+    successes, rather than being a seed that silently never appears.
+
     Args:
         task: What to run.
         methods: Methodologies by name.
@@ -931,7 +1104,8 @@ def run_task(
         report: Where progress lines go.
 
     Returns:
-        How many campaigns were actually run.
+        How many campaigns were actually run, counting those that exhausted:
+        they cost the same time and are now held, so the next sweep skips them.
 
     Raises:
         ValueError: If the task declares an attainable optimum its landscape
@@ -971,11 +1145,33 @@ def run_task(
                 # An arm that cannot fill its plate raises rather than quietly
                 # measuring fewer designs. On a sparse feasible set that is a
                 # property of the method -- rejection sampling stalls where
-                # masking is free -- so it is reported and the seed is left
-                # unstored, which shows up as a short seed count rather than as
-                # a number pretending to be comparable. Propagating it would
-                # discard every arm the sweep had already finished.
+                # masking is free -- so the failure is the finding, and it is
+                # *stored*. Propagating it would discard every arm the sweep had
+                # already finished; storing nothing, which is what this used to
+                # do, deleted the finding instead. The arm then vanished from the
+                # store, and an empty cell in a table is an absence a reader may
+                # fill in as they like -- including as the sharpest result on it
+                # -- while a re-run reproduces the absence and never the
+                # evidence.
                 report(f"  {task.name}/{name}: seed {seed} exhausted -- {exc}")
+                store.append(
+                    _exhausted_record(
+                        store,
+                        task=task,
+                        method=method,
+                        name=name,
+                        seed=seed,
+                        campaign=campaign,
+                        cpu_seconds=time.process_time() - cpu_started,
+                        wall_seconds=time.perf_counter() - wall_started,
+                    )
+                )
+                # Counted as run, because it was: it cost the campaign's time and
+                # it is now held, so the next sweep will not run it again. A
+                # count that skipped it would report zero campaigns run on a pass
+                # that wrote records, which is the one number this return value
+                # is read for.
+                ran += 1
                 continue
             cpu_seconds = time.process_time() - cpu_started
             wall_seconds = time.perf_counter() - wall_started
@@ -1014,22 +1210,12 @@ def run_task(
                     feasible_fraction=feasible,
                     oracle_calls=result.oracle_calls,
                     proposals=result.proposals,
-                    proxy_calls=int(getattr(method_sampler, "proxy_calls", 0)),
-                    # By attribute, like the proxy spend above: a sampler that
-                    # breeds nothing simply does not carry these, and asking the
-                    # base interface for them would make every baseline declare
-                    # a quantity only one method can measure.
-                    bred_designs=int(getattr(method_sampler, "bred_designs", 0)),
-                    unconstructible_fraction=float(
-                        getattr(method_sampler, "unconstructible_fraction", 0.0)
-                    ),
-                    # Read off the *final* sampler, which is what `campaign.sampler`
-                    # returns, and safe under re-anchoring only because the arm that
-                    # reports this carries its repair counters across a move rather
-                    # than restarting them. An arm that reset them would report its
-                    # last round here while looking like it reported the campaign --
-                    # the same silent undercount the proxy spend once had.
-                    repaired_fraction=float(getattr(method_sampler, "repaired_fraction", 0.0)),
+                    # The sampler's own accounting, shared with the exhausted
+                    # path so the two cannot drift into carrying different
+                    # columns. `campaign.sampler` is the sampler the run
+                    # *finished* with, which under re-anchoring is not the one it
+                    # started from.
+                    **_sampler_fields(method_sampler),
                     # Processor time is what the arms are compared on; elapsed
                     # time is kept beside it only so a reader can see how hard
                     # the machine was contended when this ran. A suite is
@@ -1046,28 +1232,7 @@ def run_task(
                     deterministic=is_deterministic(),
                     top_sequences=_top_designs(result),
                     trace=result.trace(),
-                    rounds=[
-                        {
-                            "index": float(record.index),
-                            "proposed": float(record.proposed),
-                            "screened": float(record.screened),
-                            "evaluated": float(record.evaluated),
-                            "feasible": float(record.feasible),
-                            "best_in_round": record.best_in_round,
-                            "best_so_far": record.best_so_far,
-                            "mean_in_round": record.mean_in_round,
-                            "batch_diversity": record.batch_diversity,
-                            "surrogate_correlation": record.surrogate_correlation,
-                            "hypervolume": record.hypervolume,
-                            # How far this round's anchor sat from the wild
-                            # type. Flat at zero says the campaign searched one
-                            # Hamming ball for its whole life, which is the
-                            # difference between a budget of `max_mutations` and
-                            # a budget of `max_mutations` per round.
-                            "anchor_distance": float(record.anchor_distance),
-                        }
-                        for record in result.rounds
-                    ],
+                    rounds=_round_rows(result.rounds),
                 )
             )
             ran += 1
@@ -1142,18 +1307,34 @@ def records_to_metric(
 ) -> np.ndarray:
     """Pull one metric out of stored records, in seed order.
 
+    **Exhausted records are excluded, and the exclusion is the point.** Every
+    caller of this averages what comes back, and a record from a campaign that
+    never finished has no measurement to contribute: its ``best`` and
+    ``diversity`` are ``nan`` by construction, so leaving it in would turn the
+    whole arm's mean into ``nan`` while the seed count went on claiming a full
+    row. Both readings are wrong, and the second is wrong silently.
+
+    What the exclusion costs is that the failure is now *invisible here*, which
+    is exactly what it was before this function had anything to exclude. So a
+    caller that reports a mean must also report how many seeds it left out --
+    [RunRecord.exhausted][evogfn.benchmark.store.RunRecord.exhausted] is stored
+    per seed for that purpose, and ``experiments/run_suite.py`` prints the count
+    beside the row. A shorter array with nothing said about why is the absence
+    this whole mechanism exists to end.
+
     Args:
         records: Records by seed.
         seeds: The order to return them in.
         metric: Field name.
 
     Returns:
-        An array with one entry per seed present.
+        An array with one entry per seed present that carries a completed
+        campaign.
     """
     values = []
     for seed in seeds:
         record = records.get(seed)
-        if record is None:
+        if record is None or record.exhausted:
             continue
         value = getattr(record, metric)
         values.append(np.nan if value is None else float(value))

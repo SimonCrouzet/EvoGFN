@@ -28,6 +28,14 @@ So the honest framing is: if rejection keeps up, the masking advantage is one of
 proposal cost rather than sample efficiency, and should be reported that way.
 [proposals_made][evogfn.algorithms.base.Sampler.proposals_made] is what makes
 the difference visible.
+
+A rejection rate on its own overstates how well rejection is coping, and
+[draws_unmutated][evogfn.algorithms.baselines.genetic.GeneticAlgorithm.draws_unmutated]
+is why: at ``p_m = 1/L`` the number of substitutions an offspring carries is
+Poisson(1), so a large share of every batch is the anchor unchanged, and those
+draws are reachable by definition. They pass the filter, hold the rejection rate
+down, and search nothing. The three ``draws_*`` counters are reported together
+for that reason -- two of them are a rate, and the third is what the rate means.
 """
 
 from __future__ import annotations
@@ -117,6 +125,9 @@ class GeneticAlgorithm(Sampler):
         self._rng = np.random.default_rng(seed)
         self._population = np.tile(env.parent, (population_size, 1))
         self._fitness = np.full(population_size, -np.inf)
+        self._draws_attempted = 0
+        self._draws_rejected = 0
+        self._draws_unmutated = 0
 
     @property
     def name(self) -> str:
@@ -194,7 +205,49 @@ class GeneticAlgorithm(Sampler):
             moved._fitness = np.where(intact, self._fitness, -np.inf)
         moved._rng = self._rng
         moved._proposals_made = self._proposals_made
+        # Carried for the same reason the proposal count is. These are campaign
+        # totals, and a campaign that re-anchors three times would otherwise
+        # report its last round's draws as though they were the whole run --
+        # undercounting silently, and worst on exactly the runs that moved the
+        # most, which are the ones anyone would look at.
+        moved._draws_attempted = self._draws_attempted
+        moved._draws_rejected = self._draws_rejected
+        moved._draws_unmutated = self._draws_unmutated
         return moved
+
+    @property
+    def draws_attempted(self) -> int:
+        """Offspring bred and offered to the feasibility filter.
+
+        Zero unless ``feasible_only``: an arm that emits whatever it breeds
+        offers nothing to a filter, and counting its output here would put a
+        rejection rate of zero beside a method that never rejects.
+        """
+        return self._draws_attempted
+
+    @property
+    def draws_rejected(self) -> int:
+        """How many of those the environment refused as unreachable."""
+        return self._draws_rejected
+
+    @property
+    def draws_unmutated(self) -> int:
+        """Admitted draws that were the anchor itself, carrying no substitution.
+
+        The number that decides how a rejection rate should be read. Offspring
+        are mutated at ``p_m = 1/L`` per position, so the count of substitutions
+        an offspring carries is Poisson(1) and roughly a third of every batch
+        carries none -- and a design identical to the anchor is inside every
+        budget and feasible wherever the anchor is, so
+        [is_reachable][evogfn.env.mutation.MutationEnvironment.is_reachable]
+        admits all of them.
+
+        Those admissions hold the measured rejection rate well below the rate at
+        which the sampler produces anything *new*. Read alone the rate then says
+        rejection sampling is coping; read beside this it says the surviving
+        draws are mostly the parent, which is the finding.
+        """
+        return self._draws_unmutated
 
     @property
     def carried_fitness(self) -> int:
@@ -238,7 +291,20 @@ class GeneticAlgorithm(Sampler):
         for _ in range(self._max_attempts):
             batch = self._breed(parents, n)
             self._count(n)
-            keep = batch[self._env.is_reachable(batch)]
+            reachable = self._env.is_reachable(batch)
+            # Counted here, before the loop can return and before it can raise.
+            # The one run that exhausts is the run whose numbers explain why it
+            # exhausted, and accounting written after the raise is accounting
+            # that never happens on the run anybody wants it for.
+            self._draws_attempted += int(batch.shape[0])
+            self._draws_rejected += int((~reachable).sum())
+            keep = batch[reachable]
+            # Among the *admitted* draws, not among all of them: a rejected draw
+            # cost a proposal and nothing else, while an admitted copy of the
+            # anchor consumed a well and bought no information.
+            self._draws_unmutated += int(
+                np.all(keep == self._env.parent[None, :], axis=1).sum() if keep.shape[0] else 0
+            )
             if keep.shape[0]:
                 collected.append(keep)
                 found += keep.shape[0]

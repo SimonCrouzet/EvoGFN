@@ -62,6 +62,19 @@ class Uniform(Sampler):
         return drawn
 
 
+class Stuck(Sampler):
+    """One design and nothing else, which is how a campaign runs out.
+
+    The campaign will not re-measure a design an earlier round already assayed,
+    so this fills its first plate and can then propose nothing the run is allowed
+    to charge for.
+    """
+
+    def propose(self, n):
+        self._count(n)
+        return np.zeros((n, LENGTH), dtype=np.int32)
+
+
 def arm(bias):
     def build(seed, protocol):
         return Campaign(
@@ -70,6 +83,41 @@ def arm(bias):
             rounds=protocol.rounds,
             batch_size=protocol.batch_size,
             pool_size=max(protocol.batch_size * 4, 32),
+        )
+
+    return build
+
+
+def stuck_arm():
+    """An arm that exhausts on every seed."""
+
+    def build(seed, protocol):  # noqa: ARG001 - this arm ignores its seed
+        return Campaign(
+            landscape=Additive(),
+            sampler=Stuck(),
+            rounds=protocol.rounds,
+            batch_size=protocol.batch_size,
+            pool_size=32,
+        )
+
+    return build
+
+
+def flaky_arm():
+    """An arm that exhausts on even seeds and runs normally on odd ones.
+
+    Partial failure is the case worth testing: an arm that fails everywhere has
+    no mean to protect, while one that fails half the time has seven good
+    campaigns for a reader to lose.
+    """
+
+    def build(seed, protocol):
+        return Campaign(
+            landscape=Additive(),
+            sampler=Stuck() if seed % 2 == 0 else Uniform(seed, bias=0.2),
+            rounds=protocol.rounds,
+            batch_size=protocol.batch_size,
+            pool_size=32,
         )
 
     return build
@@ -229,25 +277,40 @@ class TestHarness:
         assert not result.against("one", metric="regret")[0].significant
 
     def test_underspending_is_surfaced(self):
-        class Stuck(Sampler):
-            def propose(self, n):
-                self._count(n)
-                return np.zeros((n, LENGTH), dtype=np.int32)
-
-        def stuck(seed, protocol):  # noqa: ARG001 - this arm ignores its seed
-            return Campaign(
-                landscape=Additive(),
-                sampler=Stuck(),
-                rounds=protocol.rounds,
-                batch_size=protocol.batch_size,
-                pool_size=32,
-            )
-
         result = run_benchmark(
-            Additive(), {"stuck": stuck}, Protocol(rounds=3, batch_size=8), seeds=[0, 1]
+            Additive(), {"stuck": stuck_arm()}, Protocol(rounds=3, batch_size=8), seeds=[0, 1]
         )
         assert result.arms["stuck"].underspent
         assert "underspent" in result.report()
+
+    def test_a_seed_that_exhausted_does_not_erase_the_ones_that_did_not(self):
+        # `nan` in one seed's `best` makes every figure on the arm's line `nan`
+        # if it is averaged in, so one exhausted seed out of eight would hide
+        # seven perfectly good campaigns behind a broken-looking row.
+        result = run_benchmark(
+            Additive(),
+            {"flaky": flaky_arm()},
+            Protocol(rounds=3, batch_size=8),
+            seeds=list(range(8)),
+        )
+        arm_result = result.arms["flaky"]
+
+        assert arm_result.failed == 4
+        assert np.isfinite(arm_result.regret[np.isfinite(arm_result.regret)]).any()
+        assert "nan" not in arm_result.summary()
+
+    def test_the_seeds_it_lost_are_named_rather_than_dropped(self):
+        # The other half. A mean quietly taken over survivors reports a subset
+        # while the header goes on claiming the full seed count, which is the
+        # same absence -- an arm that looks complete and is not.
+        result = run_benchmark(
+            Additive(),
+            {"flaky": flaky_arm()},
+            Protocol(rounds=3, batch_size=8),
+            seeds=list(range(8)),
+        )
+        assert "4 exhausted" in result.arms["flaky"].summary()
+        assert "4 exhausted" in result.report()
 
     def test_the_report_names_the_budget(self):
         result = run_benchmark(

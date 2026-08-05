@@ -415,6 +415,7 @@ class Campaign:
         self._environment = environment
         self._reanchor = reanchor
         self._sampler_factory = sampler_factory
+        self._completed: tuple[RoundRecord, ...] = ()
         if reanchor:
             self._check_can_reanchor()
 
@@ -458,6 +459,24 @@ class Campaign:
         return self._sampler
 
     @property
+    def completed_rounds(self) -> tuple[RoundRecord, ...]:
+        """The rounds that finished, readable after a run that did not.
+
+        [run][evogfn.loop.campaign.Campaign.run] returns a ledger only when
+        every round filled its plate, so a campaign that raises takes its whole
+        history with it -- and the caller is left unable to say whether it
+        failed in round one having measured nothing or in round four having
+        measured 288 designs. Those are different findings, and the difference
+        is exactly what a stored record of the failure has to carry.
+
+        Returns:
+            One record per completed round, in order, and empty before the first
+            round finishes. On a run that completed this is the same tuple the
+            result carries.
+        """
+        return self._completed
+
+    @property
     def environment(self) -> MutationEnvironment | None:
         """The environment as currently anchored, or ``None`` if none was given.
 
@@ -488,6 +507,7 @@ class Campaign:
         values: list[Fitness] = []
         seen: set[bytes] = set()
         records: list[RoundRecord] = []
+        self._completed = ()
         best_so_far = float("-inf")
         spent = 0
         # The anchor moves; the wild type is what distance is measured from, so
@@ -533,6 +553,10 @@ class Campaign:
                 )
             best_so_far = record.best_so_far
             records.append(record)
+            # Published on the campaign as each round lands, not at the end: the
+            # whole point of this field is to survive the raise, and a run that
+            # raises never reaches the end.
+            self._completed = tuple(records)
             metrics = {
                 "best_so_far": record.best_so_far,
                 "best_in_round": record.best_in_round,

@@ -42,15 +42,23 @@ from evogfn.benchmark.selection import (
 
 
 class Record:
-    """The two fields the rule reads, which is all a stored record needs here."""
+    """The fields the rule reads, which is all a stored record needs here.
 
-    def __init__(self, regret, diversity=1.0):
+    ``exhausted`` defaults to a completed campaign, which is what every case
+    below that does not say otherwise means. A double that omitted it entirely
+    would not type-check against `Scored`, and that is the intended pressure: a
+    reader of stored records has to have an answer for a campaign that never
+    finished.
+    """
+
+    def __init__(self, regret, diversity=1.0, exhausted=False):
         self.regret = regret
         self.diversity = diversity
+        self.exhausted = exhausted
 
 
-def arm(regrets, diversity=1.0):
-    return {i: Record(r, diversity) for i, r in enumerate(regrets)}
+def arm(regrets, diversity=1.0, exhausted=False):
+    return {i: Record(r, diversity, exhausted) for i, r in enumerate(regrets)}
 
 
 class TestAClearWinner:
@@ -144,6 +152,63 @@ class TestPartialFailure:
             "steady": {i: Record(0.5, 1.0) for i in range(20)},
         }
         assert select(records).tied == ("flaky",)
+
+
+class TestAnArmThatCouldNotFinish:
+    """A campaign that exhausted is evidence about the arm, not a missing number.
+
+    The distinction these pin is the one that makes them necessary at all: every
+    record below carries a *finite, excellent* regret on the seeds it failed on.
+    A rule that excluded failures only because their regret happened to be `nan`
+    would pass every test here by accident and would select a configuration that
+    cannot complete a campaign the moment a failed record arrived carrying a
+    number -- and nothing downstream re-checks the choice.
+    """
+
+    def records(self):
+        """A flaky arm that exhausts on half its seeds, against a steady one."""
+        return {
+            "flaky": {i: Record(0.01, 99.0, exhausted=i % 2 == 0) for i in range(20)},
+            "steady": {i: Record(0.5, 1.0) for i in range(20)},
+        }
+
+    def test_it_is_not_chosen_on_the_seeds_it_survived(self):
+        # The seeds an arm fails on are the hard ones, so a mean over the rest is
+        # its own best case. This rule chooses *our* configuration, and one that
+        # cannot finish a campaign is not one to ship whatever it scores where it
+        # did finish.
+        assert select(self.records()).chosen == "steady"
+
+    def test_its_mean_says_it_was_not_eligible(self):
+        # Reported rather than hidden: the caption drawn from this has to be able
+        # to say the arm was excluded, not that it scored badly.
+        assert select(self.records()).regret["flaky"] == float("inf")
+
+    def test_it_cannot_reach_the_tie_break_it_would_win(self):
+        # Diversity of 99 against 1. Were the arm merely tied rather than
+        # excluded, the tie-break would hand it the selection outright.
+        assert select(self.records()).tied == ("steady",)
+
+    def test_every_arm_exhausting_leaves_nothing_to_choose(self):
+        # A confident-looking choice between two arms that both failed is the one
+        # outcome worse than an error here.
+        with pytest.raises(ValueError, match="failed on every"):
+            select(
+                {
+                    "a": arm([0.1] * 5, exhausted=True),
+                    "b": arm([0.2] * 5, exhausted=True),
+                }
+            )
+
+    def test_a_screen_does_not_leave_it_in_the_plausible_set(self):
+        # `indistinguishable` is read as "the evidence cannot rank these against
+        # the leader", and a shortlist is drawn from it. An arm that exhausted
+        # has been ranked -- it failed -- so leaving it unseparated would let it
+        # be nominated into a confirmation it should never reach.
+        screen = rank_screen("gfn-subtb", self.records())
+
+        assert screen.leader.name == "steady"
+        assert "flaky" not in screen.indistinguishable
 
 
 def test_only_shared_seeds_are_used():

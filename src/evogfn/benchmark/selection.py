@@ -82,13 +82,19 @@ if TYPE_CHECKING:
 
 
 class Scored(Protocol):
-    """The two numbers the rule reads from a stored campaign.
+    """The two numbers the rule reads from a stored campaign, and its standing.
 
-    Structural rather than a `RunRecord`, because the rule is arithmetic over
-    two fields and nothing else about a record concerns it. That keeps the rule
-    testable against hand-built cases -- a selection procedure whose behaviour
-    can only be exercised by running campaigns is one whose edge cases go
-    unexercised.
+    Structural rather than a `RunRecord`, because the rule is arithmetic over a
+    couple of fields and nothing else about a record concerns it. That keeps the
+    rule testable against hand-built cases -- a selection procedure whose
+    behaviour can only be exercised by running campaigns is one whose edge cases
+    go unexercised.
+
+    ``exhausted`` is declared here rather than reached for with ``getattr``
+    precisely because it must not be optional to consider. A reader that forgets
+    it averages a failed campaign into a mean and picks a configuration on the
+    strength of the seeds it survived; making it part of the shape means a new
+    reader has to look at it.
     """
 
     @property
@@ -98,6 +104,10 @@ class Scored(Protocol):
     @property
     def diversity(self) -> float:
         """Mean pairwise distance among the top designs."""
+
+    @property
+    def exhausted(self) -> bool:
+        """Whether the campaign behind this record failed to finish."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -128,10 +138,39 @@ class Selection:
 def _means(
     records: Mapping[str, Mapping[int, Scored]], seeds: list[int]
 ) -> tuple[dict[str, float], dict[str, float]]:
-    """Mean regret and diversity per arm over the shared seeds."""
+    """Mean regret and diversity per arm over the shared seeds.
+
+    An arm that exhausted on any shared seed is made ineligible outright rather
+    than scored on the seeds it survived, and that is a different decision from
+    the one below it about a missing number. A ``nan`` regret is a quantity this
+    campaign does not report; an exhausted seed is a campaign that **could not be
+    run to the end**, which is a property of the configuration being selected,
+    and the seeds it failed on are the hard ones. Averaging over the rest picks
+    the configuration on its own best-case subset -- and does so silently, since
+    the mean it produces is a perfectly ordinary number.
+
+    Ineligible, not merely penalised: this rule chooses *our own* configuration,
+    and one that cannot complete a campaign is not a configuration to ship
+    whatever it scores where it did complete.
+
+    Nothing stored before ``exhausted`` existed can be affected, since it
+    defaults to ``False`` -- so no selection already made moves under this.
+
+    Args:
+        records: Stored records per arm, keyed by seed.
+        seeds: The seeds every arm holds.
+
+    Returns:
+        Mean regret and mean diversity per arm, with ``inf``/``-inf`` for an arm
+        that is not eligible to be chosen.
+    """
     regret: dict[str, float] = {}
     diversity: dict[str, float] = {}
     for name, held in records.items():
+        if any(held[s].exhausted for s in seeds):
+            regret[name] = float("inf")
+            diversity[name] = float("-inf")
+            continue
         values = np.array([held[s].regret for s in seeds], dtype=np.float64)
         finite = values[np.isfinite(values)]
         # An arm that failed on some seeds is scored on the ones it survived,
@@ -193,7 +232,10 @@ def select(records: Mapping[str, Mapping[int, Scored]]) -> Selection:
     regret, diversity = _means(records, shared)
     leader = min(regret, key=lambda name: regret[name])
     if not np.isfinite(regret[leader]):
-        raise ValueError("every arm failed on every shared seed")
+        raise ValueError(
+            "every arm failed on every shared seed, or exhausted on one of them; "
+            "nothing here is eligible to be chosen"
+        )
 
     # Everything a paired comparison cannot separate from the leader is still in
     # the running, including arms with a worse mean: losing by less than the
@@ -202,6 +244,11 @@ def select(records: Mapping[str, Mapping[int, Scored]]) -> Selection:
     reference = np.array([records[leader][s].regret for s in shared], dtype=np.float64)
     for name in sorted(records):
         if name == leader:
+            continue
+        # An ineligible arm cannot be tied into the running by the back door.
+        # `_means` has already refused it, and a tie is what would otherwise
+        # carry it into the diversity tie-break and let it win there.
+        if not np.isfinite(regret[name]):
             continue
         mine = np.array([records[name][s].regret for s in shared], dtype=np.float64)
         if not np.isfinite(mine).all() or not np.isfinite(reference).all():
@@ -819,7 +866,9 @@ class Ranked:
         diversity: Mean top-K diversity over the same seeds.
         separated: Whether a paired comparison separates it from its screen's
             leader. ``True`` for the leader itself, since nothing separates it
-            from itself and it is not a candidate for being merged into a tie.
+            from itself and it is not a candidate for being merged into a tie,
+            and ``True`` for a configuration that exhausted on a shared seed --
+            that one is not unresolved, it is out.
         regrets: The per-seed regrets the mean was taken over, in the screen's
             seed order. Carried rather than summarised away because the only
             comparison left to make -- one screen's leader against another's --
@@ -918,8 +967,15 @@ def rank_screen(objective: str, records: Mapping[str, Mapping[int, Scored]]) -> 
         # and a crash there would only be reached after the campaigns were paid
         # for.
         usable = len(shared) > 1 and bool(np.isfinite(mine).all() and np.isfinite(reference).all())
-        separated = name == leader or (
-            usable and compare(name, mine, reference, higher_is_better=False).significant
+        # An ineligible arm counts as separated, which is not a technicality:
+        # `indistinguishable` is read as "the evidence cannot rank these against
+        # the leader", and an arm that exhausted has been ranked -- it failed.
+        # Left unseparated it would swell the plausible set and could be
+        # nominated out of it.
+        separated = (
+            name == leader
+            or not np.isfinite(regret[name])
+            or (usable and compare(name, mine, reference, higher_is_better=False).significant)
         )
         finite = mine[np.isfinite(mine)]
         ranked.append(

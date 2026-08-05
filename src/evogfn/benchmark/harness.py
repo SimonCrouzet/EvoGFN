@@ -49,9 +49,14 @@ ArmFactory = Callable[[int, "Protocol"], Campaign]
 class ArmResult:
     """What one method did across every seed.
 
+    A seed on which the campaign exhausted is carried as ``nan`` in ``best`` and
+    therefore in ``regret``; see `run_benchmark`. Every reader below has to
+    decide what to do with those, and they do not all decide the same thing.
+
     Attributes:
         name: The arm's label.
-        best: Best value found, per seed.
+        best: Best value found, per seed. ``nan`` where the campaign could not
+            finish, which is a different statement from a bad value.
         regret: Distance to the optimum, per seed. Empty when the landscape
             does not know its optimum.
         diversity: Mean pairwise Hamming distance over everything measured.
@@ -75,16 +80,38 @@ class ArmResult:
         """
         return bool((self.spent < self.budget).any())
 
+    @property
+    def failed(self) -> int:
+        """Seeds whose campaign produced no measurement at all.
+
+        Counted rather than inferred from a ``nan`` in the printed mean: a
+        summary line reading ``nan`` says something went wrong somewhere on this
+        arm, and this says how often and lets the rest of the line still be read.
+        """
+        return int((~np.isfinite(self.best)).sum())
+
     def summary(self) -> str:
-        """One line: the metric, its standard error, and the spend."""
+        """One line: the metric, its standard error, the spend, and the failures.
+
+        The mean is taken over the seeds that produced a measurement, and the
+        seeds that did not are reported as a count beside it. Both halves are
+        load-bearing. Averaging ``nan`` in makes every figure on the line ``nan``,
+        so one exhausted seed hides fifteen good ones; dropping them without
+        saying so reports a mean over a subset while the header claims the full
+        seed count, which is the failure this whole line exists to avoid making
+        elsewhere.
+        """
         metric = self.regret if self.regret.size else -self.best
         label = "regret" if self.regret.size else "-best"
-        error = metric.std(ddof=1) / np.sqrt(metric.size) if metric.size > 1 else 0.0
+        usable = metric[np.isfinite(metric)]
+        error = usable.std(ddof=1) / np.sqrt(usable.size) if usable.size > 1 else 0.0
+        mean = usable.mean() if usable.size else float("nan")
         spend = f"{self.spent.mean():.0f}/{self.budget}"
         flag = " (underspent)" if self.underspent else ""
+        failed = f" ({self.failed} exhausted)" if self.failed else ""
         return (
-            f"{self.name:<24}{label} {metric.mean():>7.3f} +/- {error:<6.3f}"
-            f"div {self.diversity.mean():>5.2f}  spent {spend}{flag}"
+            f"{self.name:<24}{label} {mean:>7.3f} +/- {error:<6.3f}"
+            f"div {self.diversity.mean():>5.2f}  spent {spend}{flag}{failed}"
         )
 
 
@@ -104,6 +131,15 @@ class BenchmarkResult:
 
     def against(self, reference: str, *, metric: str = "regret") -> list[PairedComparison]:
         """Compare every arm against one of them, paired across seeds.
+
+        A seed on which either arm exhausted is **not** dropped here, unlike in
+        [ArmResult.summary][evogfn.benchmark.harness.ArmResult.summary], and the
+        difference is deliberate: this comparison is paired, so dropping a seed
+        from one arm would silently unpair the rest and compare two different
+        seed sets. The ``nan`` propagates instead -- through the mean and through
+        the interval, so the comparison reports itself as unresolvable rather
+        than as a win for either side. Reading it as a null would be a mistake,
+        which is why the arm's own line carries the exhausted count.
 
         Args:
             reference: Name of the arm to compare against.
