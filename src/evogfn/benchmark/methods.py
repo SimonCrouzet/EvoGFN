@@ -40,11 +40,69 @@ acquisition rule are constitutive of that pipeline rather than extras handed to
 it -- the same standing the proxy has for a GFlowNet. Taking them away would
 leave an arm called ALDE that is not ALDE.
 
-What is *not* here is as much a decision as what is. Simulated annealing appears
-in no baseline table of either lineage this suite is measured against, so it is
-not an arm; [SimulatedAnnealing][evogfn.algorithms.baselines.annealing.SimulatedAnnealing]
+One baseline is run twice, because its budget is not ours
+---------------------------------------------------------
+
+MLDE's published protocol is 384 screened variants plus a designed plate: 480
+assays, against the 384 every other arm here spends. It does not fit, and there
+is no configuration in which it does -- its *training set alone* is this suite's
+whole budget. So it runs twice. `mlde` is the compressed arm, trained on one
+plate instead of four, which is a handicap its own module names and quantifies;
+`mlde-over-budget` is the published protocol, screening every plate the task
+affords and designing one more.
+
+Beating a baseline at *its own* budget is a stronger claim than beating it at
+ours, and it is the only version of the claim that survives the obvious
+objection. Reporting only the compressed arm would leave the headline resting on
+a comparator we had shortened, with nothing in the table saying so; reporting
+only the over-budget arm would compare across budgets, which is the failure
+[Protocol][evogfn.benchmark.protocol.Protocol] exists to make visible. Both rows,
+and the arm that costs more says so in its name.
+
+What is *not* here is as much a decision as what is
+---------------------------------------------------
+
+**Simulated annealing** appears in no baseline table of either lineage this suite
+is measured against, so it is not an arm;
+[SimulatedAnnealing][evogfn.algorithms.baselines.annealing.SimulatedAnnealing]
 remains available to anyone who wants the comparison, and a registry entry is
 what would put it in a results row.
+
+**δ-CS** (Kim et al., *Improved Off-policy Reinforcement Learning in Biological
+Sequence Design*, ICML 2025) is excluded, and the reasoning is worth writing down
+because it is the comparator a reviewer is most likely to name. Its own algorithm
+is four steps: draw a high-scoring sequence from a **rank-based reweighted prior
+over an offline dataset**, mask each position i.i.d. Bernoulli(δ), re-fill the
+masked positions with a GFlowNet forward policy trained by trajectory balance,
+and adapt δ from a proxy ensemble's disagreement, δ(x) = δ_const - λσ(x). It runs
+at 10 rounds of 128, so 1,280 assays.
+
+Three of those four steps have no faithful reading here:
+
+* **There is no offline dataset.** A campaign in this suite starts from a wild
+  type and zero measurements; δ-CS's benchmarks start from thousands of labelled
+  sequences, and its headline result -- high-scoring designs "even with a single
+  active round" -- is a statement about that prior. Step one has nothing to draw
+  from at round zero, and whatever we substituted would be ours.
+* **δ indexes a set we would have to choose.** The published δ is per position of
+  the *whole sequence*. This suite's state is a set of substitutions inside a
+  mutation budget, so "mask with probability δ" can mean the whole sequence or
+  only the applied substitutions, and at the shipped defaults those differ by
+  roughly a factor of six in how much they destroy. Neither is the paper's, and
+  picking one is a choice we make on the baseline's behalf -- the same objection
+  that keeps [_cmaes_exact][evogfn.benchmark.methods._cmaes_exact] out of the
+  table.
+* **It is a GFlowNet.** δ-CS is trajectory balance plus a destroy-and-rebuild
+  operator and a proxy ensemble; this project's arms are trajectory balance
+  family objectives plus a proxy ensemble. An arm we implemented, tuned and
+  placed in the *baselines* column, then beat with our own, would be a comparison
+  between two of our implementations wearing someone else's citation. Where it
+  belongs, if it is ever run, is beside `gfn-tb` as a variant at its own budget
+  -- not in `BASELINES`.
+
+That is an exclusion with a reason rather than an omission, which is the
+distinction this section exists to mark: ``docs/limitations.md`` already lists
+δ-CS among the controls that were not run, and it stays there.
 
 What replaces the silent default is a named ladder on one representative
 baseline, `BASELINES`. It answers the attribution question a reviewer will ask
@@ -105,9 +163,12 @@ any change to this module.
 
 from __future__ import annotations
 
+import json
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from functools import cache
 from itertools import count
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -390,6 +451,7 @@ def _campaign(  # noqa: PLR0913 - a campaign is defined by its protocol
     build: Callable[[MutationEnvironment], Sampler],
     surrogate: DeepEnsemble | None,
     *,
+    protocol: Protocol | None = None,
     pool_size: int = DEFAULT_POOL,
     distinct_batch: bool = False,
     acquisition: Acquisition | None = None,
@@ -407,6 +469,12 @@ def _campaign(  # noqa: PLR0913 - a campaign is defined by its protocol
             it rebuilds come from one place and cannot drift apart.
         surrogate: Model fitted to the measurements, or ``None`` for the
             unassisted ablation.
+        protocol: The rounds and plate this campaign runs, or ``None`` for the
+            task's own. Only an arm whose *published* protocol does not fit the
+            task's passes anything here, and it names itself accordingly -- see
+            `classical`'s ``extra_rounds``. Everything else takes the task's, so
+            the harness's guarantee that one protocol reaches every arm holds by
+            default and is departed from only where a row says so.
         pool_size: Candidates the sampler is asked for per proposal call, or
             `PLATE_POOL` for exactly the plate. Passed in rather than computed
             here because it is the method's published population, not a harness
@@ -429,15 +497,16 @@ def _campaign(  # noqa: PLR0913 - a campaign is defined by its protocol
         The campaign, which refuses at construction if the task asks to
         re-anchor and anything needed for it is missing.
     """
+    resolved = task.protocol if protocol is None else protocol
     return Campaign(
         landscape=landscape,  # type: ignore[arg-type]
         sampler=build(env),
         surrogate=surrogate,
         acquisition=acquisition or Greedy(),
         selector=TopK(),
-        rounds=task.protocol.rounds,
-        batch_size=task.protocol.batch_size,
-        pool_size=(task.protocol.batch_size if pool_size == PLATE_POOL else pool_size),
+        rounds=resolved.rounds,
+        batch_size=resolved.batch_size,
+        pool_size=(resolved.batch_size if pool_size == PLATE_POOL else pool_size),
         distinct_batch=distinct_batch,
         environment=env,
         reanchor=task.reanchor,
@@ -614,6 +683,7 @@ def classical(  # noqa: PLR0913 - each argument names one published component
     distinct_batch: bool = False,
     acquisition: AcquisitionBuilder | None = None,
     bootstrap: bool = False,
+    extra_rounds: int = 0,
 ) -> Methodology:
     """A classical baseline, as published or with a named piece added.
 
@@ -656,6 +726,33 @@ def classical(  # noqa: PLR0913 - each argument names one published component
             measure.
         bootstrap: Fit each ensemble member to a resample of the measurements.
             Inert without ``surrogate``, since there is then no ensemble to fit.
+        extra_rounds: Plates this arm runs **beyond the task's own budget**,
+            because its published protocol does not fit inside that budget. This
+            is the one argument here that breaks the harness's "every arm sees
+            the same protocol" guarantee, so it is deliberately the crudest
+            possible knob -- whole rounds at the task's own plate, never a
+            different plate and never a different radius per round -- and an arm
+            that sets it must say so in its name.
+
+            The only arm that does is MLDE, whose protocol is
+            `PUBLISHED_TRAINING_SIZE` screened variants plus one designed plate.
+            On this suite's four-plate protocol one extra plate resolves to
+            exactly Wittmann et al.'s 480, with exactly their 384-variant
+            training split; on a task of another shape it is the same protocol at
+            that task's scale, screen everything then design one plate more.
+
+            Two consequences a reader has to be told about, since neither is
+            visible in the stored ``protocol`` field -- which is the *task's*
+            repr, written by [run_task][evogfn.benchmark.suite.run_task] and not
+            by the arm. First, the record's ``oracle_calls`` exceeds the budget
+            that field names, and that gap *is* the disclosure. Second, on a
+            re-anchoring task an extra round is also an extra round of *reach*:
+            the task's audited attainable optimum is taken over
+            [Task.search_budget][evogfn.benchmark.tasks.Task.search_budget]
+            rounds, so a regret stored for this arm is taken against a bound
+            derived for a shorter campaign and can come out negative. That is a
+            real limitation of running an over-budget arm inside a per-task
+            audit, not a bug in either.
 
     Returns:
         A methodology, carrying the settings above so that a record written by
@@ -665,6 +762,15 @@ def classical(  # noqa: PLR0913 - each argument names one published component
 
     def methodology(task: Task, seed: int) -> Campaign:
         landscape, env, ensemble = _parts(task, seed, bootstrap=bootstrap)
+        # Resolved once and handed to both the builder and the campaign. A
+        # builder that laid its designs out across the task's plate count while
+        # the campaign ran a different one would be a walk whose site order and
+        # whose rounds disagreed, and nothing would raise.
+        protocol = (
+            task.protocol
+            if extra_rounds == 0
+            else replace(task.protocol, rounds=task.protocol.rounds + extra_rounds)
+        )
         # One proxy for the whole campaign, closed over rather than rebuilt: it
         # wraps the surrogate instance the campaign refits in place, and a fresh
         # one per anchor would still see the same model but would make that
@@ -679,7 +785,7 @@ def classical(  # noqa: PLR0913 - each argument names one published component
 
         def make(anchored: MutationEnvironment) -> Sampler:
             """Build the baseline against whichever anchor the campaign is at."""
-            sampler = build(anchored, _anchor_seed(seed, next(generation)), task.protocol)
+            sampler = build(anchored, _anchor_seed(seed, next(generation)), protocol)
             return sampler if proxy is None else ProxyOptimising(sampler, proxy=proxy)
 
         return _campaign(
@@ -688,6 +794,7 @@ def classical(  # noqa: PLR0913 - each argument names one published component
             env,
             make,
             ensemble if surrogate else None,
+            protocol=protocol,
             pool_size=pool_size,
             distinct_batch=distinct_batch,
             acquisition=None if acquisition is None else acquisition(seed),
@@ -717,6 +824,10 @@ def classical(  # noqa: PLR0913 - each argument names one published component
             # draw it made.
             "acquisition": "Greedy" if acquisition is None else type(acquisition(0)).__name__,
             "bootstrap": bootstrap,
+            # Rounds beyond the task's, so a record says by how much its arm
+            # exceeded the budget the `protocol` field beside it names. Zero for
+            # every arm that ran the task's own protocol, which is all but one.
+            "extra_rounds": extra_rounds,
         },
     )
 
@@ -998,6 +1109,44 @@ def _mlde(env: MutationEnvironment, seed: int, _protocol: Protocol) -> Sampler:
     return MLDE(env, seed=seed)
 
 
+def _mlde_as_published(env: MutationEnvironment, seed: int, protocol: Protocol) -> Sampler:
+    """MLDE at Wittmann et al.'s own split: screen every plate but the last.
+
+    The published protocol is a *training size*, not a budget: screen 384
+    variants at random, fit the ensemble to them, and spend one more plate on
+    what it predicts best. Compressed into this suite's 384 assays that becomes
+    one training plate instead of four, which its own module records as a
+    handicap -- the paper's outcome improves with training-set size, so a
+    96-variant MLDE is a weaker MLDE.
+
+    So the training size is read off the protocol rather than pinned at
+    [PUBLISHED_TRAINING_SIZE][evogfn.algorithms.baselines.mlde.PUBLISHED_TRAINING_SIZE].
+    Every plate but the last is screening; the last is the designed plate. On
+    the four-plate protocol this task's arm is registered against, that *is*
+    384 and 96 -- the published numbers, reached by construction rather than by
+    two constants agreeing, which is what keeps the arm on Wittmann et al.'s
+    split if the shared protocol ever moves.
+
+    Pinning 384 outright would be worse in exactly one way and it is the way that
+    matters: on any task whose whole campaign is shorter than 384 the sampler
+    would never reach its training size, would propose at random for every round,
+    and would still be tabled as MLDE. A random arm under a supervised arm's name
+    is the failure this whole module is arranged against.
+
+    One thing this does *not* fix, because it belongs to the sampler and to
+    `mlde` equally. The handover is gated on **usable** measurements:
+    [MLDE.observe][evogfn.algorithms.baselines.mlde.MLDE.observe] drops an
+    infeasible assay, having no fitness to regress on. So on a landscape with a
+    transition constraint the screening plates yield fewer training examples than
+    they cost, the model takes over later than the protocol says, and where the
+    infeasible share is large it never takes over at all -- at which point the
+    row is a random baseline under a supervised method's name. Reading
+    ``is_fitted`` off the finished sampler is what distinguishes the two, and
+    nothing in the spend or the plate count does.
+    """
+    return MLDE(env, training_size=protocol.batch_size * (protocol.rounds - 1), seed=seed)
+
+
 def _single_step(env: MutationEnvironment, seed: int, protocol: Protocol) -> Sampler:
     """Traditional directed evolution, to ALDE's specification.
 
@@ -1074,7 +1223,10 @@ def _feasible_genetic(env: MutationEnvironment, seed: int, _protocol: Protocol) 
 #: ``single-step``        the wet-lab lineage's DE walk, and the other half
 #:                        of the intersection
 #: ``recomb``             the wet-lab lineage's independent-site DE variant
-#: ``mlde``               the supervised protein-engineering reference
+#: ``mlde``               the supervised protein-engineering reference,
+#:                        compressed to the shared budget
+#: ``mlde-over-budget``   the same reference at the budget its paper spends,
+#:                        which is one plate more than this suite gives anyone
 #: ``alde``               its active-learning successor, on this suite's own
 #:                        landscapes and budget shape
 #: ``genetic``            the Ehrlich lineage's only baseline, and the arm the
@@ -1126,6 +1278,22 @@ BASELINES: dict[str, Methodology] = {
     # its published protocol, not a favour from the harness. Shrinking it to a
     # plate would leave an arm called MLDE that is not MLDE.
     "mlde": classical(_mlde, pool_size=DEFAULT_POOL),
+    # The same method at the budget its own paper spends: 384 screened plus a
+    # designed plate, which is 480 against everyone else's 384. It is here
+    # *because* it does not fit -- an arm compressed to a quarter of its training
+    # set is a weaker arm, and a headline resting on the compressed row alone
+    # would be resting on a comparator we had shortened. Named for the fact
+    # rather than for the number: one extra plate is over budget on every task in
+    # the suite, while "480" is only the resolved total where the plate is 96.
+    #
+    # Two things a reader of its row has to hold on to. The stored `protocol`
+    # field is the task's, so it names 384 while this arm spent 480 -- the gap
+    # shows as `oracle_calls`, and `extra_rounds` in the arm's own parameters
+    # says where it came from. And on a re-anchoring task the extra plate is
+    # extra reach as well as extra assays, so this arm's regret is taken against
+    # an attainable bound audited for a shorter campaign; read its `best` rather
+    # than its `regret` where the two disagree.
+    "mlde-over-budget": classical(_mlde_as_published, pool_size=DEFAULT_POOL, extra_rounds=1),
     # ALDE: the same library screen, and then the three things its own authors
     # name as what it adds over MLDE -- rounds, an uncertainty-bearing surrogate,
     # and a non-greedy rule to read that uncertainty with. Their bench
@@ -1297,24 +1465,357 @@ def anchor_arms() -> dict[str, Methodology]:
     }
 
 
-def variant_arms() -> dict[str, Methodology]:
-    """The GFlowNet ladder: two mechanisms, each one rung above plain ``gfn-tb``.
+#: Where the selection phase records the configuration this project ships.
+#:
+#: The *same relative path* ``experiments/run_suite.py``'s ``selected_gflownet``
+#: reads, and the same
+#: string rather than a path resolved from ``__file__``, deliberately. A library
+#: resolving a data file against the working directory is poor practice in
+#: general; here the property that has to hold is stronger than that objection.
+#: The ladder's base rung and the headline table's GFlowNet arm must be *the same
+#: arm*, and two readers that resolve the same file differently -- one finding it
+#: from the repository root, one not finding it from somewhere else -- break
+#: exactly that. Resolving it identically to the only other reader is what makes
+#: disagreement impossible rather than unlikely.
+SELECTED_CONFIGURATION = Path("results/selected.json")
+
+#: Every axis the selection moves. Absent and null are different claims -- null
+#: says the chosen objective reads no such knob, absent says the file predates
+#: the stage that chose it -- so a missing key raises rather than defaulting, on
+#: the same reasoning as the reader in ``experiments/run_suite.py``: a ladder
+#: built from a file missing an axis would run the default on it and report the
+#: result as the shipped configuration.
+_SELECTED_AXES = ("objective", "arm", "beta", "steps", "lam", "mix", "hidden_dim")
+
+#: The landscape shape the capacity-matched control is sized at: the diagnostic
+#: instance, which is the only landscape the ladder tier runs on.
+#:
+#: A parameter count depends on the sequence length and the alphabet -- they fix
+#: the trunk's input width and the action head's output width -- so "the plain
+#: policy that matches the conditioned one" is a statement about *one* sizing.
+#: Named here rather than imported from
+#: [suite][evogfn.benchmark.suite] because that module imports this one, and a
+#: test pins the pair against the diagnostic instance so that a tier moved to
+#: another landscape fails loudly instead of shipping a control matched to a
+#: landscape nobody runs.
+LADDER_SEQUENCE_LENGTH = 32
+LADDER_VOCAB_SIZE = 20
+
+
+def _parameter_count(hidden_dim: int, *, learn_flow: bool, anchor_conditioned: bool) -> int:
+    """Parameters a ladder policy of this width carries, by construction.
+
+    Built and counted rather than computed from a formula. The closed forms are
+    easy to write and easy to get subtly wrong -- an embedding table, a bias, a
+    flow head -- and a control mis-sized by a formula error is a control that
+    reports capacity as conditioning.
+
+    Args:
+        hidden_dim: Width of the trunk.
+        learn_flow: Whether the policy carries a flow head.
+        anchor_conditioned: Whether the anchor is fed alongside the state.
+
+    Returns:
+        The number of learnable parameters. The anchor itself is a buffer rather
+        than a parameter and so is correctly not counted: it is data the policy
+        reads, not capacity it has.
+    """
+    n_actions = LADDER_SEQUENCE_LENGTH * LADDER_VOCAB_SIZE + 1
+    shape = {
+        "n_tokens": LADDER_VOCAB_SIZE,
+        "sequence_length": LADDER_SEQUENCE_LENGTH,
+        "n_actions": n_actions,
+        "hidden_dim": hidden_dim,
+        "learn_flow": learn_flow,
+        "seed": 0,
+    }
+    policy = (
+        AnchorConditionedPolicy(anchor=np.zeros(LADDER_SEQUENCE_LENGTH, dtype=np.int64), **shape)  # type: ignore[arg-type]
+        if anchor_conditioned
+        else SequencePolicy(**shape)  # type: ignore[arg-type]
+    )
+    return sum(int(p.numel()) for p in policy.parameters())
+
+
+@cache
+def matched_hidden_dim(hidden_dim: int, *, learn_flow: bool) -> int:
+    """Trunk width at which a plain policy carries a conditioned one's capacity.
+
+    Anchor conditioning widens the trunk's *input* -- the state embedding, the
+    anchor embedding and one difference indicator per position -- so an
+    anchor-conditioned policy has more parameters than a plain one of the same
+    trunk width. At the ladder's sizing and ``hidden_dim = 64`` that is 179,715
+    against 112,131, a 60% difference in capacity. Any gain the ``+anchor`` rung
+    shows is confounded with that until a plain policy of matching size has been
+    measured, and no amount of care about the other axes removes the confound.
+
+    **No width matches exactly**, since the counts are quadratics in the width
+    that do not agree at any integer. The rule is therefore the *narrowest plain
+    trunk that is not smaller* than the conditioned one, which fixes the residual
+    on the safe side: a control that slightly over-resources the comparator can
+    only understate conditioning's effect, while one that under-resources it
+    manufactures the effect the arm exists to rule out. At the shipped width of
+    64 this resolves to 101, which is 179,952 parameters -- 237 above the
+    conditioned arm's 179,715, or 0.13% -- and 101 is also the *closest* integer
+    either way, the next width down being 178,083 and so 1,632 short.
+
+    Searched rather than solved, and every candidate is built and counted, so a
+    change to the architecture moves this instead of leaving it stating a
+    residual that stopped being true.
+
+    Args:
+        hidden_dim: Width of the anchor-conditioned trunk to match.
+        learn_flow: Whether both policies carry a flow head. The objective
+            decides this, so it is read from the base arm rather than assumed:
+            matched at the wrong setting the two counts differ by a head.
+
+    Returns:
+        The plain trunk width.
+    """
+    target = _parameter_count(hidden_dim, learn_flow=learn_flow, anchor_conditioned=True)
+    low = hidden_dim
+    high = max(hidden_dim, 1) * 2
+    while _parameter_count(high, learn_flow=learn_flow, anchor_conditioned=False) < target:
+        low, high = high, high * 2
+    # Invariant: `low` is short of the target and `high` is not, so the answer is
+    # the first width above `low`, and the loop cannot return an untested width.
+    while high - low > 1:
+        middle = (low + high) // 2
+        if _parameter_count(middle, learn_flow=learn_flow, anchor_conditioned=False) < target:
+            low = middle
+        else:
+            high = middle
+    return high
+
+
+@dataclass(frozen=True)
+class LadderBase:
+    """The rung every other rung of `variant_arms` is one step above.
+
+    Carries the base arm *and* the parts it was built from, which is redundant
+    only in appearance. The arm is what the base rung runs, and it is built
+    exactly as the headline table builds its GFlowNet arm so the two share a
+    store cell; the parts are what the other rungs are built from, since a
+    methodology is a closure and a closure cannot be asked what objective it
+    holds. Rungs assembled from these fields differ from the base in the flag
+    they are named for and in nothing else, and a test asserts that rather than
+    the reader having to trust it.
+
+    Attributes:
+        name: The base arm's name, and therefore the prefix every rung takes.
+        arm: The base rung itself.
+        objective: The training objective the rungs rebuild with.
+        learn_flow: Whether the objective needs a flow head.
+        beta: Reward exponent.
+        steps: Gradient steps per round.
+        hidden_dim: Width of the policy trunk.
+    """
+
+    name: str
+    arm: Methodology
+    objective: GFlowNetObjective
+    learn_flow: bool
+    beta: float
+    steps: int
+    hidden_dim: int
+
+    def rung(self, **flags: bool | int) -> Methodology:
+        """One rung: the base configuration with the named mechanism turned on.
+
+        Args:
+            **flags: Arguments of [gflownet][evogfn.benchmark.methods.gflownet]
+                that this rung sets -- the two mechanism flags, or the widened
+                trunk of the capacity control.
+
+        Returns:
+            A methodology.
+        """
+        settings: dict[str, bool | int | float] = {
+            "beta": self.beta,
+            "steps": self.steps,
+            "learn_flow": self.learn_flow,
+            "hidden_dim": self.hidden_dim,
+        }
+        settings.update(flags)
+        return gflownet(self.objective, **settings)  # type: ignore[arg-type]
+
+
+def _objective_instance(name: str, lam: float | None) -> tuple[GFlowNetObjective, bool]:
+    """The objective a selection record names, and whether it needs a flow head.
+
+    Args:
+        name: An objective from `OBJECTIVES` or `flow_objectives`.
+        lam: Sub-trajectory balance's length weighting, or ``None`` for its own
+            default.
+
+    Returns:
+        The objective instance and its ``learn_flow`` requirement.
+
+    Raises:
+        KeyError: If the name is not a known objective.
+        ValueError: If the objective breeds. Genetic-GFN is built by
+            [genetic_gflownet][evogfn.benchmark.methods.genetic_gflownet], which
+            takes neither mechanism flag, so neither rung of this ladder is
+            definable for it -- and building the ladder on plain trajectory
+            balance instead, silently, would report a mechanism study of a
+            configuration nobody selected.
+    """
+    from evogfn.algorithms.gflownet.flow_objectives import (  # noqa: PLC0415
+        DEFAULT_LAMBDA,
+        DetailedBalance,
+        ForwardLookingDetailedBalance,
+        SubTrajectoryBalance,
+    )
+
+    if name == "gfn-tb":
+        return TrajectoryBalance(), False
+    if name == "gfn-contrastive":
+        return ContrastiveBalance(prune_threshold=0.1), False
+    if name == "gfn-db":
+        return DetailedBalance(), True
+    if name == "gfn-subtb":
+        return SubTrajectoryBalance(lam=DEFAULT_LAMBDA if lam is None else lam), True
+    if name == "gfn-fldb":
+        return ForwardLookingDetailedBalance(), True
+    if name == "genetic-gfn":
+        raise ValueError(
+            "the selected configuration is Genetic-GFN, which breeds and is built by "
+            "genetic_gflownet(); neither ladder mechanism is defined for it, so the "
+            "ladder cannot be built on the shipped configuration"
+        )
+    raise KeyError(f"unknown objective {name!r}")
+
+
+def shipped_base() -> LadderBase:
+    """The configuration this project ships, as the ladder's base rung.
+
+    Read from `SELECTED_CONFIGURATION` rather than restated, and built through
+    the selection phase's own
+    [_build_objective][evogfn.benchmark.selection._build_objective], so the base
+    rung and the arm ``experiments/run_suite.py`` puts in the headline table are
+    the same arm resolved from the same file by the same builder. Restating the
+    chosen settings here instead -- ``gfn-subtb`` at beta 0.1, 300 steps, lambda
+    0.9, width 64 -- would be one literal per axis that nothing would ever check,
+    and the ladder would go on claiming to study the shipped configuration for as
+    long as it took a selection to move.
+
+    Imported inside the function because `selection` imports this module: the
+    cycle is real and the lazy import is what breaks it. It costs nothing in
+    staleness terms, ``benchmark.selection`` already being one of the entry
+    points every record's fingerprint is expanded from.
+
+    Returns:
+        The base rung. With no selection recorded this is ``gfn-tb`` -- not as a
+        placeholder but because that is what the headline table reports in that
+        state: ``methods_for`` falls back to the untuned arms, so a ladder based
+        on anything else would be the one describing a configuration nobody runs.
+
+    Raises:
+        ValueError: If the file records a selection that stopped partway, or one
+            whose name and settings describe different configurations, or one
+            whose objective has no ladder. Raised rather than falling back to the
+            untuned defaults, which would silently answer a question about
+            trajectory balance under the name of the shipped method.
+    """
+    from evogfn.benchmark.selection import Configuration  # noqa: PLC0415
+
+    if not SELECTED_CONFIGURATION.exists():
+        return LadderBase(
+            name="gfn-tb",
+            # Looked up rather than rebuilt, so the base rung is the identical
+            # object -- and therefore the identical store cell -- that the
+            # objectives diagnostic has already paid a hundred seeds for.
+            arm=OBJECTIVES["gfn-tb"],
+            objective=TrajectoryBalance(),
+            learn_flow=False,
+            beta=DEFAULT_BETA,
+            steps=DEFAULT_TRAINING_STEPS,
+            hidden_dim=DEFAULT_HIDDEN_DIM,
+        )
+
+    choice = json.loads(SELECTED_CONFIGURATION.read_text())
+    if missing := [key for key in _SELECTED_AXES if key not in choice]:
+        raise ValueError(
+            f"{SELECTED_CONFIGURATION} is missing {', '.join(missing)}, so the selection it "
+            f"records is unfinished; run experiments/select_configuration.py to completion, "
+            f"or delete the file to build the ladder on the untuned defaults"
+        )
+    configuration = Configuration(
+        objective=str(choice["objective"]),
+        beta=float(choice["beta"]),
+        steps=int(choice["steps"]),
+        hidden_dim=int(choice["hidden_dim"]),
+        lam=None if choice["lam"] is None else float(choice["lam"]),
+        mix=None if choice["mix"] is None else float(choice["mix"]),
+    )
+    # The recorded name is not decoration: it is the store key every confirmation
+    # campaign was written under, so a file whose settings and name disagree
+    # would build one configuration and read another's results.
+    if configuration.name != str(choice["arm"]):
+        raise ValueError(
+            f"{SELECTED_CONFIGURATION} names arm {choice['arm']!r} but its settings build "
+            f"{configuration.name!r}; one of the two describes a campaign that never happened"
+        )
+    objective, learn_flow = _objective_instance(configuration.objective, configuration.lam)
+    return LadderBase(
+        name=configuration.name,
+        arm=configuration.build(),
+        objective=objective,
+        learn_flow=learn_flow,
+        beta=configuration.beta,
+        steps=configuration.steps,
+        hidden_dim=configuration.hidden_dim,
+    )
+
+
+def variant_arms(base: LadderBase | None = None) -> dict[str, Methodology]:
+    """The GFlowNet ladder: two mechanisms, each one rung above what ships.
 
     The same shape as the ``genetic+`` ladder in `BASELINES` and for the same
-    reason. Each rung adds exactly one thing to a base arm that is *looked up*
-    rather than re-declared, so the store's ``(task, arm)`` cell for ``gfn-tb``
-    is shared with every table that already paid for it, and the comparison is
+    reason. Each rung adds exactly one thing to a base arm that is *resolved*
+    rather than re-declared, so the store's ``(task, arm)`` cell for the base is
+    shared with every table that already paid for it, and the comparison is
     against the identical configuration by construction rather than by two
-    expressions agreeing:
+    expressions agreeing. Writing ``B`` for the base arm's name:
 
-    ==========================  =======================================================
-    arm                         what it adds
-    ==========================  =======================================================
-    ``gfn-tb``                  nothing; feasibility is masked at every intermediate
-    ``gfn-tb+terminal``         feasibility is required of the design, not of the order
-    ``gfn-tb+anchor``           the policy is told which parent it is evolving from
-    ``gfn-tb+terminal+anchor``  both
-    ==========================  =======================================================
+    ====================  =======================================================
+    arm                   what it adds
+    ====================  =======================================================
+    ``B``                 nothing; feasibility is masked at every intermediate
+    ``B+terminal``        feasibility is required of the design, not of the order
+    ``B+anchor``          the policy is told which parent it is evolving from
+    ``B+terminal+anchor`` both
+    ``B+wide``            neither; the capacity ``+anchor`` also brought
+    ====================  =======================================================
+
+    The base is what this project ships, not ``gfn-tb``
+    ---------------------------------------------------
+
+    It used to be ``gfn-tb``, and that was wrong in a way this repository can
+    demonstrate rather than merely suspect. The shipped configuration is
+    sub-trajectory balance, chosen by a pre-declared rule over 3,100 campaigns;
+    and the selection study measured the reward exponent on trajectory balance
+    and then again on sub-trajectory balance and **the curve reversed direction
+    between them**. An effect measured on one objective is therefore not known to
+    transfer to the other here, which makes a ladder built on trajectory balance
+    a study of an arm nobody runs -- and makes the claim that its both-on rung
+    "is the configuration the method would ship if both rungs win" a non sequitur,
+    since the configuration that ships is not on the ladder at all.
+
+    Whether to take the base as a parameter or read the selection here is a real
+    question and it is decided by *which drift is possible*, not by which
+    dependency reads better. A module that reaches into a results file is coupled
+    to it; a parameter with a restated default is coupled to nothing and drifts
+    the moment a selection moves, which is precisely the failure being fixed. So
+    the base is a parameter -- a caller with a configuration in hand passes it,
+    and tests can hand it one without a file on disk -- and the *default* is the
+    recorded selection, read through `shipped_base` from the same file and by the
+    same builder ``experiments/run_suite.py`` uses. The one caller in the suite
+    passes nothing, so the default is what the tier runs, and it cannot disagree
+    with the headline table about what ships.
+
+    Why there are four rungs and not three
+    --------------------------------------
 
     The both-on rung is not decoration. Unlike the ``genetic+`` ladder, whose
     rungs are nested -- each contains the one above it -- these two mechanisms
@@ -1325,28 +1826,59 @@ def variant_arms() -> dict[str, Methodology]:
     inherited residue from a substitution, and terminal feasibility is what makes
     the substitution orders unconstrained; a policy that can see which positions
     are its own is the one with something to do with that freedom. It is also the
-    configuration the method would ship if both rungs win, so it has to have been
-    run rather than inferred by addition.
+    configuration the method would ship if both rungs win -- which is a statement
+    about this ladder only now that its base is the shipped arm -- so it has to
+    have been run rather than inferred by addition.
+
+    Why there is a fifth arm that is not a rung
+    -------------------------------------------
+
+    ``B+wide`` is a control, not a step. Anchor conditioning widens the
+    trunk's input, so ``+anchor`` is *both* a conditioning change and a capacity
+    change, and a win there is unattributable until a plain policy of the same
+    size has been measured. Its width is resolved by `matched_hidden_dim`, which
+    builds candidates and counts them; at the shipped width it is 101, carrying
+    179,952 parameters against the conditioned arm's 179,715 -- 237 over, 0.13%,
+    and over rather than under on purpose, since a control given slightly more
+    capacity can only understate the mechanism it exists to isolate.
+
+    It carries the base arm's prefix for the same reason the rungs do, and it is
+    the arm that needed it most. Its *width* is derived from the base
+    configuration -- 101 matches a conditioned trunk of 64, and would match
+    nothing else -- so under the bare name it used to have, a stored record from
+    one selection and a record sized against a different selection were the same
+    ``(task, arm)`` cell and indistinguishable in the store. The rungs were
+    rebuilt to stand on the recorded selection precisely to close that drift; a
+    control left outside the naming scheme kept it open for the one arm whose
+    number is not on the ladder anywhere else.
 
     Kept out of `OBJECTIVES` deliberately. That mapping is read as a set of
     *training objectives* -- the configuration sweep resolves each of its keys to
-    an objective instance by name -- and none of these varies the objective. All
-    are plain trajectory balance; what differs is the graph one of them walks and
-    the input another one reads.
+    an objective instance by name -- and none of these varies the objective; what
+    differs is the graph one of them walks, the input another one reads and the
+    width of a third.
 
     No rung is available to a classical arm, and that is a property of the
     methods rather than of this module: conditioning needs a policy to condition,
     and nothing in `BASELINES` has one.
 
+    Args:
+        base: The rung everything else is one step above, or ``None`` for the
+            recorded selection.
+
     Returns:
         Methodologies by name.
     """
+    base = shipped_base() if base is None else base
     return {
-        "gfn-tb": OBJECTIVES["gfn-tb"],
-        "gfn-tb+terminal": gflownet(TrajectoryBalance(), terminal_feasibility=True),
-        "gfn-tb+anchor": gflownet(TrajectoryBalance(), anchor_conditioned=True),
-        "gfn-tb+terminal+anchor": gflownet(
-            TrajectoryBalance(), terminal_feasibility=True, anchor_conditioned=True
+        base.name: base.arm,
+        f"{base.name}+terminal": base.rung(terminal_feasibility=True),
+        f"{base.name}+anchor": base.rung(anchor_conditioned=True),
+        f"{base.name}+terminal+anchor": base.rung(
+            terminal_feasibility=True, anchor_conditioned=True
+        ),
+        f"{base.name}+wide": base.rung(
+            hidden_dim=matched_hidden_dim(base.hidden_dim, learn_flow=base.learn_flow)
         ),
     }
 

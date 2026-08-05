@@ -36,6 +36,7 @@ called ALDE with a greedy rule and an initialisation-variance ensemble is MLDE
 with extra rounds.
 """
 
+import json
 from types import SimpleNamespace
 
 import numpy as np
@@ -43,19 +44,31 @@ import pytest
 
 from evogfn.acquisition.rules import Thompson
 from evogfn.algorithms.baselines import SimulatedAnnealing
+from evogfn.algorithms.baselines.mlde import PUBLISHED_BUDGET
 from evogfn.algorithms.gflownet.flow_objectives import SubTrajectoryBalance
 from evogfn.algorithms.gflownet.objectives import TrajectoryBalance
 from evogfn.algorithms.inner_loop import ProxyOptimising
 from evogfn.benchmark.methods import (
     BASELINES,
+    DEFAULT_BETA,
+    DEFAULT_HIDDEN_DIM,
     DEFAULT_POOL,
+    DEFAULT_TRAINING_STEPS,
+    LADDER_SEQUENCE_LENGTH,
+    LADDER_VOCAB_SIZE,
     OBJECTIVES,
+    SELECTED_CONFIGURATION,
+    LadderBase,
     _RebuiltOnMove,
     anchor_arms,
     gflownet,
+    matched_hidden_dim,
+    shipped_base,
     variant_arms,
 )
 from evogfn.benchmark.protocol import Protocol
+from evogfn.benchmark.selection import _build_objective
+from evogfn.benchmark.suite import DIAGNOSTIC_INSTANCE
 from evogfn.benchmark.tasks import Task
 from evogfn.env.mutation import MutationEnvironment, TerminalFeasibilityEnvironment
 from evogfn.landscapes.ehrlich import EhrlichLandscape
@@ -106,6 +119,7 @@ EXPECTED_POOL = {
     "cmaes": BATCH,
     "adalead": BATCH,
     "mlde": DEFAULT_POOL,
+    "mlde-over-budget": DEFAULT_POOL,
     "alde": DEFAULT_POOL,
     "random+screen": DEFAULT_POOL,
     "genetic+screen": DEFAULT_POOL,
@@ -126,6 +140,7 @@ BARE = (
     "cmaes",
     "adalead",
     "mlde",
+    "mlde-over-budget",
 )
 
 #: Published pipelines that *contain* a model, so bareness is the wrong test for
@@ -140,6 +155,23 @@ MODELLED = ("alde",)
 #: row. Read by the ladder test, which pins the rest of `BASELINES` as rungs.
 PUBLISHED = (*BARE, *MODELLED)
 
+#: Rounds an arm runs beyond its task's own protocol, by name. Empty for every
+#: arm but one, and it has to stay that way: the harness's whole pairing argument
+#: is that one protocol reaches every arm, so an arm spending more is a departure
+#: that has to be declared somewhere a test can read it.
+#:
+#: MLDE is the departure. Its protocol is a training set of 384 plus a designed
+#: plate, so on this suite's four-plate budget the published method has no
+#: configuration at all -- its training set alone is the whole budget. The
+#: compressed arm and the over-budget arm are both run, and this is what says
+#: which is which.
+EXTRA_ROUNDS = {"mlde-over-budget": 1}
+
+
+def budget_of(name):
+    """Oracle calls an arm is entitled to on `toy_task`, which is not the same for all."""
+    return (ROUNDS + EXTRA_ROUNDS.get(name, 0)) * BATCH
+
 
 def toy_task(*, reanchor: bool = True) -> Task:
     """A task cheap enough to run every arm against end to end."""
@@ -150,6 +182,25 @@ def toy_task(*, reanchor: bool = True) -> Task:
         protocol=Protocol(rounds=ROUNDS, batch_size=BATCH, max_mutations=4),
         max_mutations=4,
         reanchor=reanchor,
+        attainable=None,
+    )
+
+
+def unconstrained_task():
+    """The same toy with every transition allowed, so every assay yields a value.
+
+    Feasibility is what `TOY` exists to exercise, and it is exactly what has to be
+    absent for a question about a *training set* to be well posed: a sampler that
+    gathers measurements counts the ones that came back with a number, and an
+    infeasible design comes back with none.
+    """
+    return Task(
+        name="unconstrained",
+        purpose="a toy with no feasibility constraint, for supervised handover",
+        build=lambda: EhrlichLandscape(**{**TOY, "transition_density": 1.0}),  # type: ignore[arg-type]
+        protocol=Protocol(rounds=ROUNDS, batch_size=BATCH, max_mutations=4),
+        max_mutations=4,
+        reanchor=True,
         attainable=None,
     )
 
@@ -189,6 +240,16 @@ def reanchored_sampler(campaign, env):
     return campaign.sampler.reanchored(env)
 
 
+def mlde_of(campaign):
+    """The MLDE sampler a campaign holds, read for its own budget accounting.
+
+    Its training split, whether it ever fitted, and how far below the published
+    sample it sits are all properties of `MLDE` rather than of `Sampler`, and the
+    campaign is typed as holding the latter.
+    """
+    return campaign.sampler
+
+
 def one_step_from(env):
     """A design one legal substitution away from an environment's anchor."""
     state = env.initial(1)
@@ -205,6 +266,63 @@ def counting_sampler(*, proxy_calls, bred, unconstructible, proposals=0):
         proposals_made=proposals,
         name="stub",
     )
+
+
+#: A ladder base that does not depend on which configuration is currently
+#: selected. The shape tests below hold for any base, and pinning them to
+#: `results/selected.json` would make them fail the day a selection moves for
+#: reasons that have nothing to do with the two mechanisms. Trajectory balance
+#: at the module defaults, so `arm` and the fields beside it describe the same
+#: configuration -- which is itself the precondition every rung rests on.
+LADDER = LadderBase(
+    name="base",
+    arm=gflownet(TrajectoryBalance()),
+    objective=TrajectoryBalance(),
+    learn_flow=False,
+    beta=DEFAULT_BETA,
+    steps=DEFAULT_TRAINING_STEPS,
+    hidden_dim=DEFAULT_HIDDEN_DIM,
+)
+
+
+def rung(suffix):
+    """A ladder rung's name, which is the base arm's name plus what it adds."""
+    return f"{LADDER.name}{suffix}"
+
+
+def diagnostic_task():
+    """A task on the landscape the ladder tier actually runs on.
+
+    The parameter counts are only meaningful at one sizing -- the sequence length
+    fixes the trunk's input width and the alphabet fixes the action head's output
+    -- so the capacity control has to be measured on the landscape it will be run
+    on rather than on `toy_task`.
+    """
+    return Task(
+        name="diagnostic",
+        purpose="the diagnostic instance, for sizing the capacity control",
+        build=lambda: EhrlichLandscape(**DIAGNOSTIC_INSTANCE),  # type: ignore[arg-type]
+        protocol=Protocol(rounds=ROUNDS, batch_size=BATCH, max_mutations=4),
+        max_mutations=4,
+        reanchor=True,
+        attainable=None,
+    )
+
+
+def parameter_count(arm):
+    """Learnable parameters in the policy an arm builds on the ladder's landscape.
+
+    Counted off the policy the arm itself constructs rather than off one built to
+    match it, so what is measured is the network that would train.
+    """
+    return sum(int(p.numel()) for p in policy_of(arm(diagnostic_task(), 0)).parameters())
+
+
+def recorded_selection():
+    """What `results/selected.json` holds, or ``None`` when nothing is recorded."""
+    if not SELECTED_CONFIGURATION.exists():
+        return None
+    return json.loads(SELECTED_CONFIGURATION.read_text())
 
 
 class TestTheLadderIsWhatItSaysItIs:
@@ -341,13 +459,22 @@ class TestEveryArmSpendsItsWholeBudget:
         # Run at the pool each arm's paper specifies, which for most of them is
         # exactly one plate -- the configuration under which the shortfall was
         # measured, and which the old global 2048 masked completely.
+        #
+        # The entitlement is per arm rather than global because one arm is
+        # deliberately over budget, and both halves of that matter: an arm that
+        # spent less than its own entitlement is the original shortfall, and an
+        # arm that spent more than `EXTRA_ROUNDS` declares has taken a budget
+        # nobody granted it -- which is the same fault as the shortfall, wearing
+        # the other sign, and would be invisible in a table indexed by the task's
+        # protocol.
+        budget = budget_of(name)
         result = BASELINES[name](toy_task(), 0).run()
 
-        assert result.oracle_calls == ROUNDS * BATCH, (
-            f"{name} spent {result.oracle_calls} of {ROUNDS * BATCH} oracle calls"
+        assert result.oracle_calls == budget, (
+            f"{name} spent {result.oracle_calls} of {budget} oracle calls"
         )
-        assert [record.evaluated for record in result.rounds] == [BATCH] * ROUNDS
-        assert len(result.sequences) == ROUNDS * BATCH
+        assert [record.evaluated for record in result.rounds] == [BATCH] * (budget // BATCH)
+        assert len(result.sequences) == budget
 
     @pytest.mark.parametrize("name", sorted(BASELINES))
     def test_no_arm_re_measures_a_design_from_an_earlier_round(self, name):
@@ -386,6 +513,96 @@ class TestEveryArmSpendsItsWholeBudget:
         assert all(record.duplicates == 0 for record in result.rounds)
 
 
+class TestMldeIsRunAtItsOwnBudgetAsWellAsOurs:
+    """The one arm that spends more than its task's budget, and why it is allowed.
+
+    MLDE's published protocol is 384 screened variants plus a designed plate:
+    480 assays, against the 384 this suite gives everyone. There is no
+    configuration in which it fits -- its *training set alone* is the whole
+    budget -- so the compressed arm trains on one plate where Wittmann et al.
+    train on four, which their own results say is a weaker MLDE.
+
+    The failure this class is arranged against is not that the over-budget arm
+    exists but that it could silently stop being MLDE. Two ways, both quiet:
+    it takes the extra assays and screens at random for the whole campaign,
+    never fitting anything, in which case a random baseline is sitting in the
+    table under a supervised method's name; or the shared protocol moves, the
+    arm's training split moves with it, and the row goes on being described as
+    the published 384 + 96 while being neither.
+    """
+
+    def four_plate_task(self):
+        """A task on the protocol the headline table runs: four plates of 96."""
+        return Task(
+            name="four-plate",
+            purpose="the shared protocol, for checking MLDE resolves to its own",
+            build=lambda: EhrlichLandscape(**TOY),  # type: ignore[arg-type]
+            protocol=Protocol(rounds=4, batch_size=96, max_mutations=4),
+            max_mutations=4,
+            reanchor=True,
+            attainable=None,
+        )
+
+    def test_on_the_shared_protocol_the_arm_resolves_to_the_published_numbers(self):
+        # Derived rather than pinned: the training split is "every plate but the
+        # last", which *is* 384 and 96 on four plates of 96 and would be
+        # something else on any other shape. So this is the assertion that says
+        # whether the arm is still Wittmann et al.'s split -- and the day the
+        # shared protocol moves it fails, rather than the arm quietly running a
+        # different split under the published protocol's name.
+        campaign = BASELINES["mlde-over-budget"](self.four_plate_task(), 0)
+
+        assert campaign.budget == PUBLISHED_BUDGET
+        assert mlde_of(campaign).required_budget == PUBLISHED_BUDGET
+        assert not mlde_of(campaign).runs_below_published_training_size
+
+    def test_the_compressed_arm_is_the_one_that_does_not_fit_the_published_split(self):
+        # Both rows are run and they are not the same method. Were the compressed
+        # arm to quietly acquire the published training size it would spend its
+        # whole budget screening and design nothing, and were the over-budget arm
+        # to lose it the table would carry two identical rows under two names.
+        compressed = BASELINES["mlde"](self.four_plate_task(), 0)
+        published = BASELINES["mlde-over-budget"](self.four_plate_task(), 0)
+
+        assert mlde_of(compressed).runs_below_published_training_size
+        assert not mlde_of(published).runs_below_published_training_size
+        assert compressed.budget < published.budget
+
+    def test_the_extra_plate_is_spent_on_designs_and_not_on_more_screening(self):
+        # The silent failure: an arm handed a larger budget that never reaches
+        # its own training size screens at random for every round, ends unfitted,
+        # and is reported as MLDE. `is_fitted` is the only thing that separates
+        # "a supervised method ran" from "a random baseline ran under its name",
+        # and nothing about the spend or the plate count would show it.
+        #
+        # Run on the unconstrained landscape because the handover is gated on
+        # *usable* measurements: `MLDE.observe` drops an infeasible assay, having
+        # no fitness to regress on, so on a constrained landscape the screening
+        # plates yield fewer training examples than they cost and the handover
+        # slips. That interaction belongs to `mlde` as much as to this arm and is
+        # not what this test is about -- it is recorded in `_mlde_as_published`.
+        campaign = BASELINES["mlde-over-budget"](unconstrained_task(), 0)
+        campaign.run()
+
+        assert mlde_of(campaign).is_fitted
+        assert mlde_of(campaign).training_examples == budget_of("mlde-over-budget")
+
+    def test_only_the_over_budget_arm_departs_from_the_tasks_protocol(self):
+        # The harness's pairing argument is that one protocol reaches every arm.
+        # Exactly one arm is exempt, it is named for the exemption, and a second
+        # arm acquiring an extra round would break the pairing everywhere while
+        # every individual campaign still looked correct.
+        for name, arm in BASELINES.items():
+            campaign = arm(toy_task(), 0)
+            assert campaign._rounds == ROUNDS + EXTRA_ROUNDS.get(name, 0), name
+        assert set(EXTRA_ROUNDS) <= set(BASELINES)
+        # The name is the only place the departure is legible in a results table:
+        # the store writes the *task's* protocol beside every record, so a row
+        # spending more than that protocol says while being named like the arms
+        # beside it is a budget-indexed comparison that is silently not one.
+        assert all("over-budget" in name for name in EXTRA_ROUNDS)
+
+
 class TestAnArmSaysWhatItRanAt:
     """An arm's configuration is recorded, because its name cannot carry it."""
 
@@ -418,6 +635,12 @@ class TestAnArmSaysWhatItRanAt:
         # `PLATE_POOL` is recorded as the zero it is and resolves per task, so
         # the check is against the plate the task actually measures.
         assert (recorded["pool_size"] or BATCH) == campaign._pool_size
+        # The store writes the *task's* protocol beside these parameters, so this
+        # is the only field in the record that says an arm ran longer than that
+        # protocol. A recorded zero on a campaign with an extra round would
+        # describe the run as within budget while it was not, and every
+        # budget-indexed comparison downstream would read it that way.
+        assert recorded["extra_rounds"] == campaign._rounds - ROUNDS
 
     def test_the_two_genetic_arms_are_told_apart_by_what_built_them(self):
         # Same class, different constructor arguments: a record naming only the
@@ -546,13 +769,20 @@ class TestTheVariantLadderIsAddedRatherThanApplied:
     those were. `genetic-feasible` is named separately below because it reaches
     the same environment class through `feasible_only` and is the arm most
     likely to be moved by accident.
+
+    Built on `LADDER` rather than on whatever `results/selected.json` currently
+    holds: what these assert is the ladder's *shape*, which must hold for any
+    base, and a fixed base keeps them from turning red the day a selection moves
+    for reasons that have nothing to do with the mechanisms.
+    `TestTheLadderIsBuiltOnTheConfigurationThatShips` is where the default base
+    is checked against the file, which is the other half.
     """
 
-    def variant_env(self, name):
-        return environment_of(variant_arms()[name](toy_task(), 0))
+    def variant_env(self, suffix):
+        return environment_of(variant_arms(LADDER)[rung(suffix)](toy_task(), 0))
 
-    def variant_policy(self, name):
-        return policy_of(variant_arms()[name](toy_task(), 0))
+    def variant_policy(self, suffix):
+        return policy_of(variant_arms(LADDER)[rung(suffix)](toy_task(), 0))
 
     def test_every_shipped_arm_still_masks_feasibility_at_every_step(self):
         for name, arm in {**BASELINES, **OBJECTIVES}.items():
@@ -571,16 +801,16 @@ class TestTheVariantLadderIsAddedRatherThanApplied:
             assert type(policy_of(arm(toy_task(), 0))) is SequencePolicy, name
 
     def test_the_terminal_arm_searches_the_terminal_only_graph(self):
-        assert isinstance(self.variant_env("gfn-tb+terminal"), TerminalFeasibilityEnvironment)
-        assert type(self.variant_env("gfn-tb+anchor")) is MutationEnvironment
+        assert isinstance(self.variant_env("+terminal"), TerminalFeasibilityEnvironment)
+        assert type(self.variant_env("+anchor")) is MutationEnvironment
 
     def test_the_anchor_arm_conditions_its_policy_on_the_anchor(self):
-        policy = self.variant_policy("gfn-tb+anchor")
+        policy = self.variant_policy("+anchor")
         assert isinstance(policy, AnchorConditionedPolicy)
-        assert type(self.variant_policy("gfn-tb+terminal")) is SequencePolicy
+        assert type(self.variant_policy("+terminal")) is SequencePolicy
 
     def test_the_both_arm_takes_both_and_the_two_do_not_interfere(self):
-        campaign = variant_arms()["gfn-tb+terminal+anchor"](toy_task(), 0)
+        campaign = variant_arms(LADDER)[rung("+terminal+anchor")](toy_task(), 0)
         assert isinstance(environment_of(campaign), TerminalFeasibilityEnvironment)
         assert isinstance(policy_of(campaign), AnchorConditionedPolicy)
 
@@ -588,14 +818,14 @@ class TestTheVariantLadderIsAddedRatherThanApplied:
         # A held anchor can disagree with the environment's, and the
         # disagreement is silent: the policy conditions on a parent nobody is
         # searching from and the loss stays finite.
-        campaign = variant_arms()["gfn-tb+anchor"](toy_task(), 0)
+        campaign = variant_arms(LADDER)[rung("+anchor")](toy_task(), 0)
         assert policy_of(campaign).anchor.tolist() == environment_of(campaign).parent.tolist()
 
     def test_the_conditioned_policy_follows_a_moved_anchor(self):
         # The campaign prefers the sampler's own re-anchoring hook over its
         # factory, so this is the path a re-anchoring task actually takes, and
         # it never passes through the factory that built the policy.
-        campaign = variant_arms()["gfn-tb+anchor"](toy_task(), 0)
+        campaign = variant_arms(LADDER)[rung("+anchor")](toy_task(), 0)
         env = environment_of(campaign)
         moved_to = env.reanchored(one_step_from(env))
         moved = reanchored_sampler(campaign, moved_to)
@@ -604,36 +834,47 @@ class TestTheVariantLadderIsAddedRatherThanApplied:
         assert held_policy(moved).anchor.tolist() == moved_to.parent.tolist()
 
     def test_each_variant_changes_exactly_the_flag_it_is_named_for(self):
-        # An arm that also moved the step count, the reward exponent or the
-        # trunk width would be losing or winning on compute, and the ladder
-        # would report that as a feasibility or conditioning result.
-        base = settings(variant_arms()["gfn-tb"])
+        # An arm that also moved the step count, the reward exponent, the
+        # objective or the trunk width would be losing or winning on compute,
+        # and the ladder would report that as a feasibility or conditioning
+        # result. `+wide` is exempted on width alone because width *is*
+        # what it varies -- and on nothing else, which is the whole of its
+        # claim to be a capacity control rather than a second configuration.
+        arms = variant_arms(LADDER)
+        base = settings(arms[LADDER.name])
         flags = ("terminal_feasibility", "anchor_conditioned")
-        for name in ("gfn-tb+terminal", "gfn-tb+anchor", "gfn-tb+terminal+anchor"):
-            resolved = settings(variant_arms()[name])
+        for suffix in ("+terminal", "+anchor", "+terminal+anchor"):
+            resolved = settings(arms[rung(suffix)])
             assert {k: v for k, v in resolved.items() if k not in flags} == {
                 k: v for k, v in base.items() if k not in flags
-            }, name
+            }, suffix
+        control = settings(arms[rung("+wide")])
+        assert {k: v for k, v in control.items() if k != "hidden_dim"} == {
+            k: v for k, v in base.items() if k != "hidden_dim"
+        }
 
     def test_the_flags_are_off_wherever_they_are_not_named(self):
-        assert settings(variant_arms()["gfn-tb"])["terminal_feasibility"] is False
-        assert settings(variant_arms()["gfn-tb"])["anchor_conditioned"] is False
-        assert settings(variant_arms()["gfn-tb+terminal"])["anchor_conditioned"] is False
-        assert settings(variant_arms()["gfn-tb+anchor"])["terminal_feasibility"] is False
-        both = settings(variant_arms()["gfn-tb+terminal+anchor"])
+        arms = variant_arms(LADDER)
+        assert settings(arms[LADDER.name])["terminal_feasibility"] is False
+        assert settings(arms[LADDER.name])["anchor_conditioned"] is False
+        assert settings(arms[rung("+terminal")])["anchor_conditioned"] is False
+        assert settings(arms[rung("+anchor")])["terminal_feasibility"] is False
+        assert settings(arms[rung("+wide")])["anchor_conditioned"] is False
+        both = settings(arms[rung("+terminal+anchor")])
         assert both["terminal_feasibility"] is True
         assert both["anchor_conditioned"] is True
 
-    def test_the_ladder_reuses_the_shipped_arm_rather_than_rebuilding_it(self):
-        # The store keys on (task, arm), so a re-declared `gfn-tb` is the same
-        # cell only while two expressions agree. Looked up, they cannot disagree.
-        assert variant_arms()["gfn-tb"] is OBJECTIVES["gfn-tb"]
+    def test_the_ladder_reuses_the_base_arm_rather_than_rebuilding_it(self):
+        # The store keys on (task, arm), so a re-declared base is the same cell
+        # only while two expressions agree. Handed the arm, they cannot disagree.
+        assert variant_arms(LADDER)[LADDER.name] is LADDER.arm
 
     def test_the_variants_are_not_in_the_objective_sweep(self):
         # `OBJECTIVES` is resolved key-by-key to a training objective by the
-        # configuration sweep. Neither variant is an objective -- both are plain
-        # trajectory balance -- so a key here would be looked up as one and fail.
-        assert not set(variant_arms()) - {"gfn-tb"} & set(OBJECTIVES)
+        # configuration sweep. No rung is an objective -- each is the base
+        # objective with a mechanism turned on -- so a key here would be looked
+        # up as one and fail.
+        assert not set(variant_arms(LADDER)) - {LADDER.name} & set(OBJECTIVES)
 
     @pytest.mark.slow
     def test_a_variant_arm_runs_a_campaign_end_to_end(self):
@@ -646,3 +887,277 @@ class TestTheVariantLadderIsAddedRatherThanApplied:
         )
         result = arm(toy_task(), 0).run()
         assert result.sequences.shape[0] == ROUNDS * BATCH
+
+
+class TestTheLadderIsBuiltOnTheConfigurationThatShips:
+    """The base rung is what the project runs, not what it inherited.
+
+    The failure this catches had already been made. The ladder looked up
+    ``gfn-tb`` as its base while the configuration selected over 3,100 campaigns
+    is ``gfn-subtb``, and nothing in the resulting table would have said so: every
+    rung would have been correctly one step above its base, every arm would have
+    been internally consistent, and the study would simply have answered a
+    question about a different method. That this repository's own beta scan
+    reverses direction between the two objectives is what makes it a real error
+    rather than a pedantic one -- an effect measured on one is not evidence about
+    the other here.
+
+    It is silent in the other direction too. A selection that moves and a ladder
+    that does not would leave the ladder's base and the headline table's GFlowNet
+    arm as two different configurations under one story, so what is asserted below
+    is not "the base is sub-trajectory balance" -- which would need editing every
+    time selection ran -- but "the base is whatever the file says", which cannot
+    go out of date.
+    """
+
+    def test_the_default_base_is_the_arm_the_selection_recorded(self):
+        choice = recorded_selection()
+        if choice is None:
+            pytest.skip("no selection recorded, so there is no shipped arm to check against")
+        assert shipped_base().name == choice["arm"]
+        assert set(variant_arms()) >= {choice["arm"], f"{choice['arm']}+terminal"}
+
+    def test_the_base_rung_is_the_arm_the_headline_table_would_run(self):
+        # Built through the selection phase's own builder, from the same file, so
+        # the ladder's base cell and the headline's GFlowNet cell are the same
+        # campaign. Compared on the recorded settings rather than on identity,
+        # because the two are separate calls and only what they resolve to is
+        # ever stored.
+        choice = recorded_selection()
+        if choice is None:
+            pytest.skip("no selection recorded, so there is no shipped arm to check against")
+        headline = _build_objective(
+            choice["objective"],
+            float(choice["beta"]),
+            int(choice["steps"]),
+            lam=None if choice["lam"] is None else float(choice["lam"]),
+            mix=None if choice["mix"] is None else float(choice["mix"]),
+            hidden_dim=int(choice["hidden_dim"]),
+        )
+        assert settings(variant_arms()[choice["arm"]]) == settings(headline)
+
+    def test_the_base_rung_is_not_the_untuned_default_it_used_to_be(self):
+        # The regression itself, stated as a regression. `gfn-tb` at the
+        # inherited defaults is a configuration the selection rejected, and a
+        # ladder that quietly returned to it would read exactly like one that had
+        # never left.
+        choice = recorded_selection()
+        if choice is None:
+            pytest.skip("no selection recorded, so the untuned default is what ships")
+        assert settings(variant_arms()[choice["arm"]]) != settings(OBJECTIVES["gfn-tb"])
+
+    def test_a_caller_may_hand_the_ladder_its_base(self):
+        # The seam that keeps this module from owning a results file: a caller
+        # with a configuration in hand passes it, and every test above builds a
+        # ladder without a file on disk at all.
+        assert set(variant_arms(LADDER)) == {
+            "base",
+            "base+terminal",
+            "base+anchor",
+            "base+terminal+anchor",
+            "base+wide",
+        }
+
+    def test_every_arm_in_the_ladder_carries_the_base_arms_name(self):
+        # The store keys on (task, arm), and every arm here is defined *relative
+        # to* a base: the two mechanism rungs by the flag they turn on, the
+        # capacity control by a width derived from the base's own -- 101 matches
+        # a conditioned trunk of 64 and matches nothing else. An arm named
+        # without the prefix is therefore one store cell for every base it was
+        # ever built against, and two selections' worth of campaigns would
+        # average into a single row with nothing to say they had.
+        base = LadderBase(
+            name="other-base",
+            arm=gflownet(TrajectoryBalance(), hidden_dim=32),
+            objective=TrajectoryBalance(),
+            learn_flow=False,
+            beta=DEFAULT_BETA,
+            steps=DEFAULT_TRAINING_STEPS,
+            hidden_dim=32,
+        )
+        assert all(
+            name == base.name or name.startswith(f"{base.name}+") for name in variant_arms(base)
+        )
+
+    def test_two_bases_share_no_arm_name_at_all(self):
+        # The drift stated as the collision it produces. These two ladders differ
+        # in the trunk width their control is matched against -- 32 and the
+        # module default -- so the two controls are different networks, and under
+        # a name that did not carry the base they were the same cell. This is the
+        # regression the ladder rebuild fixed for the rungs and left open here.
+        narrow = LadderBase(
+            name="narrow",
+            arm=gflownet(TrajectoryBalance(), hidden_dim=32),
+            objective=TrajectoryBalance(),
+            learn_flow=False,
+            beta=DEFAULT_BETA,
+            steps=DEFAULT_TRAINING_STEPS,
+            hidden_dim=32,
+        )
+        assert matched_hidden_dim(32, learn_flow=False) != matched_hidden_dim(
+            LADDER.hidden_dim, learn_flow=False
+        ), "the two bases must size their controls differently or this proves nothing"
+        assert not set(variant_arms(narrow)) & set(variant_arms(LADDER))
+
+    def test_with_no_selection_recorded_the_base_is_what_the_table_reports(self):
+        # Not a placeholder. `methods_for` falls back to the untuned arms when no
+        # selection exists, so `gfn-tb` is genuinely what the headline reports in
+        # that state -- and looked up, so the base rung is the identical store
+        # cell the objectives diagnostic already paid for.
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(
+                "evogfn.benchmark.methods.SELECTED_CONFIGURATION",
+                SELECTED_CONFIGURATION.parent / "no-such-selection.json",
+            )
+            base = shipped_base()
+        assert base.name == "gfn-tb"
+        assert base.arm is OBJECTIVES["gfn-tb"]
+
+    def test_a_selection_that_stopped_partway_refuses_rather_than_defaulting(self, tmp_path):
+        # Absent and null are different claims. A file missing an axis describes
+        # a configuration no rule ever chose, and building the ladder on the
+        # default for that axis would report an untuned setting as selected.
+        partial = tmp_path / "selected.json"
+        partial.write_text(json.dumps({"objective": "gfn-subtb", "arm": "x", "beta": 0.1}))
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr("evogfn.benchmark.methods.SELECTED_CONFIGURATION", partial)
+            with pytest.raises(ValueError, match="unfinished"):
+                shipped_base()
+
+    def test_a_selection_whose_name_and_settings_disagree_refuses(self, tmp_path):
+        # The name is the store key every confirmation campaign was written
+        # under. A file whose settings build something else would run one
+        # configuration and read another's hundred seeds as its own.
+        lying = tmp_path / "selected.json"
+        lying.write_text(
+            json.dumps(
+                {
+                    "objective": "gfn-subtb",
+                    "arm": "gfn-subtb@b0.1-s300-l0.9-h64",
+                    "beta": 0.2,
+                    "steps": 300,
+                    "lam": 0.9,
+                    "mix": None,
+                    "hidden_dim": 64,
+                }
+            )
+        )
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr("evogfn.benchmark.methods.SELECTED_CONFIGURATION", lying)
+            with pytest.raises(ValueError, match="never happened"):
+                shipped_base()
+
+    def test_a_breeding_selection_refuses_rather_than_dropping_to_plain_balance(self, tmp_path):
+        # Genetic-GFN is built by a different factory, and that factory takes
+        # neither mechanism flag. Falling back to trajectory balance would put a
+        # ladder in the table under the shipped configuration's name while
+        # studying an arm nobody selected.
+        bred = tmp_path / "selected.json"
+        bred.write_text(
+            json.dumps(
+                {
+                    "objective": "genetic-gfn",
+                    "arm": "genetic-gfn@b0.5-s300-m0.25-h64",
+                    "beta": 0.5,
+                    "steps": 300,
+                    "lam": None,
+                    "mix": 0.25,
+                    "hidden_dim": 64,
+                }
+            )
+        )
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr("evogfn.benchmark.methods.SELECTED_CONFIGURATION", bred)
+            with pytest.raises(ValueError, match="neither ladder mechanism"):
+                shipped_base()
+
+
+#: How far the capacity control may sit from the arm it controls for, as a share
+#: of that arm's parameter count. Half a percent is far below any effect the
+#: ladder could report and far above the residual no integer width can remove --
+#: the shipped pair differ by 0.13% -- so a failure here means the architecture
+#: moved rather than that the arithmetic is imprecise.
+CAPACITY_TOLERANCE = 0.005
+
+
+class TestTheCapacityControlIsTheSizeOfTheArmItControlsFor:
+    """The `+wide` control exists because `+anchor` changes two things at once.
+
+    Conditioning widens the trunk's *input* -- state embedding, anchor embedding
+    and one difference indicator per position -- so the conditioned policy is half
+    again as large as the plain one at the same trunk width. Without a plain
+    policy of matching size in the table, every reading of "conditioning helped"
+    is equally a reading of "more parameters helped", and no column distinguishes
+    them.
+
+    What would otherwise be silent is the drift. The widths are integers and the
+    counts are quadratics, so the match is arithmetic that holds for one
+    architecture; add a layer to either policy, change the embedding width, give
+    the conditioned trunk a second head, and the control silently stops
+    controlling. Nothing raises, no campaign fails, and the ladder goes on
+    printing a comparison whose premise has quietly gone.
+    """
+
+    def base(self):
+        choice = recorded_selection()
+        if choice is None:
+            pytest.skip("no selection recorded, so there is no shipped width to match")
+        return shipped_base()
+
+    def test_the_control_and_the_conditioned_arm_are_the_same_size(self):
+        base = self.base()
+        arms = variant_arms()
+        conditioned = parameter_count(arms[f"{base.name}+anchor"])
+        control = parameter_count(arms[f"{base.name}+wide"])
+
+        assert abs(control - conditioned) <= CAPACITY_TOLERANCE * conditioned
+
+    def test_the_control_errs_upward_rather_than_downward(self):
+        # The direction is the whole safety property. A control with slightly
+        # more capacity than the arm it controls for can only understate
+        # conditioning's effect; one with slightly less manufactures the effect
+        # the arm exists to rule out, and the table cannot tell the two apart.
+        base = self.base()
+        arms = variant_arms()
+
+        assert parameter_count(arms[f"{base.name}+wide"]) >= parameter_count(
+            arms[f"{base.name}+anchor"]
+        )
+
+    def test_no_narrower_width_would_do(self):
+        # The rule is the narrowest plain trunk that is not smaller, so one width
+        # down must fall short. Without this the control could drift arbitrarily
+        # wide and still pass the tolerance above by luck of the tolerance.
+        base = self.base()
+        width = matched_hidden_dim(base.hidden_dim, learn_flow=base.learn_flow)
+        conditioned = parameter_count(variant_arms()[f"{base.name}+anchor"])
+        narrower = gflownet(
+            base.objective,
+            beta=base.beta,
+            steps=base.steps,
+            learn_flow=base.learn_flow,
+            hidden_dim=width - 1,
+        )
+
+        assert parameter_count(narrower) < conditioned
+
+    def test_the_shipped_pair_are_the_counts_the_docstring_states(self):
+        # The numbers in `matched_hidden_dim`'s docstring, measured. A docstring
+        # quoting a residual that stopped being true is worse than one quoting
+        # none, since the reader has no way to know which.
+        base = self.base()
+        if base.hidden_dim != 64:
+            pytest.skip("the stated counts are for the shipped width of 64")
+        arms = variant_arms()
+
+        assert parameter_count(arms[f"{base.name}+anchor"]) == 179715
+        assert parameter_count(arms[f"{base.name}+wide"]) == 179952
+        assert settings(arms[f"{base.name}+wide"])["hidden_dim"] == 101
+
+    def test_the_control_is_sized_for_the_landscape_the_tier_runs_on(self):
+        # A parameter count is a statement about one sizing. Were the ladder tier
+        # moved to another landscape, this control would be matched to a
+        # landscape nobody runs -- and every count above would still pass, being
+        # measured at the sizing this asserts.
+        assert DIAGNOSTIC_INSTANCE["sequence_length"] == LADDER_SEQUENCE_LENGTH
+        assert DIAGNOSTIC_INSTANCE["vocab_size"] == LADDER_VOCAB_SIZE
