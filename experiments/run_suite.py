@@ -79,6 +79,7 @@ from evogfn.benchmark.methods import (
     anchor_arms,
     flow_objectives,
     sensitivity,
+    shipped_base,
     variant_arms,
 )
 from evogfn.benchmark.selection import _build_objective
@@ -421,7 +422,14 @@ REFERENCES = {
     # `genetic` is not in this tier at all, so without an entry here the whole
     # paired section would be replaced by one line saying there was no reference
     # -- three rungs run and nothing compared.
-    "variant-ladder": "gfn-tb",
+    #
+    # Resolved from the ladder itself rather than named, because the ladder is
+    # now built on whatever configuration the selection recorded. A literal here
+    # would name an arm the tier had stopped running the moment a selection
+    # moved, and `reference_for` returns None for a name the tier does not hold
+    # -- so the failure is a tier that quietly compares nothing, which is what
+    # this entry exists to prevent.
+    "variant-ladder": lambda: shipped_base().name,
     # The policy-carrying arm, so the pair that gets printed on the re-anchored
     # task is rebuilt-against-carried: the amortisation cell, and the only cell
     # in this study that a paired test can reach. Against the default reference
@@ -466,6 +474,11 @@ def reference_for(tier: Tier, methods: dict[str, object]) -> str | None:
         as one -- said explicitly so the report can name the omission.
     """
     chosen = REFERENCES.get(tier.name, DEFAULT_REFERENCE)
+    # A callable entry names an arm that is not fixed at import -- the ladder's
+    # base rung follows the recorded selection -- and is resolved here so the
+    # table below never has to know which kind it got.
+    if callable(chosen):
+        chosen = chosen()
     return chosen if chosen in methods else None
 
 
@@ -553,6 +566,22 @@ def _arm_rows(
         spread = records_to_metric(records, seeds, "diversity")
         spent = records_to_metric(records, seeds, "oracle_calls")
         proxy = records_to_metric(records, seeds, "proxy_calls")
+        # Every mean on this row is taken over completed campaigns only --
+        # `records_to_metric` drops the rest -- so the count of seeds that failed
+        # has to appear beside them or the row reports a subset while `n` reads
+        # like a full one. An arm that exhausted on *every* seed is the case this
+        # is really for: it used to be absent from the table altogether, and an
+        # empty cell is an absence a reader fills in as they please. It gets a
+        # line of its own, because there is no mean to print on it and a row of
+        # `nan`s would read as a broken table rather than as a result.
+        exhausted = sum(1 for seed in seeds if (r := records.get(seed)) is not None and r.exhausted)
+        if not len(regret):
+            lines.append(
+                f"  {name:<18} exhausted on all {exhausted} of its stored seeds; it could not "
+                f"propose designs it had not already measured, so there is no number here"
+            )
+            continue
+        failed = f"  exhausted={exhausted}" if exhausted else ""
         error = regret.std(ddof=1) / len(regret) ** 0.5 if len(regret) > 1 else 0.0
         share = _at_optimum(records, attainable)
         if share >= VACUOUS_SHARE:
@@ -564,7 +593,7 @@ def _arm_rows(
             f"  {name:<18} regret {regret.mean():>7.3f} +/- {error:<6.3f} "
             f"at-opt {share:>5.2f}  feas {feasible.mean():>5.3f}  "
             f"div {spread.mean():>5.2f}  spent {spent.mean():>6.0f}  "
-            f"proxy {proxy.mean():>7.0f}  n={len(regret)}{mark}"
+            f"proxy {proxy.mean():>7.0f}  n={len(regret)}{failed}{mark}"
         )
     return lines, solved
 
@@ -604,6 +633,15 @@ def _paired(
         mine = records_to_metric(held[name], seeds, "regret")
         theirs = records_to_metric(base, seeds, "regret")
         if len(mine) != len(theirs) or len(mine) < 2:  # noqa: PLR2004
+            # Said rather than skipped. The lengths differ when one of the two
+            # arms exhausted on a seed the other completed, and a pairing that
+            # dropped it from one side only would compare two different seed
+            # sets; an omitted line, on the other hand, reads as "these did not
+            # separate", which is the opposite of what happened.
+            lines.append(
+                f"    {name} vs {reference}: not paired -- {len(mine)} and {len(theirs)} "
+                f"completed campaigns over {len(seeds)} shared seeds"
+            )
             continue
         outcome = compare(name, mine, theirs, higher_is_better=False)
         lines.append(f"    {outcome!r}")

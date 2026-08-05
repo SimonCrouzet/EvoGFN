@@ -21,16 +21,26 @@ landscape's own optimum claims a design scoring above the maximum, and a
 declared bound below what an arm reaches makes every regret on the task
 negative. Both are refused rather than reported.
 
+**A campaign that failed, stored as nothing at all.** `run_task` caught the
+exhaustion, printed a line and moved on, so an arm that could not run anywhere on
+a task left *no record* -- and an empty cell in a table is an absence any reader
+may fill in, including as that table's sharpest result. `TestAnExhaustedCampaign`
+pins the record it now writes: that it exists, that it carries no measurement
+dressed up as a zero, that it says how far the campaign got, and that the readers
+which average do not quietly average it in.
+
 The heavier re-derivations are marked ``slow``. ``large-space`` is not among
 them at all: its beam search at L=256 runs for minutes, and the place to
 re-check it is ``experiments/audit_optima.py``, which exists for exactly that.
 """
 
 import itertools
+from dataclasses import replace
 
 import numpy as np
 import pytest
 
+from evogfn.algorithms.base import Sampler
 from evogfn.benchmark.attainable import attainable_optimum, reanchored_attainable
 from evogfn.benchmark.methods import BASELINES, OBJECTIVES, anchor_arms
 from evogfn.benchmark.protocol import Protocol
@@ -46,12 +56,14 @@ from evogfn.benchmark.suite import (
     constraint_density,
     fixed_anchor_task,
     objective_task,
+    records_to_metric,
     replication,
     rounds_curve,
     run_task,
 )
 from evogfn.benchmark.tasks import Attainable, Task
 from evogfn.landscapes.ehrlich import EhrlichLandscape
+from evogfn.loop.campaign import Campaign
 
 #: A landscape small enough to run a real campaign against inside a test, and
 #: chosen so that random mutagenesis improves on the parent more than once in
@@ -345,7 +357,17 @@ def test_a_real_campaign_stores_what_it_cost(tmp_path):
     # does not. Reversed would mean the two clocks had been swapped -- which no
     # single-clock check could catch, and which would make the comparable figure
     # the contended one.
-    assert record.cpu_seconds <= record.wall_seconds + 1e-6
+    #
+    # The tolerance is proportional rather than a fixed microsecond, and that is
+    # not slack for its own sake. This toy runs in under ten milliseconds, so a
+    # scheduler hiccup of a fraction of a millisecond -- which is what a loaded
+    # machine delivers, and this suite is routinely run beside a dozen campaigns
+    # -- exceeds an absolute epsilon while saying nothing about which clock is
+    # which. A swap, the failure actually under test, puts the two figures on
+    # opposite sides by the whole duration and is caught by any tolerance well
+    # below 1. What was here before failed on four separate runs today, none of
+    # them a swap.
+    assert record.cpu_seconds <= record.wall_seconds * 1.25 + 1e-3
 
 
 def test_an_arm_that_repairs_its_decode_stores_how_often_it_had_to(tmp_path):
@@ -411,6 +433,223 @@ def test_an_unaudited_task_stores_no_regret(tmp_path):
     record = stored(tmp_path, toy_task(reanchor=True, attainable=None))
     assert record.regret is None
     assert np.isfinite(record.best)
+
+
+#: A sparse Ehrlich instance, on which rejection sampling actually gives up.
+#: The point of running the shipped ``genetic-feasible`` arm against it rather
+#: than a stub is that the whole finding is about a real arm on a real
+#: constraint: a stub can be made to exhaust, but only a real one can show
+#: *why* it exhausted.
+SPARSE = {
+    "sequence_length": 16,
+    "vocab_size": 8,
+    "n_motifs": 1,
+    "motif_length": 4,
+    "quantization": 4,
+    "max_spacing": 2,
+    "transition_density": 0.05,
+    "seed": 2,
+}
+
+
+def sparse_task() -> Task:
+    """A task whose feasible set is too thin for rejection sampling."""
+    return Task(
+        name="sparse",
+        purpose="a constraint sparse enough that rejection sampling stalls",
+        build=lambda: EhrlichLandscape(**SPARSE),  # type: ignore[arg-type]
+        protocol=Protocol(rounds=4, batch_size=16, max_mutations=4),
+        max_mutations=4,
+        reanchor=False,
+        attainable=None,
+    )
+
+
+def test_a_rejection_arm_stores_the_draws_that_explain_its_cost(tmp_path):
+    """Guards three counters that are in the schema and empty in the data.
+
+    They default to zero, which makes an unwired column and an arm that rejected
+    nothing the same record. So this runs the shipped rejection arm rather than
+    stamping one: the only way it passes is `run_task` reading the counters off
+    the sampler the campaign finished with.
+
+    ``draws_unmutated`` is the one that matters. Without it the rejection rate is
+    the whole story and it reads as a cost the method is absorbing; with it, the
+    draws that survived turn out to be overwhelmingly the anchor unchanged --
+    admitted because an unmutated design is trivially reachable, and worth
+    nothing because it is the design the arm started from.
+    """
+    store = ResultStore(tmp_path)
+    task = toy_task(reanchor=True, attainable=None)
+    run_task(
+        task, {"genetic-feasible": BASELINES["genetic-feasible"]}, store, [0], report=lambda _: None
+    )
+    record = store.load(task.name, "genetic-feasible")[0]
+
+    assert record.draws_attempted > 0
+    assert 0 < record.draws_rejected < record.draws_attempted
+    assert record.draws_unmutated > 0
+    assert record.draws_unmutated <= record.draws_attempted - record.draws_rejected
+
+
+def test_an_arm_that_rejects_nothing_stores_zero_draws(tmp_path):
+    # Zero has to mean "runs no rejection loop", not "rejected nothing": read by
+    # attribute, so an arm carrying no such counter stores a plain zero and the
+    # column stays comparable down its length.
+    record = stored(tmp_path, toy_task(reanchor=True, attainable=None))
+
+    assert (record.draws_attempted, record.draws_rejected, record.draws_unmutated) == (0, 0, 0)
+
+
+def test_the_arm_that_gives_up_keeps_the_numbers_that_explain_why(tmp_path):
+    """The two halves of this fix, together, on the case that motivated both.
+
+    A real rejection arm on a real sparse constraint, stored rather than
+    discarded, and carrying the counters that say what went wrong. Every
+    assertion here is about something that used to be absent: the record itself,
+    and -- once there is a record -- the reason the rejection rate on it is not
+    the alarming number.
+
+    The counters have to be incremented *before* the sampler raises. The one run
+    that gives up is the run whose numbers explain the failure, and accounting
+    written after the raise is accounting that never happens on it.
+    """
+    store = ResultStore(tmp_path)
+    task = sparse_task()
+    run_task(
+        task, {"genetic-feasible": BASELINES["genetic-feasible"]}, store, [0], report=lambda _: None
+    )
+    record = store.load(task.name, "genetic-feasible")[0]
+
+    assert record.exhausted
+    assert record.draws_attempted > 0
+    assert record.draws_rejected > 0
+    # The finding, as an assertion: most of what survived the filter was the
+    # anchor itself. Were this small, the rejection rate beside it would be the
+    # whole story and the story would be that rejection is coping.
+    admitted = record.draws_attempted - record.draws_rejected
+    assert record.draws_unmutated > admitted / 2
+
+
+class OneDesign(Sampler):
+    """A sampler holding exactly one design, which is how a campaign exhausts.
+
+    Nothing exotic about the mechanism: the campaign refuses to re-measure a
+    design an earlier round already assayed, so an arm that can only produce one
+    thing fills its first plate and can never fill a second. That is the same
+    terminal condition a rejection GA reaches on a sparse feasible set, reached
+    in a tenth of a second and without depending on any particular landscape
+    being hard.
+    """
+
+    def __init__(self, length):
+        super().__init__()
+        self._length = length
+
+    def propose(self, n):
+        self._count(n)
+        return np.zeros((n, self._length), dtype=np.int32)
+
+
+def exhausting(task, seed):  # noqa: ARG001 - this arm cannot vary with its seed
+    """An arm that completes round zero and then has nothing left to propose."""
+    landscape = task.landscape()
+    return Campaign(
+        landscape=landscape,
+        sampler=OneDesign(landscape.sequence_length),
+        rounds=task.protocol.rounds,
+        batch_size=task.protocol.batch_size,
+        pool_size=task.protocol.batch_size,
+    )
+
+
+class TestAnExhaustedCampaign:
+    """The record a run that could not finish leaves behind.
+
+    Every failure here is an absence, and an absence is what nothing downstream
+    can catch: a missing record reads as a seed nobody ran, a zeroed metric reads
+    as a campaign that measured badly, and an exhausted seed folded into a mean
+    reads as a result.
+    """
+
+    @pytest.fixture
+    def task(self):
+        # A declared optimum, so that a regret *could* have been computed here.
+        # Against a task declaring none, `regret is None` would pass for the
+        # wrong reason and this would test nothing.
+        return toy_task(reanchor=False, attainable=Attainable.exactly(1.0, "declared for the test"))
+
+    @pytest.fixture
+    def stored_run(self, tmp_path, task):
+        store = ResultStore(tmp_path)
+        ran = run_task(task, {"stuck": exhausting}, store, [0], report=lambda _: None)
+        return store, ran
+
+    def test_the_seed_is_stored_rather_than_vanishing(self, stored_run, task):
+        store, ran = stored_run
+        held = store.load(task.name, "stuck")
+
+        assert 0 in held, "an arm that exhausted left no record, so it is absent from the store"
+        assert held[0].exhausted
+        # Counted as run, because it was: it cost a campaign's worth of time and
+        # is now held. A return of zero on a pass that wrote records is the one
+        # thing this number is read for.
+        assert ran == 1
+
+    def test_the_failure_is_not_run_again_on_the_next_sweep(self, stored_run, task):
+        # Stored and current, like any other record. Were it stale or unkeyed,
+        # every later sweep would pay for the same failure again -- and worse,
+        # the seed would keep reading as missing, which is the state this record
+        # exists to end.
+        store, _ = stored_run
+        assert store.missing(task.name, "stuck", [0]) == []
+
+    def test_it_holds_no_measurement_dressed_up_as_a_number(self, stored_run, task):
+        # `nan` and `None`, never zero. Zero is a measurement -- "found nothing
+        # good", "built nothing constructible" -- and it averages into a column
+        # beside real ones without anything to mark it, which is the failure this
+        # record was added to prevent rather than a milder form of it.
+        record = stored_run[0].load(task.name, "stuck")[0]
+
+        assert np.isnan(record.best)
+        assert record.regret is None
+        assert np.isnan(record.diversity)
+        assert np.isnan(record.feasible_fraction)
+        assert record.top_sequences == []
+
+    def test_it_says_how_far_the_campaign_actually_got(self, stored_run, task):
+        # A run that gave up in round four having measured 288 designs and one
+        # that gave up in round one having measured none are different findings,
+        # and a record that zeroed both would report them identically. The toy
+        # fills exactly one plate before it runs out of designs.
+        record = stored_run[0].load(task.name, "stuck")[0]
+
+        assert len(record.rounds) == 1
+        assert record.oracle_calls == task.protocol.batch_size
+        assert record.proposals >= task.protocol.batch_size
+        assert len(record.trace) == 1
+        assert record.wall_seconds > 0.0
+
+    def test_a_reader_that_averages_leaves_it_out(self, stored_run, task):
+        # The half of the fix that is easy to miss. Storing the failure puts a
+        # `nan` where every table reads a number, and one exhausted seed would
+        # otherwise turn a whole arm's mean into `nan` while the seed count went
+        # on claiming a full row. The exclusion is deliberate and the callers
+        # report the count separately.
+        failed = stored_run[0].load(task.name, "stuck")[0]
+        finished = replace(failed, seed=1, exhausted=False, best=0.5, regret=0.5)
+        held = {0: failed, 1: finished}
+
+        assert records_to_metric(held, [0, 1], "best") == pytest.approx([0.5])
+        assert records_to_metric(held, [0, 1], "regret") == pytest.approx([0.5])
+
+    def test_an_older_record_still_loads_as_a_campaign_that_finished(self, tmp_path):
+        # `exhausted` defaults to False, so every record written before the field
+        # existed keeps meaning what it meant. A default of True, or a required
+        # field, would silently reclassify or drop the whole store -- `load`
+        # skips a line it cannot build a record from, so a required field would
+        # make every stored campaign disappear rather than fail loudly.
+        assert not stored(tmp_path, toy_task(reanchor=True, attainable=None)).exhausted
 
 
 def test_the_stored_provenance_names_the_radius_and_the_anchor_rule(tmp_path):
