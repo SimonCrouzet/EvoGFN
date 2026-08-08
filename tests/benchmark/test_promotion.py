@@ -233,11 +233,22 @@ class TestARecordThatNoLongerDescribesAnything:
             run_suite.promoted_rung()
 
     def test_a_promotion_taken_against_another_base_raises(self, run_suite, base):
+        # The base is named in the record because every rung's margin is a margin
+        # *against it*; a selection that moves afterwards leaves those margins
+        # measured against an arm nobody runs, and the rung itself still builds,
+        # so nothing else would catch it.
+        #
+        # The superseded base is derived from the live one rather than written
+        # down. Any literal is the shipped base itself in whichever checkout the
+        # selection happens to agree with it -- with no selection recorded
+        # `shipped_base()` falls back to `gfn-tb`, so a record naming `gfn-tb`
+        # asserts nothing there -- while a name built from `base` differs from it
+        # by construction, in every checkout.
         run_suite.PROMOTION_FILE.write_text(
             json.dumps(
                 {
                     "arm": f"{base}+anchor",
-                    "base": "gfn-tb",
+                    "base": f"{base}-superseded",
                     "tier": "variant-ladder",
                     "task": "t",
                 }

@@ -4,8 +4,19 @@ Two things here can be silently wrong and neither raises when it is.
 
 **A grid the shipped configuration is not on.** The whole point of the ladder is
 to say whether the budget the paper prints is the right one, and a grid missing
-that budget prints a curve the reported arm is not on. So the shipped rung is
-pinned against ``results/selected.json`` rather than against a literal.
+that budget prints a curve the reported arm is not on. So the shipped budget is
+never a literal here -- a literal drifts with the grid, silently, which is the
+one failure these checks exist to catch.
+
+That splits in two, because the two halves are knowable in different places.
+*Which budget ships* is answered by `shipped_base` in any checkout: with a
+selection recorded it is the selected step count, and without one it is the
+untuned default the headline table genuinely falls back to. So "the grid
+contains and brackets the budget that ships" is checked everywhere, CI included.
+*Which arm ships* is answered only by ``results/selected.json``, which is
+gitignored and therefore absent in a fresh checkout, so "the ladder's rung at
+that budget is the very store cell the confirmation paid for" is checked only
+where the selection has run.
 
 **A twin that has drifted from the arm it claims to be.** ``genetic+search``'s
 inner-loop budget is not exposed by `classical`, so the ladder runs a
@@ -20,18 +31,32 @@ campaigns.
 from __future__ import annotations
 
 import importlib.util
-import json
 import sys
 from pathlib import Path
 
 import pytest
 
 from evogfn.algorithms.inner_loop import DEFAULT_GENERATIONS, ProxyOptimising
-from evogfn.benchmark.methods import BASELINES, DEFAULT_POOL, SELECTED_CONFIGURATION
+from evogfn.benchmark.methods import (
+    BASELINES,
+    DEFAULT_POOL,
+    SELECTED_CONFIGURATION,
+    shipped_base,
+)
 from evogfn.benchmark.saturation import saturation
 from evogfn.benchmark.selection import Configuration
 from evogfn.benchmark.store import ResultStore
 from tests.benchmark.test_methods import toy_task
+
+#: Gates the one check that needs the *name* of the arm that ships. The recorded
+#: selection lives under ``results/``, which is gitignored, so it is present on a
+#: machine that has run the selection phase and absent everywhere else, CI
+#: included. Kept as narrow as it can be: everything the shipped *budget* alone
+#: can answer is checked without it, through `shipped_steps` below.
+needs_selection = pytest.mark.skipif(
+    not SELECTED_CONFIGURATION.exists(),
+    reason="results/selected.json is gitignored; present only after the selection phase has run",
+)
 
 
 def _load():
@@ -47,6 +72,24 @@ def _load():
 
 
 experiment = _load()
+
+
+def shipped_steps():
+    """Gradient steps per round for the GFlowNet arm this checkout would run.
+
+    Resolved through `shipped_base` -- the same call ``methods_for`` resolves the
+    headline table's GFlowNet arm through -- rather than read out of
+    ``results/selected.json`` here or restated as a number. Two things follow,
+    and both are the point.
+
+    It is never a literal, so a grid edited away from the budget that ships fails
+    rather than agreeing with itself. And it answers in a fresh checkout too,
+    where it returns the untuned default, which is not a stand-in for the
+    selection but genuinely what the headline table falls back to running there.
+    The property the grid owes -- that the ladder covers the budget being
+    reported -- is owed in both states, so it is checked in both.
+    """
+    return shipped_base().steps
 
 
 def proxy_spend(campaign):
@@ -78,8 +121,7 @@ class TestTheGrids:
         saturation(flat(experiment.GENERATIONS), axis="generations")
 
     def test_the_shipped_step_count_is_on_the_grid(self):
-        chosen = json.loads(SELECTED_CONFIGURATION.read_text())
-        assert chosen["steps"] in experiment.STEPS
+        assert shipped_steps() in experiment.STEPS
 
     def test_the_shipped_generation_count_is_on_the_grid(self):
         assert DEFAULT_GENERATIONS in experiment.GENERATIONS
@@ -89,16 +131,29 @@ class TestTheGrids:
         # A grid whose best value sits at its own edge cannot distinguish "this
         # budget is right" from "this budget is the largest one offered", and
         # the question here is how *little* is enough as much as how much.
-        chosen = json.loads(SELECTED_CONFIGURATION.read_text())
-        assert min(experiment.STEPS) < chosen["steps"] < max(experiment.STEPS)
+        assert min(experiment.STEPS) < shipped_steps() < max(experiment.STEPS)
         assert min(experiment.GENERATIONS) < DEFAULT_GENERATIONS < max(experiment.GENERATIONS)
 
 
 class TestTheStepsLadder:
+    @needs_selection
     def test_the_shipped_rung_is_the_arm_the_confirmation_already_paid_for(self):
-        chosen = json.loads(SELECTED_CONFIGURATION.read_text())
-        names = {rung.steps: rung.name for rung in experiment.steps_rungs(chosen["objective"])}
-        assert names[chosen["steps"]] == chosen["arm"]
+        # The half of the grid question that only a recorded selection can
+        # answer. `TestTheGrids` establishes that the shipped *budget* is on the
+        # ladder; this establishes that the rung standing at it is the same store
+        # *cell* the confirmation already bought its seeds under, which turns on
+        # `LADDER`'s pinned beta, lambda and width agreeing with the selected
+        # ones -- an agreement no amount of grid arithmetic implies.
+        #
+        # Skipped rather than propped up with a literal arm name: with no
+        # selection recorded the shipped base is the untuned `gfn-tb`, which is
+        # not a screened arm name and has no entry in `LADDER`, so there is no
+        # cell to be identical to. A pinned name would make this pass in CI while
+        # testing that the literal equals itself.
+        shipped = shipped_base()
+        chosen = Configuration.parse(shipped.name)
+        names = {rung.steps: rung.name for rung in experiment.steps_rungs(chosen.objective)}
+        assert names[chosen.steps] == shipped.name
 
     def test_only_the_step_count_moves_along_a_ladder(self):
         for objective in experiment.LADDER:
