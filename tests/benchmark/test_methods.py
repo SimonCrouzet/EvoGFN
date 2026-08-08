@@ -34,6 +34,12 @@ the opposite of the principle. `BARE` and `MODELLED` split the two cases, and
 components that would otherwise go missing are written down -- an arm still
 called ALDE with a greedy rule and an initialisation-variance ensemble is MLDE
 with extra rounds.
+
+**And ours is not published either.** `ADAPTED` is the third case: a published
+pipeline running a parameter of ours in place of one of its own. The bareness
+and budget rules apply to it unchanged, but it must never join `PUBLISHED`,
+because a row we configured quoted under somebody's citation is the same failure
+as a hybrid -- reported at the level of the arm rather than of its components.
 """
 
 import json
@@ -44,7 +50,11 @@ import pytest
 
 from evogfn.acquisition.rules import Thompson
 from evogfn.algorithms.baselines import SimulatedAnnealing
-from evogfn.algorithms.baselines.mlde import PUBLISHED_BUDGET
+from evogfn.algorithms.baselines.mlde import (
+    ADAPTED_TRAINING_SIZE,
+    DEFAULT_TRAINING_SIZE,
+    PUBLISHED_BUDGET,
+)
 from evogfn.algorithms.gflownet.flow_objectives import SubTrajectoryBalance
 from evogfn.algorithms.gflownet.objectives import TrajectoryBalance
 from evogfn.algorithms.inner_loop import ProxyOptimising
@@ -120,6 +130,7 @@ EXPECTED_POOL = {
     "adalead": BATCH,
     "mlde": DEFAULT_POOL,
     "mlde-over-budget": DEFAULT_POOL,
+    "mlde+earlyfit": DEFAULT_POOL,
     "alde": DEFAULT_POOL,
     "random+screen": DEFAULT_POOL,
     "genetic+screen": DEFAULT_POOL,
@@ -154,6 +165,13 @@ MODELLED = ("alde",)
 #: Every arm that is somebody's published pipeline rather than a decomposition
 #: row. Read by the ladder test, which pins the rest of `BASELINES` as rungs.
 PUBLISHED = (*BARE, *MODELLED)
+
+#: Arms that are a published pipeline with a parameter of *ours* in place of one
+#: of its own. Not `PUBLISHED`, and the separation is the whole point: the same
+#: bareness and budget rules apply to them, but a table that listed them among
+#: the published rows would be quoting our engineering under somebody's
+#: citation. They wear the ``+`` for the reason ``cmaes+dp`` does.
+ADAPTED = ("mlde+earlyfit",)
 
 #: Rounds an arm runs beyond its task's own protocol, by name. Empty for every
 #: arm but one, and it has to stay that way: the harness's whole pairing argument
@@ -333,7 +351,7 @@ class TestTheLadderIsWhatItSaysItIs:
         # that appears without a rung to stand on is a hybrid back in the table,
         # and an arm that disappears is a comparator a reviewer expects going
         # missing without anyone deciding it should.
-        assert set(BASELINES) == set(PUBLISHED) | {
+        assert set(BASELINES) == set(PUBLISHED) | set(ADAPTED) | {
             "random+screen",
             "genetic+screen",
             "genetic+search",
@@ -601,6 +619,125 @@ class TestMldeIsRunAtItsOwnBudgetAsWellAsOurs:
         # spending more than that protocol says while being named like the arms
         # beside it is a budget-indexed comparison that is silently not one.
         assert all("over-budget" in name for name in EXTRA_ROUNDS)
+
+
+class TestTheAdaptedMldeArmIsOursAndCanFit:
+    """The third MLDE row: ours, at everybody's budget, sized so a fit can happen.
+
+    `mlde` and `mlde-over-budget` gate their handover on *usable* measurements,
+    and on a constrained landscape most wells return nothing to regress on. At
+    the suite's measured feasible share of 0.053 a 384-assay campaign buys about
+    20 training examples against their 96 and 384, so neither ever fits and both
+    rows are random screens under a supervised method's name. That is the
+    finding, both arms keep reporting it, and this arm is what makes it readable:
+    at a training size a constrained screen returns, the pair separates "a
+    constrained space suits this method badly" from "this method never fitted".
+
+    The failure this class is arranged against is the arm quietly becoming one of
+    the other two. It fits here and the default does not, and that gap is the
+    whole content of the row -- if an edit closes it in either direction the
+    table carries three arms answering one question, or a fourth random screen.
+    """
+
+    def four_round_task(self, *, density):
+        """Four plates of 32, at whichever transition density is asked for.
+
+        Four rounds because the handover is tested at a round boundary, and 32 so
+        that three screening plates *could* return `mlde`'s 96 measurements --
+        which is what makes the constrained run below a statement about
+        feasibility rather than about the budget.
+        """
+        return Task(
+            name=f"density-{density}",
+            purpose="four plates, for whether MLDE's handover can happen at all",
+            build=lambda: EhrlichLandscape(**{**TOY, "transition_density": density}),
+            protocol=Protocol(rounds=4, batch_size=32, max_mutations=4),
+            max_mutations=4,
+            reanchor=True,
+            attainable=None,
+        )
+
+    def test_it_reaches_a_fit_where_the_shipped_arm_never_does(self):
+        # The measurement the arm was added for. Both spend 128 assays on the
+        # same landscape; the default gathers a fraction of the 96 usable
+        # measurements it waits for and screens at random to the end, and
+        # `is_fitted` is the only thing in either result that says which of the
+        # two campaigns was supervised.
+        task = self.four_round_task(density=0.5)
+        adapted = BASELINES["mlde+earlyfit"](task, 0)
+        default = BASELINES["mlde"](task, 0)
+        adapted.run()
+        default.run()
+
+        assert mlde_of(adapted).is_fitted
+        assert not mlde_of(default).is_fitted
+        assert mlde_of(default).training_examples < 96
+
+    def test_the_shipped_arm_fits_the_same_protocol_once_feasibility_is_removed(self):
+        # What makes the row above about feasibility and not about the budget.
+        # Given the same four plates with every transition allowed, the default
+        # arm gathers its 96 usable measurements and hands over -- so the only
+        # thing it lacked on the constrained landscape was wells that reported.
+        campaign = BASELINES["mlde"](self.four_round_task(density=1.0), 0)
+        campaign.run()
+
+        assert mlde_of(campaign).is_fitted
+
+    def test_it_buys_the_fit_with_the_budget_it_was_already_given(self):
+        # The deviation is a parameter of ours, not an assay of ours. An arm that
+        # reached its handover by taking extra plates would be a second
+        # `mlde-over-budget` -- comparable to nothing in the table beside it --
+        # and the extra spend would be invisible in the stored protocol.
+        task = self.four_round_task(density=0.5)
+        result = BASELINES["mlde+earlyfit"](task, 0).run()
+
+        assert result.oracle_calls == 4 * 32
+        assert [record.evaluated for record in result.rounds] == [32] * 4
+        assert settings(BASELINES["mlde+earlyfit"])["extra_rounds"] == 0
+
+    def test_the_two_arms_it_was_added_beside_are_unchanged(self):
+        # They are the finding. Lowering `mlde`'s training size to make it fit,
+        # rather than adding a third arm, would delete the result and leave the
+        # suite with two arms answering the same question.
+        four_plate = Task(
+            name="four-plate",
+            purpose="the shared protocol, for checking the other arms did not move",
+            build=lambda: EhrlichLandscape(**TOY),  # type: ignore[arg-type]
+            protocol=Protocol(rounds=4, batch_size=96, max_mutations=4),
+            max_mutations=4,
+            reanchor=True,
+            attainable=None,
+        )
+        compressed = mlde_of(BASELINES["mlde"](four_plate, 0))
+        published = mlde_of(BASELINES["mlde-over-budget"](four_plate, 0))
+        adapted = mlde_of(BASELINES["mlde+earlyfit"](four_plate, 0))
+
+        assert compressed.required_budget == DEFAULT_TRAINING_SIZE + 96
+        assert published.required_budget == PUBLISHED_BUDGET
+        assert adapted.required_budget == ADAPTED_TRAINING_SIZE + 96
+
+    def test_it_is_bare_and_ranks_on_the_prediction_like_the_arms_it_pairs_with(self):
+        # It fits its own ensemble, so a campaign surrogate in front of it would
+        # be a second model filtering the first one's output -- and it would make
+        # the pair with `mlde` a comparison between a hybrid and a baseline
+        # rather than between two training sizes.
+        campaign = BASELINES["mlde+earlyfit"](toy_task(), 0)
+
+        assert campaign._surrogate is None
+        assert not isinstance(campaign.sampler, ProxyOptimising)
+        assert settings(BASELINES["mlde+earlyfit"])["acquisition"] == "Greedy"
+
+    def test_the_name_and_the_record_both_mark_the_row_as_ours(self):
+        # A reader must not take this for the published method at any point they
+        # meet it. The registry key carries the `+` that `cmaes+dp` uses for the
+        # same purpose, and the record names the builder rather than the class --
+        # which is the only field distinguishing this campaign from `mlde`'s once
+        # the objects are gone, both being an `MLDE` over a library pool.
+        assert set(ADAPTED) <= set(BASELINES)
+        assert all("+" in name for name in ADAPTED)
+        assert not set(ADAPTED) & set(PUBLISHED)
+        assert settings(BASELINES["mlde+earlyfit"])["sampler"] == "mlde-adapted"
+        assert settings(BASELINES["mlde"])["sampler"] == "mlde"
 
 
 class TestAnArmSaysWhatItRanAt:

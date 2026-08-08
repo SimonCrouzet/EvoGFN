@@ -59,6 +59,29 @@ only the over-budget arm would compare across budgets, which is the failure
 [Protocol][evogfn.benchmark.protocol.Protocol] exists to make visible. Both rows,
 and the arm that costs more says so in its name.
 
+And a third arm, because on a constrained landscape neither of them fits
+-------------------------------------------------------------------------
+
+Both of those arms gate their handover on **usable** measurements, and an
+infeasible assay carries no fitness to regress on. On the ``feasibility`` task
+the mean feasible share of a random screen is 0.053, so 384 assays buy about 20
+training examples against `mlde`'s 96 and `mlde-over-budget`'s 384. Neither
+handover ever happens: both rows are random screens tabled under a supervised
+method's name, and only ``fitted`` in the stored record says so. That is a real
+finding about the setting and both arms stay exactly as they are to report it.
+
+What it cannot tell us is *why* the row lost, and the two answers are opposite.
+`mlde+earlyfit` is the third arm, at the same oracle budget and at a training
+size small enough that the handover can happen -- **ours**, not Wittmann et al.'s
+protocol, which is what the ``+`` says here as it does for ``cmaes+dp``. It
+answers "would this method be competitive if it ever got to be this method?", and
+between the two rows a reader can separate an arm that is a poor fit for
+constrained spaces from an arm that never fitted. What it gives up is stated
+where the training size is derived, in
+[evogfn.algorithms.baselines.mlde][]: eight measurements is a real fit and very
+nearly no model selection, so a favourable number from it bounds a trained MLDE
+from below rather than measuring one.
+
 What is *not* here is as much a decision as what is
 ---------------------------------------------------
 
@@ -1147,6 +1170,38 @@ def _mlde_as_published(env: MutationEnvironment, seed: int, protocol: Protocol) 
     return MLDE(env, training_size=protocol.batch_size * (protocol.rounds - 1), seed=seed)
 
 
+def _mlde_adapted(env: MutationEnvironment, seed: int, _protocol: Protocol) -> Sampler:
+    """**Our** adaptation of MLDE: a training size a constrained screen returns.
+
+    Not Wittmann et al.'s protocol, and not `_mlde`'s compression of it either.
+    The published method assumes an assay comes back with a number. On a
+    landscape where 95% of wells come back with nothing to regress on, its
+    supervised phase is unreachable at *any* budget a laboratory would run -- the
+    training set grows at a twentieth of the rate the budget shrinks, so its 384
+    usable measurements would cost upwards of seven thousand assays. `mlde` and
+    `mlde-over-budget` both therefore spend the whole campaign screening at
+    random on such a task, and the two rows they produce are random baselines
+    under a supervised method's name. Both stay, because that is the finding.
+
+    This arm lowers the training size to
+    [ADAPTED_TRAINING_SIZE][evogfn.algorithms.baselines.mlde.ADAPTED_TRAINING_SIZE]
+    so that the handover happens, at the same oracle budget as every other arm.
+    It is how the question *would MLDE be competitive here if it ever got to be
+    MLDE?* can be asked at all, and it is **not** a claim about what the
+    published method does: the value is derived from the suite's own measured
+    feasible share rather than from anything in the paper, and it is a twelfth of
+    a training sample the module beside it already calls a compression.
+
+    Two properties it deliberately does not have. It is not per-task: one stated
+    number, not one read off each landscape's feasibility, since a configuration
+    tuned on the task it is scored on is a family of configurations rather than
+    one. And it is not over budget: the deviation is a parameter of ours, not an
+    assay of ours, so it stays inside the protocol every other arm runs and only
+    `mlde-over-budget` departs from that.
+    """
+    return MLDE.adapted(env, seed=seed)
+
+
 def _single_step(env: MutationEnvironment, seed: int, protocol: Protocol) -> Sampler:
     """Traditional directed evolution, to ALDE's specification.
 
@@ -1235,6 +1290,9 @@ def _feasible_genetic(env: MutationEnvironment, seed: int, _protocol: Protocol) 
 #:                        comparator
 #: ``cmaes``              the continuous relaxation the in-silico lineage runs
 #: ``genetic-feasible``   ours; the control for the feasibility claim
+#: ``mlde+earlyfit``      ours; the supervised reference at a training size a
+#:                        constrained screen can actually return, which is the
+#:                        only configuration of it that ever fits there
 #: =====================  ===================================================
 #:
 #: The four ``genetic+`` arms are a **ladder on one representative baseline**
@@ -1254,6 +1312,12 @@ def _feasible_genetic(env: MutationEnvironment, seed: int, _protocol: Protocol) 
 #: whether a screen helps at all or only helps a method that was already
 #: searching. A silent deep ensemble on every arm would answer none of these
 #: questions and would make every one of them a hybrid.
+#:
+#: ``mlde+earlyfit`` wears the same ``+`` for the other reason it is used here,
+#: the one ``cmaes+dp`` carries: not a rung added to a pipeline but a parameter
+#: of that pipeline replaced by one of ours. It is a *smaller* method than the
+#: arm it sits beside rather than a larger one, and the mark is there for the
+#: same purpose either way -- so nobody reads the row as the published method.
 #:
 #: Note what ``genetic+screen`` and ``alde`` are *not*: the same arm. They share
 #: a surrogate over a library pool and differ in the sampler, the acquisition
@@ -1294,6 +1358,21 @@ BASELINES: dict[str, Methodology] = {
     # an attainable bound audited for a shorter campaign; read its `best` rather
     # than its `regret` where the two disagree.
     "mlde-over-budget": classical(_mlde_as_published, pool_size=DEFAULT_POOL, extra_rounds=1),
+    # Ours, at everybody's budget. The two arms above cannot fit on a landscape
+    # whose wells mostly return nothing -- their handover counts usable
+    # measurements, and at a feasible share of 0.053 a 384-assay campaign buys
+    # about 20 of them against training sizes of 96 and 384. This one trains on
+    # eight, which three screening plates return on 98.7% of seeds, so the
+    # ensemble gets to design at least one plate and the row says something about
+    # the method rather than about a random screen wearing its name.
+    #
+    # The `+` is the same disclosure `cmaes+dp` carries: a published pipeline
+    # with a component of ours in it is not that pipeline. What is ours here is
+    # the training size, which is derived from this suite's own measured
+    # feasibility and appears nowhere in Wittmann et al. -- so this row must
+    # never be quoted as MLDE, and its pair with `mlde` is what separates "a
+    # constrained space suits this method badly" from "this method never fitted".
+    "mlde+earlyfit": classical(_mlde_adapted, pool_size=DEFAULT_POOL),
     # ALDE: the same library screen, and then the three things its own authors
     # name as what it adds over MLDE -- rounds, an uncertainty-bearing surrogate,
     # and a non-greedy rule to read that uncertainty with. Their bench
