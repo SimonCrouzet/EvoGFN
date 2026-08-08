@@ -8,7 +8,6 @@ tier's seed count from 30 to 50 costs twenty campaigns per arm, not fifty.
     uv run python experiments/run_suite.py --tier main      # headline only
     uv run python experiments/run_suite.py --seeds 50       # raise the count
     uv run python experiments/run_suite.py --report         # no runs, just read
-    uv run python experiments/run_suite.py --promote ARM    # ship a ladder rung
 
 Results land under ``results/`` as one JSONL file per task and method.
 
@@ -113,23 +112,58 @@ How many draws that section should have is not settled here. It is measured by
 this report can already say without any measurement is that three draws cannot
 reach significance under a sign test at any seed count, and it says so.
 
-How a ladder rung reaches the headline table
----------------------------------------------
+Why the mechanism rungs are reported and nothing is picked from them
+---------------------------------------------------------------------
 
-`variant-ladder` crosses two GFlowNet mechanisms on the shipped configuration and
-decides which to ship. It runs on the diagnostic landscape under
-`Purpose.SELECTION`, and its rungs reach `main` only through a **separate,
-explicit step**: ``--promote``, which reads the ladder's own stored campaigns,
-prints every rung against the base, refuses a rung the ladder did not support,
-and writes `PROMOTION_FILE`. `methods_for` reads that file and nothing else.
+`main` runs the five rungs of
+[variant_arms][evogfn.benchmark.methods.variant_arms] beside the baselines: the
+shipped arm as the base, and ``+terminal``, ``+anchor``, ``+terminal+anchor`` and
+``+wide`` as decomposition rows. **No rung is selected.** The table reports what
+each mechanism does on the tasks that carry the claim, and stops there.
 
-The ordering is the whole point. If the rungs sat in `main` and the best were
-picked afterwards, the configuration would have been chosen on the tasks that
-carry the claims -- tuning on the test set, which is what the selection phase
-exists to prevent. Once promoted, the rungs that lost appear as decomposition
-rows exactly where `genetic+search` does, labelled `[ablation of ...]` on the row
-and carrying an attribution line beside every p-value, so a reader cannot take
-one for a method a lab would run.
+That is a change from what this file used to do, and the reasoning is worth
+keeping. The rungs used to live in a `variant-ladder` tier on the diagnostic
+landscape under `Purpose.SELECTION`, reaching `main` only through an explicit
+``--promote`` step -- the ordering that keeps a configuration from being chosen
+on the tasks that carry the claims. That ordering is the right one *when a choice
+is being made*. It buys nothing when none is, and it costs the thing the study is
+for: deciding a mechanism on a diagnostic instance and inferring to the headline
+tasks is exactly the inference this project has already been burned by, since the
+reward-exponent curve reversed direction between trajectory balance and
+sub-trajectory balance. Measuring each mechanism where the claim lives answers
+the question directly, and because nothing is selected there is no
+tuning-on-the-test-set to guard against -- the guard and the thing it guarded
+were removed together, rather than one being left behind to imply the other.
+
+What the rows still owe a reader is the marking, and they owe it more than
+before: four of the five decompose the arm beside them and none of them is a
+pipeline anybody published. They carry `[ablation of ...]` on the row and an
+attribution line beside every p-value, exactly where `genetic+search` does, and
+they are paired against the **shipped base** in a section of their own -- a rung's
+p-value against `genetic` would be a method comparison wearing an attribution
+sentence, which is a row explaining itself wrongly.
+
+Four of the twenty rungs are reproduced rather than run
+-------------------------------------------------------
+
+`+terminal` defers the feasibility rule from every construction step to the stop
+action, and `gb1-anchor` and `trpb-anchor` have no transition matrix to defer.
+There the two environments describe the identical graph, so `+terminal` *is* the
+base arm's campaign and `+terminal+anchor` is `+anchor`'s -- 400 campaigns, some
+28 core-hours, spent recomputing numbers the table already holds, and two pairs of
+identical rows a reader could quote as "we tested the mechanism here and it made
+no difference". That is a different and false claim from "there was nothing here
+to test".
+
+So those rows are reproduced at report time and **nothing is stored for them**. A
+stored copy is indistinguishable from a measurement the moment it is written, and
+every reader of the store -- the instance analysis, a script written next year --
+would count it as an independent campaign; a marker would only move the problem to
+whichever reader forgets to honour it. Reproduced in the report, the copy sits
+where the claim is made: in italic, with a legend naming the arm it repeats.
+Which rows those are is derived from the environment rather than from a list of
+task names, so a task that gains a transition matrix is measured instead, with no
+edit anywhere.
 """
 
 from __future__ import annotations
@@ -150,6 +184,7 @@ from evogfn.benchmark.methods import (
     OBJECTIVES,
     anchor_arms,
     flow_objectives,
+    reproduced_rungs,
     sensitivity,
     shipped_base,
     variant_arms,
@@ -215,11 +250,12 @@ SOLVED_TOLERANCE = 1e-9
 #: therefore cost compute and produce a duplicate row rather than an error.
 ANCHOR_TIER = "anchor-study"
 
-#: The GFlowNet mechanism ladder, named for the same reason `ANCHOR_TIER` is: the
-#: promotion step below reads *this tier and no other*, which is what stops a
-#: configuration being chosen on a task that carries claims. A literal misspelt
-#: at either end would silently promote against an empty record set.
-LADDER_TIER = "variant-ladder"
+#: The headline tier, and the one tier that carries the mechanism rungs. Named
+#: for the same reason `ANCHOR_TIER` is: `methods_for` branches on it, and a
+#: misspelling does not raise -- it falls through to the baseline set, so the
+#: five-rung study would silently become a one-arm row and the table would look
+#: exactly as it did before anybody decided to report the mechanisms.
+MAIN_TIER = "main"
 
 #: The tier whose tasks differ from one another only in the landscape draw.
 #: Everything in the instance-analysis path keys off this name, and the tier's
@@ -327,35 +363,27 @@ def tiers(main_seeds: int, diagnostic_seeds: int) -> list[Tier]:
         # protocol, same seeds, so a setting's effect and an objective's are
         # measured against each other rather than across two configurations.
         Tier("sensitivity", (objective_task(),), tuple(range(diagnostic_seeds)), Purpose.SELECTION),
-        # `Purpose.SELECTION` and not `DIAGNOSTIC`, which is the distinction the
-        # enum exists to hold: both rungs are off by default, so what this tier
-        # returns *chooses the configuration the method ships* rather than
-        # describing how methods behave. Called a diagnostic it would be eligible
-        # to appear in the results table as a mechanism finding while the same
-        # campaigns had already fixed our own configuration -- a choice reported
-        # as a result. On the diagnostic landscape, which no headline task uses,
-        # so the choice is not being made on the test set.
+        # The five mechanism rungs run here rather than in a tier of their own on
+        # the diagnostic landscape. A separate tier was what a *selection* needed
+        # -- decide off the test set, then promote -- and no rung is selected any
+        # more, so what a second tier would now buy is the same five arms measured
+        # where no claim is made, at 500 campaigns, and read across landscapes to
+        # the tasks that do carry the claims. That last step is the inference the
+        # reward-exponent reversal already cost this project once.
+        Tier(MAIN_TIER, cheap, tuple(range(main_seeds)), Purpose.BENCHMARK),
+        # The published pipelines and the selected arm, at `main`'s seed count --
+        # but **not** the mechanism rungs, which stay on `main` alone. This tier
+        # asks whether the *ordering* survives another draw from the instance
+        # generator, and a mechanism's size is not part of that ordering; adding
+        # the four rungs here would cost 2,400 campaigns to replicate a
+        # decomposition rather than a claim.
         #
-        # On `objective_task` for the reason the ladder is built by lookup: its
-        # base rung is the stored `(objectives, gfn-tb)` cell, so the control the
-        # three rungs are read against is the identical configuration by
-        # construction, and its first `diagnostic_seeds` are already banked.
-        #
-        # Seeded like the headline rather than like a diagnostic, because the
-        # rung that justifies the fourth arm is an *interaction*:
-        # `+terminal+anchor` earns its compute only by beating what the two
-        # single rungs predict by addition, and a difference of differences
-        # carries about twice the standard error of either main effect. At the
-        # diagnostic count that rung comes back inconclusive against its own
-        # prediction, which is the one answer this tier must not return.
-        Tier("variant-ladder", (objective_task(),), tuple(range(main_seeds)), Purpose.SELECTION),
-        Tier("main", cheap, tuple(range(main_seeds)), Purpose.BENCHMARK),
-        # Same arms and the same seed count as `main`, because it answers a
-        # question about `main`: every constrained comparison there rests on one
-        # draw from the generator, and a hundred seeds vary the wild type and the
-        # surrogate's initialisation without ever varying the instance. A
-        # lower-powered replicate could not distinguish "the ordering broke" from
-        # "we ran out of seeds", which is the one thing it exists to decide.
+        # Same seed count as `main`, because it answers a question about `main`:
+        # every constrained comparison there rests on one draw from the generator,
+        # and a hundred seeds vary the wild type and the surrogate's
+        # initialisation without ever varying the instance. A lower-powered
+        # replicate could not distinguish "the ordering broke" from "we ran out of
+        # seeds", which is the one thing it exists to decide.
         Tier("replication", replication(), tuple(range(main_seeds)), Purpose.BENCHMARK),
         Tier("rounds-curve", rounds_curve(), tuple(range(diagnostic_seeds)), Purpose.DIAGNOSTIC),
         Tier(
@@ -450,208 +478,139 @@ def selected_gflownet() -> dict[str, object]:
     }
 
 
-#: Where the promotion step records which rung of the variant ladder ships.
-#:
-#: A **separate file from** `CHOICE_FILE`, and a separate step, because the two
-#: decisions are made at different times against different evidence: the
-#: selection chooses hyperparameters from its own screen, and the promotion
-#: chooses a mechanism from a ladder that stands on whatever the selection
-#: chose. Writing both into one file would make the second look like a field of
-#: the first, which is exactly the reading that turns the promotion into an
-#: automatic consequence of the ladder rather than a decision somebody took.
-PROMOTION_FILE = Path("results/promoted.json")
+def mechanism_ablations() -> dict[str, str]:
+    """The rungs that are decomposition rows, mapped to the arm they decompose.
 
-#: Axes a promotion record must carry. Absent is not the same as null here for
-#: the reason it is not in `CHOICE_FILE`: a file written by a promotion that
-#: stopped partway describes a configuration no rule ever chose.
-_PROMOTION_AXES = ("arm", "base", "tier", "task")
+    Every rung but the base, and the base is the shipped arm -- so this is the
+    four mechanism rows of the headline table, each pointing at the
+    configuration it is one step away from. They are exactly what
+    `genetic+search` is to `genetic`: real campaigns, honestly run, that answer
+    *which part of the method does the work* rather than *which method a lab
+    should run*, and an unmarked one sitting among published pipelines is read
+    as a pipeline. ``+wide`` is the one that would be misread hardest -- it is a
+    capacity control whose only purpose is to make ``+anchor`` attributable, so
+    a reader taking it for a method would take a deliberately over-sized policy
+    for something somebody proposed.
 
-
-def promoted_rung() -> str | None:
-    """The ladder rung the promotion step chose, if it has run.
-
-    Returns:
-        The rung's arm name, or ``None`` when nothing has been promoted -- in
-        which case the headline tiers run exactly what they ran before the
-        ladder existed, which is the state the ladder must not be able to change
-        on its own.
-
-    Raises:
-        ValueError: If the record is unfinished, or names a rung the ladder no
-            longer builds, or was taken against a base the selection has since
-            moved off. All three describe an arm nobody runs, and falling back
-            to the untuned path instead would put a configuration in the
-            headline table that no promotion ever chose.
-    """
-    if not PROMOTION_FILE.exists():
-        return None
-    record = json.loads(PROMOTION_FILE.read_text())
-    if missing := [key for key in _PROMOTION_AXES if key not in record]:
-        raise ValueError(
-            f"{PROMOTION_FILE} is missing {', '.join(missing)}, so the promotion it "
-            f"records is unfinished; re-run experiments/run_suite.py --promote, or "
-            f"delete the file to leave the ladder unpromoted"
-        )
-    arm, base = str(record["arm"]), str(record["base"])
-    rungs = variant_arms()
-    if arm not in rungs:
-        raise ValueError(
-            f"{PROMOTION_FILE} promotes {arm!r}, which is not a rung of the current "
-            f"ladder ({', '.join(rungs)}); the ladder has moved under the promotion, "
-            f"so the recorded decision is about an arm nothing runs"
-        )
-    if base != shipped_base().name:
-        raise ValueError(
-            f"{PROMOTION_FILE} promotes a rung measured against base {base!r}, but the "
-            f"ladder now stands on {shipped_base().name!r}; the promotion rests on a "
-            f"comparison against a configuration this project no longer ships"
-        )
-    return arm
-
-
-def promoted_arms() -> dict[str, object]:
-    """The ladder's arms, once a promotion has put them in the headline path.
-
-    Empty until the promotion step runs, and that emptiness is the whole design.
-    The rungs are decided on the diagnostic landscape and *then* promoted; if
-    they simply appeared in `main` and the best were picked afterwards, the
-    configuration would have been chosen on the tasks that carry the claims --
-    tuning on the test set, which is the failure the entire selection phase
-    exists to prevent. Making promotion a file somebody writes, rather than a
-    consequence of the tier existing, is what keeps the two in that order.
+    Derived from `variant_arms` rather than written out, on the same reasoning
+    that put the ladder on the recorded selection: the rung names carry the
+    shipped arm's name as a prefix, so a literal list here would stop matching
+    the table the day a selection moved, and the rows it stopped matching would
+    go unmarked rather than raise.
 
     Returns:
-        Every rung by name, or an empty mapping when nothing is promoted.
+        Arm name to the shipped arm it decomposes.
     """
-    return dict(variant_arms()) if promoted_rung() is not None else {}
+    base = shipped_base().name
+    return {name: base for name in variant_arms() if name != base}
 
 
-def promoted_ablations() -> dict[str, str]:
-    """The rungs that are decomposition rows, mapped to the rung that ships.
+def _reproduced_on(task: Task) -> dict[str, str]:
+    """Rungs this task cannot measure, mapped to the arm whose campaign they are.
 
-    Every rung except the promoted one. They are exactly what `genetic+search`
-    is to `genetic`: real campaigns, honestly run, that answer *which part of
-    the method does the work* rather than *which method a lab should run* -- and
-    an unmarked one sitting among published pipelines is read as a pipeline.
-    ``+wide`` is in here too, and it is the one that would be misread hardest:
-    it is a capacity control whose only purpose is to make ``+anchor``
-    attributable, and a reader taking it for a method would take a deliberately
-    over-sized policy for something anyone proposed.
-
-    Returns:
-        Arm name to the promoted arm it decomposes, or an empty mapping.
-    """
-    promoted = promoted_rung()
-    if promoted is None:
-        return {}
-    return {name: promoted for name in variant_arms() if name != promoted}
-
-
-def promote(store: ResultStore, rung: str, *, report: Callable[[str], None] = print) -> int:
-    """Record which rung of the ladder ships, after the ladder has resolved.
-
-    The separate, explicit step. It reads **only** the ladder tier's own task --
-    the diagnostic landscape no headline task uses -- so a promotion cannot be
-    argued from a benchmark result even by a caller who wanted to. It runs
-    nothing: every comparison it prints comes from campaigns the ladder already
-    banked, so the decision is taken on evidence that existed before anyone
-    named a winner.
-
-    The rung is **named by the caller and never derived**. Deriving the best
-    rung here would make promotion an automatic consequence of running the
-    ladder, which is the thing this whole path exists to be instead of. What is
-    checked is that the named rung is one the evidence permits:
-
-    * a rung other than the base must have beaten the base, paired across shared
-      seeds, with the interval excluding zero;
-    * the base itself may be promoted -- "neither mechanism earns its compute" is
-      a real outcome of a ladder -- but only when no other rung beat it, since a
-      decision contradicting the tier it was taken from is not a decision.
+    One function for both halves of the decision -- what `_run` does not run and
+    what `report` reproduces -- because the two halves must agree exactly. A
+    reproduction of a row that *was* run would print a copy beside a measurement;
+    a row skipped and not reproduced would simply be missing, and an empty cell in
+    a headline table is an absence a reader fills in as they like.
 
     Args:
-        store: Where the ladder's campaigns live.
-        rung: The arm name to promote.
-        report: Where the evidence goes.
+        task: The task being run or reported on.
 
     Returns:
-        A process exit code: zero when the promotion was recorded, non-zero when
-        it was refused. Refused rather than warned about, because a promotion is
-        read back by `methods_for` and would otherwise fix the headline table's
-        configuration on evidence nobody checked.
+        Rung name to the arm it repeats, empty on any task where the mechanism has
+        something to act on. Derived from the environment by
+        [reproduced_rungs][evogfn.benchmark.methods.reproduced_rungs], so a task
+        that gains a transition matrix starts being measured with no edit here.
     """
-    rungs = variant_arms()
+    return reproduced_rungs(task=task)
+
+
+def _reproduce(
+    store: ResultStore, task: Task, held: dict[str, Mapping[int, RunRecord]]
+) -> dict[str, str]:
+    """Fill the rows this task cannot measure from the campaigns they repeat.
+
+    Reproduced here and not stored, which is the decision this arrangement turns
+    on. A stored copy is indistinguishable from a measurement the moment it is
+    written -- same cell shape, same fingerprint, same seeds -- and every reader of
+    the store would count it as an independent campaign. Reproducing at report
+    time keeps the store a record of what was measured and puts the copy where the
+    claim is made, on the line a reader takes the number from.
+
+    Args:
+        store: Where records live, consulted to catch a contradiction.
+        task: The task being reported on.
+        held: Records by arm, modified in place so the reproduced rows are read
+            by every section below exactly as a measured one would be. Its keys
+            are the arms this tier reports, and a rung outside them is not
+            reproduced: there is no row for it to fill.
+
+    Returns:
+        Rung name to the arm it reproduces, for the marker and the legend. A rung
+        whose source has no records is not reproduced: an empty row copied from an
+        empty row says nothing, and the arm simply prints nothing as it would
+        have anyway.
+
+    Raises:
+        ValueError: If the store already holds campaigns for a rung this task
+            declares a reproduction. The two claims cannot both be true, and
+            neither silent resolution is acceptable: preferring the store prints
+            an independent-looking row the suite believes could not exist, and
+            preferring the copy discards a measurement somebody paid for. Either
+            the task gained a transition matrix -- in which case the rung is now
+            measurable and the records are the right answer -- or the records were
+            produced against a task that has since lost one.
+    """
+    # Only rungs this table actually reports. A tier that does not run them has
+    # no row to fill, and filling one anyway would put a legend under a table
+    # holding nothing the legend describes.
+    copies = {rung: source for rung, source in _reproduced_on(task).items() if rung in held}
+    for rung, source in sorted(copies.items()):
+        stored = store.usable(task.name, rung)
+        if stored:
+            raise ValueError(
+                f"{task.name}/{rung}: the store holds {len(stored)} campaigns for a row this "
+                f"suite reproduces from {source}, because nothing on this task constrains "
+                f"construction and the two arms build the identical graph. Both claims cannot "
+                f"hold: either the task now has a transition matrix, and the rung must be run "
+                f"and this reproduction dropped, or those records describe a task that no "
+                f"longer exists and must be deleted"
+            )
+        if held.get(source):
+            held[rung] = held[source]
+    return {rung: source for rung, source in copies.items() if held.get(rung)}
+
+
+def _mechanism_rungs(arms: Mapping[str, object]) -> dict[str, object]:
+    """The rungs to add to a table that already holds the shipped arm.
+
+    Args:
+        arms: What the tier runs before the rungs are added.
+
+    Returns:
+        Every rung except the base, since the base **is** the arm the tier
+        already runs. Adding it again under the ladder's own object would put
+        one configuration in the table twice if the two builders ever disagreed
+        about its name, and would spend a second hundred campaigns proving they
+        agree if they did not.
+
+    Raises:
+        ValueError: If the base rung is not already among `arms`. That means the
+            selection's builder and the ladder's have drifted apart on the arm's
+            name, and the silent outcome is the bad one: two GFlowNet
+            configurations in a headline table that the selection phase exists to
+            leave holding exactly one.
+    """
     base = shipped_base().name
-    if rung not in rungs:
-        report(f"  {rung!r} is not a rung of the ladder ({', '.join(rungs)})")
-        return 2
-    task = objective_task()
-    held = {name: store.usable(task.name, name) for name in rungs}
-    seeds = sorted(set.intersection(*(set(records) for records in held.values())) or set())
-    if len(seeds) < 2:  # noqa: PLR2004 - a paired comparison needs two seeds
-        report(
-            f"  the ladder holds {len(seeds)} seed(s) every rung completed on {task.name}; "
-            f"there is nothing to promote from"
+    if base not in arms:
+        raise ValueError(
+            f"the ladder stands on {base!r}, which is not in the tier's arms "
+            f"({', '.join(sorted(arms))}); the selection and the ladder disagree about "
+            f"what this project ships, and reporting both would put two configurations "
+            f"of one method in the headline table"
         )
-        return 4
-
-    outcomes = {
-        name: compare(
-            name,
-            records_to_metric(held[name], seeds, "regret"),
-            records_to_metric(held[base], seeds, "regret"),
-            higher_is_better=False,
-        )
-        for name in rungs
-        if name != base
-    }
-    report(f"  ladder on {task.name}, {len(seeds)} shared seeds, paired against {base}:")
-    for outcome in outcomes.values():
-        report(f"    {outcome!r}")
-
-    beat_the_base = sorted(
-        name for name, outcome in outcomes.items() if outcome.significant and outcome.mean > 0.0
-    )
-    if rung == base and beat_the_base:
-        report(
-            f"  REFUSED: promoting the base {base!r} would ship the configuration that "
-            f"{', '.join(beat_the_base)} beat on this ladder; a promotion contradicting "
-            f"the tier it was taken from is not a decision"
-        )
-        return 5
-    if rung != base and rung not in beat_the_base:
-        report(
-            f"  REFUSED: {rung!r} did not beat {base!r} with an interval excluding zero "
-            f"({outcomes[rung]!r}); promoting it would put a rung in the headline table "
-            f"on evidence the ladder did not produce"
-        )
-        return 5
-
-    PROMOTION_FILE.parent.mkdir(parents=True, exist_ok=True)
-    PROMOTION_FILE.write_text(
-        json.dumps(
-            {
-                "arm": rung,
-                "base": base,
-                "tier": LADDER_TIER,
-                "task": task.name,
-                "seeds": len(seeds),
-                # The comparisons the decision rests on, stored beside it. A
-                # promotion whose evidence lives only in a terminal scrollback
-                # is one nobody can audit later, and this file is what
-                # `methods_for` reads to decide what the headline table runs.
-                "evidence": [repr(outcome) for outcome in outcomes.values()],
-                "recorded": time.strftime("%Y-%m-%dT%H:%M:%S"),
-            },
-            indent=2,
-        )
-        + "\n"
-    )
-    others = ", ".join(sorted(promoted_ablations()))
-    report(
-        f"  promoted {rung!r} into the headline path; {others} now appear there as "
-        f"decomposition rows, labelled on every line as ablations of {rung!r}"
-    )
-    return 0
+    return {name: arm for name, arm in variant_arms().items() if name != base}
 
 
 def methods_for(tier: Tier) -> dict[str, object]:
@@ -665,27 +624,13 @@ def methods_for(tier: Tier) -> dict[str, object]:
     Every branch here sits **above** the selection lookup, and that placement is
     the point rather than an accident of ordering. Below it, a recorded selection
     replaces the untuned GFlowNet arms wholesale -- which is right for a tier
-    comparing methods and fatal for the three tiers whose arms are defined
-    *relative to* an untuned one. A ladder whose base rung had been swapped for
-    the selected arm would report every rung as the difference between two
-    configurations, and an anchor study missing `gfn-tb` would lose the cell its
-    other four are read against.
+    comparing methods and fatal for the two tiers whose arms are defined
+    *relative to* an untuned one: an anchor study missing `gfn-tb` would lose the
+    cell its other four are read against.
     """
     fixed: dict[str, Callable[[], dict[str, object]]] = {
         "objectives": lambda: {**OBJECTIVES, **flow_objectives()},
         "sensitivity": lambda: dict(sensitivity()),
-        # The four-arm ladder, not the baseline set: no arm in `BASELINES` has a
-        # policy, so neither rung is even definable for one, and a table mixing
-        # them would answer "does a GFlowNet beat a GA" -- which `main` already
-        # answers -- in place of "does this rung add anything".
-        #
-        # Above the promotion lookup as well as above the selection one, and for
-        # the mirror of the same reason: the ladder is where a rung is *decided*,
-        # so it must go on running all five arms and comparing them against the
-        # base whatever has since been promoted. A promoted ladder that had
-        # dropped its losing rungs here would leave the decision unauditable the
-        # moment it was taken.
-        LADDER_TIER: lambda: dict(variant_arms()),
         # By name out of the shipped table rather than rebuilt, so these are the
         # same objects, and therefore the same store cells, that every other tier
         # runs. A name that stopped existing raises here instead of quietly
@@ -701,20 +646,49 @@ def methods_for(tier: Tier) -> dict[str, object]:
     # table, and the better of the two would be the one the selection was run to
     # avoid reporting.
     arms: dict[str, object] = dict(MAIN_METHODS) if not chosen else {**BASELINES, **chosen}
-    # The promoted ladder replaces the single selected arm with all five rungs:
-    # the winner as the method, the rest as decomposition rows. It sits on the
-    # default path rather than in a tier list of its own, so the promoted rungs
-    # appear wherever `genetic+search` already does -- there is then no second
-    # rule about where a decomposition row lives, and the shipped configuration
-    # cannot differ between two tiers that both claim to report it.
+    # The mechanism study, in the headline tier and nowhere else. Four rungs
+    # rather than five, because the fifth is the arm already above: the base rung
+    # *is* the selected arm, resolved from the same file by the same builder, so
+    # adding it a second time would be one configuration under two names --
+    # `_mechanism_rungs` raises rather than letting that pass silently.
     #
-    # It is not free: five GFlowNet arms in place of one is four extra campaigns
-    # per task per seed, which at the stored ~255s per campaign is hundreds of
-    # core-hours across the default-path tiers. That cost is paid only by
-    # somebody who both promotes and then runs; until then the rows report as
-    # unrun, which is the visible state rather than a surprise.
-    if promoted := promoted_arms():
-        arms = {**BASELINES, **promoted}
+    # Appended rather than merged in place, so the four decomposition rows sit
+    # after the pipelines they decompose instead of interleaving with them, and
+    # the base keeps the position it had when it was the tier's only GFlowNet.
+    #
+    # It is not free: four extra arms across five tasks at a hundred seeds would
+    # be 2,000 campaigns, of which 400 are not run -- see below -- leaving 1,600,
+    # which at the recorded ~255s per campaign is on the order of 113 core-hours.
+    # The headline seed count is what the `+terminal+anchor` rung needs rather
+    # than a number inherited: it earns its place only by beating what the two
+    # single rungs predict by addition, and a difference of differences carries
+    # about twice the standard error of either main effect -- at the diagnostic
+    # count it comes back inconclusive against its own prediction, which is the
+    # one answer this study must not return.
+    #
+    # Two properties of these rungs are task-dependent, and both are handled where
+    # the task is known rather than by a caveat in a table's footnotes:
+    #
+    # * `+terminal` is a **no-op without a transition matrix**. With no adjacency
+    #   to defer, `TerminalFeasibilityEnvironment` and `MutationEnvironment`
+    #   describe the identical graph, so on `gb1-anchor` and `trpb-anchor` the
+    #   `+terminal` and `+terminal+anchor` rows would be the base and `+anchor`
+    #   recomputed under other names -- 400 campaigns, and two pairs of identical
+    #   rows a reader could quote as "we tested the mechanism here and it made no
+    #   difference", which is a different and false claim from "there was nothing
+    #   here to test". They are therefore **not run**: `reproduced_rungs` names
+    #   them from the environment, `_run` omits them, and `report` reproduces the
+    #   row in italic with a legend saying whose campaign it is.
+    # * `+wide` is sized by `matched_capacity`, which counts parameters at the
+    #   shape of the task it will run on -- 101 at 32 positions, 103 at 64, 88 at
+    #   four sites, each a little over the conditioned arm rather than under. A
+    #   single width would be right on one shape only: 101 carries 1.63% *fewer*
+    #   parameters than `+anchor` on the 64-position tasks, and under-resourcing
+    #   the control is the direction that manufactures the effect it exists to
+    #   rule out. The resolved width and the achieved residual are written onto
+    #   every record the arm produces.
+    if tier.name == MAIN_TIER:
+        arms = {**arms, **_mechanism_rungs(arms)}
     if tier.name in BUDGET_AXIS_TIERS:
         # `mlde-over-budget` runs one plate beyond its task's protocol, which is
         # the point of the arm and is exactly what a tier whose axis *is* the
@@ -790,18 +764,6 @@ REFERENCES = {
     "sensitivity": "steps-300",
     # Trajectory balance, the objective the others are alternatives to.
     "objectives": "gfn-tb",
-    # The ladder's own base rung, which is what each rung is one step above.
-    # `genetic` is not in this tier at all, so without an entry here the whole
-    # paired section would be replaced by one line saying there was no reference
-    # -- three rungs run and nothing compared.
-    #
-    # Resolved from the ladder itself rather than named, because the ladder is
-    # now built on whatever configuration the selection recorded. A literal here
-    # would name an arm the tier had stopped running the moment a selection
-    # moved, and `reference_for` returns None for a name the tier does not hold
-    # -- so the failure is a tier that quietly compares nothing, which is what
-    # this entry exists to prevent.
-    LADDER_TIER: lambda: shipped_base().name,
     # The policy-carrying arm, so the pair that gets printed on the re-anchored
     # task is rebuilt-against-carried: the amortisation cell, and the only cell
     # in this study that a paired test can reach. Against the default reference
@@ -852,19 +814,24 @@ ABLATIONS = {
 }
 
 #: What each family of decomposition row separates, keyed by the pipeline it
-#: decomposes. Two families, because they answer different questions and a row
+#: decomposes. Three families, because they answer different questions and a row
 #: carrying the wrong one is a row explaining itself wrongly: the classical
-#: ablations split a surrogate's contribution from a sampler's, while a promoted
-#: ladder rung splits one GFlowNet mechanism from another.
+#: ablations split a surrogate's contribution from a sampler's, while a mechanism
+#: rung splits one mechanism of the shipped GFlowNet from another.
 _ATTRIBUTIONS = {
     "surrogate": (
         "separates the surrogate's contribution from the sampler's, and ranks "
         "no method a lab could run"
     ),
+    # It says *nothing is chosen from these rows* in as many words, because the
+    # obvious misreading of a five-row mechanism block in a headline table is
+    # that the best row is the method. It is not: the base is what ships, the
+    # other four say what each mechanism does on this task, and a rung that wins
+    # here is a finding about the mechanism rather than a new configuration.
     "mechanism": (
-        "separates one mechanism of the shipped configuration from the rest; it "
-        "was decided on the diagnostic landscape and is a decomposition of the "
-        "promoted arm, not a method a lab would run"
+        "separates one mechanism of the shipped configuration from the rest, "
+        "measured on the task that carries the claim; nothing is selected from "
+        "these rows and none of them is a method a lab would run"
     ),
     "handover": (
         "separates whether the published pipeline is unsuited to this landscape "
@@ -886,25 +853,25 @@ _HANDOVER_ROWS = frozenset({"mlde+earlyfit"})
 def ablations() -> dict[str, str]:
     """Every decomposition row in the table, mapped to what it decomposes.
 
-    The static pair plus whatever the promotion added. Resolved through a
-    function rather than left as a module constant so that the labelling cannot
-    be forgotten for the promoted rungs: `_arm_rows` and `_paired` both call
-    this, so a rung that reaches the table reaches it marked. A mapping extended
-    at promotion time by whoever remembered to would be a convention, and this
-    is the one place a convention fails -- an unmarked decomposition row among
-    published pipelines reads as a pipeline that lost.
+    The classical rungs plus the GFlowNet's. Resolved through a function rather
+    than left as a module constant because the second half of it is named after
+    whatever configuration the selection recorded: `_arm_rows` and `_paired` both
+    call this, so a rung that reaches the table reaches it marked, where a
+    constant would have to be edited by whoever remembered to. That is the one
+    place a convention fails -- an unmarked decomposition row among published
+    pipelines reads as a pipeline that lost.
 
     Returns:
-        Arm name to the pipeline or promoted arm it decomposes.
+        Arm name to the pipeline or shipped arm it decomposes.
     """
-    return {**ABLATIONS, **promoted_ablations()}
+    return {**ABLATIONS, **mechanism_ablations()}
 
 
 def _attribution(name: str) -> str:
     """Which question a decomposition row answers, in the row's own terms."""
     if name in _HANDOVER_ROWS:
         return _ATTRIBUTIONS["handover"]
-    kind = "mechanism" if name in promoted_ablations() else "surrogate"
+    kind = "mechanism" if name in mechanism_ablations() else "surrogate"
     return _ATTRIBUTIONS[kind]
 
 
@@ -921,11 +888,6 @@ def reference_for(tier: Tier, methods: dict[str, object]) -> str | None:
         as one -- said explicitly so the report can name the omission.
     """
     chosen = REFERENCES.get(tier.name, DEFAULT_REFERENCE)
-    # A callable entry names an arm that is not fixed at import -- the ladder's
-    # base rung follows the recorded selection -- and is resolved here so the
-    # table below never has to know which kind it got.
-    if callable(chosen):
-        chosen = chosen()
     return chosen if chosen in methods else None
 
 
@@ -937,8 +899,10 @@ def report(store: ResultStore, tier: Tier, reference: str | None = None) -> str:
     the context that makes it readable: the interval the task can reach, how many
     of an arm's seeds are sitting on it, what each arm spent to get there, which
     rows are ablations rather than published pipelines, **which supervised rows
-    never got as far as fitting a model**, and a refusal to present a paired
-    comparison drawn on a solved task as though it ranked anything.
+    never got as far as fitting a model**, a second paired block that reads the
+    mechanism rungs against the shipped arm rather than against `genetic`, and a
+    refusal to present a paired comparison drawn on a solved task as though it
+    ranked anything.
 
     Args:
         store: Where results live.
@@ -959,10 +923,17 @@ def report(store: ResultStore, tier: Tier, reference: str | None = None) -> str:
         attainable = attainable_for(task)
         lines.append(f"\n{task!r}")
         lines.append(_attainable_line(attainable))
-        held = {name: store.usable(task.name, name) for name in names}
+        held: dict[str, Mapping[int, RunRecord]] = {
+            name: store.usable(task.name, name) for name in names
+        }
+        # Before the seed intersection and before any row is built, so a
+        # reproduced row is read by every section below exactly as a measured one
+        # is -- and is *marked* in every one of them.
+        copies = _reproduce(store, task, held)
         seeds = [s for s in tier.seeds if all(s in held[n] for n in names if held[n])]
-        rows, solved, unfitted = _arm_rows(held, names, tier.seeds, attainable)
+        rows, solved, unfitted = _arm_rows(held, names, tier.seeds, attainable, reproduced=copies)
         lines.extend(rows)
+        lines.extend(_reproduction_legend(copies))
         for name in sorted(solved):
             lines.append(
                 f"  SOLVED  {name} sits on the attainable optimum "
@@ -982,7 +953,16 @@ def report(store: ResultStore, tier: Tier, reference: str | None = None) -> str:
                 f"name and must not be read as a tuned baseline that lost"
             )
 
-        lines.extend(_paired(held, names, seeds, reference, solved=solved, unfitted=unfitted))
+        lines.extend(
+            _paired(
+                held, names, seeds, reference, solved=solved, unfitted=unfitted, reproduced=copies
+            )
+        )
+        lines.extend(
+            _mechanism_pairs(
+                held, names, seeds, solved=solved, unfitted=unfitted, reproduced=copies
+            )
+        )
     # After every per-task table, never instead of them. The tables above are
     # already per instance; what this adds is the only reading of them that
     # treats the *instance* as the unit of replication, and a line saying that
@@ -1255,11 +1235,42 @@ def _pseudo_replication_line(effects: InstanceEffects) -> str:
     )
 
 
+def _reproduction_legend(reproduced: Mapping[str, str]) -> list[str]:
+    """The legend the italic rows above cannot be read without.
+
+    Printed under the table it belongs to rather than once per report, because a
+    reader quoting a row reads the block around it and not the top of a file. It
+    is the whole of the difference between "we tested the mechanism here and it
+    made no difference" -- which the identical numbers invite and which is false --
+    and "there was nothing here to test", which is what happened.
+
+    Args:
+        reproduced: Rung name to the arm it reproduces, empty on a task that
+            measured everything.
+
+    Returns:
+        The legend lines, or none.
+    """
+    if not reproduced:
+        return []
+    pairs = ", ".join(f"{rung} = {source}" for rung, source in sorted(reproduced.items()))
+    return [
+        f"  *italic* rows are REPRODUCTIONS, not measurements ({pairs}). Nothing on this task "
+        f"constrains the order substitutions are made in, so deferring feasibility to the stop "
+        f"action defers nothing: TerminalFeasibilityEnvironment and MutationEnvironment describe "
+        f"the identical graph here and the rung is its neighbour's campaign under another name. "
+        f"It was not run and nothing is stored for it; the numbers above are copied, and the "
+        f"agreement between the two rows is arithmetic rather than a finding about the mechanism"
+    ]
+
+
 def _arm_rows(
     held: Mapping[str, Mapping[int, RunRecord]],
     names: list[str],
     seeds: Sequence[int],
     attainable: AttainableOptimum | None,
+    *,
+    reproduced: Mapping[str, str] | None = None,
 ) -> tuple[list[str], set[str], set[str]]:
     """One line per arm, which sat on the ceiling, and which never fitted a model.
 
@@ -1279,11 +1290,20 @@ def _arm_rows(
     this the row is a random baseline printed under a supervised method's name,
     and the reading it invites is that the method was tried and beaten.
 
+    A **reproduced** row is the third. Where a rung's campaign on this task is
+    another arm's campaign under a second name, the row is not a measurement at
+    all -- see `_reproduce` -- and it prints in italic, marked with the arm it
+    copies. The numbers are real; what is not real is their independence, and two
+    identical rows read as agreement between two experiments unless the line
+    itself says otherwise.
+
     Args:
         held: Stored records by arm.
         names: The arms, in report order.
         seeds: The tier's seeds, fixing the order metrics are pulled in.
         attainable: What the task can reach, or ``None`` when unaudited.
+        reproduced: Rung name to the arm it copies, for the rows this task could
+            not measure.
 
     Returns:
         The report lines; the arms whose share of seeds on the attainable
@@ -1292,6 +1312,7 @@ def _arm_rows(
         recomputed by the caller, since recomputing is how the table and the
         comparison below it drift into disagreeing about which arms are which.
     """
+    copies = reproduced or {}
     lines, solved, unfitted = [], set(), set()
     for name in names:
         records = held[name]
@@ -1335,15 +1356,24 @@ def _arm_rows(
             solved.add(name)
         # On the row itself, not in a footnote: a decomposition row sitting
         # unmarked among published pipelines is read as one of them. Resolved
-        # through `ablations` so a promoted ladder rung is marked by the same
-        # code that marks `genetic+search`, rather than by a second list.
+        # through `ablations` so a mechanism rung is marked by the same code that
+        # marks `genetic+search`, rather than by a second list.
         decomposes = ablations().get(name)
         mark = f"  [ablation of {decomposes}]" if decomposes else ""
+        # Italic, in the only way a fixed-width text report has one: asterisks
+        # around the name, which is the plain-text convention and which the legend
+        # under the table names explicitly rather than leaving to be inferred. The
+        # marker beside it carries the arm, because "this is a copy" and "a copy of
+        # what" are two different things a reader needs and only one of them fits
+        # in an emphasis.
+        copied = copies.get(name)
+        label = f"*{name}*" if copied else name
+        repeat = f"  [reproduced from {copied}]" if copied else ""
         lines.append(
-            f"  {name:<18} regret {regret.mean():>7.3f} +/- {error:<6.3f} "
+            f"  {label:<18} regret {regret.mean():>7.3f} +/- {error:<6.3f} "
             f"at-opt {share:>5.2f}  feas {feasible.mean():>5.3f}  "
             f"div {spread.mean():>5.2f}  spent {spent.mean():>6.0f}  "
-            f"proxy {proxy.mean():>7.0f}  n={len(regret)}{failed}{unfit}{mark}"
+            f"proxy {proxy.mean():>7.0f}  n={len(regret)}{failed}{unfit}{mark}{repeat}"
         )
     return lines, solved, unfitted
 
@@ -1356,6 +1386,7 @@ def _paired(  # noqa: PLR0913 - each argument is one qualifier a p-value needs
     *,
     solved: set[str],
     unfitted: set[str],
+    reproduced: Mapping[str, str] | None = None,
 ) -> list[str]:
     """Compare every arm against the reference, paired across shared seeds.
 
@@ -1367,16 +1398,26 @@ def _paired(  # noqa: PLR0913 - each argument is one qualifier a p-value needs
         solved: Arms already sitting on the attainable optimum.
         unfitted: Arms that finished at least one campaign without fitting the
             model they are named for.
+        reproduced: Rung name to the arm it copies. A copy is **not** paired: its
+            comparison against any third arm is the comparison its source already
+            printed, to the last digit, and a second p-value with a second name on
+            it is one piece of evidence read as two. Against the source itself the
+            statistic is not merely redundant but undefined -- every paired
+            difference is exactly zero, so the standard error is zero -- and a
+            printed ``nan`` there would look like a failed test rather than a
+            comparison that never had anything to compare.
 
     Returns:
         Report lines, including a line naming the omission when there is
         nothing to compare against -- an absent section reads as "nothing
         separated these arms", which is a different statement from "nothing
         was tested" -- a line marking every ablation, whose comparison against a
-        published pipeline is an attribution and not a ranking, and a line
-        marking every comparison that names an arm which never fitted, whose
-        p-value is about a random screen rather than about a supervised method.
+        published pipeline is an attribution and not a ranking, a line marking
+        every comparison that names an arm which never fitted, whose p-value is
+        about a random screen rather than about a supervised method, and a line
+        for each reproduced row saying why it is not paired.
     """
+    copies = reproduced or {}
     if reference is None:
         return ["  no reference arm in this tier, so nothing is paired"]
     base = held.get(reference)
@@ -1385,6 +1426,22 @@ def _paired(  # noqa: PLR0913 - each argument is one qualifier a p-value needs
     lines = [f"  paired vs {reference} (positive favours the first):"]
     for name in names:
         if name == reference or not held[name]:
+            continue
+        if source := copies.get(name):
+            # Said rather than skipped, on the reasoning every other refusal in
+            # this report carries: an omitted line reads as "these did not
+            # separate", which is the opposite of what happened. Two sentences,
+            # because the copy stands in two different relations to a reference --
+            # redundant with it against a third arm, degenerate against its own
+            # source -- and one wording would be wrong about one of them.
+            because = (
+                f"it is {source}'s own campaign here, so every paired difference is exactly "
+                f"zero by construction and the statistic has no standard error"
+                if source == reference
+                else f"it reproduces {source}, so this comparison is {source}'s, already "
+                f"printed under the name of the arm that measured it"
+            )
+            lines.append(f"    {name} vs {reference}: not paired -- {because}")
             continue
         mine = records_to_metric(held[name], seeds, "regret")
         theirs = records_to_metric(base, seeds, "regret")
@@ -1429,6 +1486,73 @@ def _paired(  # noqa: PLR0913 - each argument is one qualifier a p-value needs
     return lines
 
 
+def _mechanism_pairs(  # noqa: PLR0913 - each argument is one qualifier a p-value needs
+    held: Mapping[str, Mapping[int, RunRecord]],
+    names: list[str],
+    seeds: list[int],
+    *,
+    solved: set[str],
+    unfitted: set[str],
+    reproduced: Mapping[str, str] | None = None,
+) -> list[str]:
+    """The mechanism rungs, paired against the shipped arm rather than `genetic`.
+
+    A second block and not a replacement for the first. The table's reference is
+    a published pipeline because that is what a lab chooses between, and every
+    arm here -- rungs included -- has to be readable against it. But a rung's
+    difference from `genetic` is not what the rung measures: ``+anchor`` is one
+    step from the shipped configuration and nothing else, so the number that
+    isolates the mechanism is the paired difference against *that*. Without this
+    block the rung's row carries an attribution line saying it decomposes the
+    shipped arm, sitting directly beneath a p-value taken against a different
+    one, which is a row explaining itself wrongly.
+
+    It cannot be had by subtracting the two `genetic`-referenced lines either:
+    those are two paired differences over the same seeds, and their difference
+    has a standard error neither of them states.
+
+    Args:
+        held: Stored records by arm.
+        names: The arms, in report order.
+        seeds: Seeds every arm has, so the comparison is genuinely paired.
+        solved: Arms already sitting on the attainable optimum.
+        unfitted: Arms that finished a campaign without fitting.
+        reproduced: Rung name to the arm it copies. A reproduced rung is one whose
+            mechanism has nothing to act on here, so it is exactly the rung this
+            block cannot say anything about -- and the block says that, in place of
+            a difference that is zero by construction.
+
+    Returns:
+        Report lines, or none where this tier holds no rungs -- which is every
+        tier but `main`, and is why the block is keyed off the arms present
+        rather than off the tier's name.
+    """
+    copies = reproduced or {}
+    base = shipped_base().name
+    decomposed = mechanism_ablations()
+    rungs = [name for name in names if name == base or name in decomposed]
+    if base not in rungs or len(rungs) < 2:  # noqa: PLR2004 - a study needs the base and one rung
+        return []
+    heading = "\n  --- mechanisms, each one step from the shipped arm ---"
+    measured = [name for name in rungs if name != base and name not in copies and held.get(name)]
+    if not measured:
+        # Said rather than left as a heading over nothing. `_paired` skips an arm
+        # with no records, which is right in the main table and wrong here: a
+        # block whose only content is its own header reads as four mechanisms
+        # that separated nothing, when what happened is that none of them ran.
+        # A block holding *only* reproductions is the same failure with numbers
+        # in it, and worse for being readable.
+        return [
+            heading,
+            f"  no rung has run on this task, so nothing decomposes {base} here; this is "
+            f"an unrun study rather than four mechanisms that made no difference",
+        ]
+    return [
+        heading,
+        *_paired(held, rungs, seeds, base, solved=solved, unfitted=unfitted, reproduced=copies),
+    ]
+
+
 def main(argv: list[str] | None = None) -> int:
     """Run or report on the suite."""
     parser = argparse.ArgumentParser(description=__doc__)
@@ -1469,32 +1593,16 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--results", default="results", help="Where to store results.")
     parser.add_argument("--report", action="store_true", help="Report without running.")
-    parser.add_argument(
-        "--promote",
-        metavar="RUNG",
-        help="Record which rung of the variant ladder ships, and stop. Runs "
-        "nothing and reports nothing else: it reads the ladder's stored "
-        "campaigns on the diagnostic landscape, prints every rung against the "
-        "base, and writes the decision. Naming the rung is the point -- deriving "
-        "the winner here would make promotion an automatic consequence of the "
-        "ladder having run, which is what a separate step exists instead of.",
-    )
     args = parser.parse_args(argv)
 
     # Before any tensor work: a multithreaded matmul sums in thread-completion
     # order, and a few hundred gradient steps turn that into a different design.
     configure_determinism()
-    if not args.report and not args.promote and not is_deterministic():
+    if not args.report and not is_deterministic():
         print("refusing to run: threading is not pinned", file=sys.stderr)
         return 3
 
     store = ResultStore(Path(args.results))
-    if args.promote:
-        # Before any tier is selected, and returning outright. A promotion that
-        # shared an invocation with a run would fix the headline configuration
-        # and then immediately benchmark it, which is the one ordering the
-        # separate step exists to make impossible.
-        return promote(store, args.promote, report=_flush)
     selected = tiers(args.seeds, args.diagnostic_seeds)
     if args.tier:
         selected = [t for t in selected if t.name in set(args.tier)]
@@ -1567,7 +1675,13 @@ def _run(
         said so.
     """
     if running.name != ANCHOR_TIER:
-        return run_tier(running, arms, store, report=_flush)  # type: ignore[arg-type]
+        # The second departure from the cross, and unlike the anchor study it is
+        # a property of the (task, arm) pair rather than of the tier: `+terminal`
+        # is a real mechanism on a task that constrains construction and its
+        # neighbour's own campaign on one that does not. Passed as a rule rather
+        # than resolved here, so the same function decides what is skipped and
+        # what the report reproduces.
+        return run_tier(running, arms, store, report=_flush, omit=_reproduced_on)  # type: ignore[arg-type]
     if by_method:
         # Refused rather than applied. The study is a list of ``(task, arm)``
         # cells and not an arm set, so an arm filter would drop whole cells

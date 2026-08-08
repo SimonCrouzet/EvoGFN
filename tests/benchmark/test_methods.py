@@ -64,21 +64,24 @@ from evogfn.benchmark.methods import (
     DEFAULT_HIDDEN_DIM,
     DEFAULT_POOL,
     DEFAULT_TRAINING_STEPS,
-    LADDER_SEQUENCE_LENGTH,
-    LADDER_VOCAB_SIZE,
     OBJECTIVES,
     SELECTED_CONFIGURATION,
     LadderBase,
+    _environment,
+    _parameter_count,
     _RebuiltOnMove,
     anchor_arms,
+    constrains_construction,
     gflownet,
-    matched_hidden_dim,
+    matched_capacity,
+    matched_capacity_for,
+    reproduced_rungs,
     shipped_base,
     variant_arms,
 )
 from evogfn.benchmark.protocol import Protocol
 from evogfn.benchmark.selection import _build_objective
-from evogfn.benchmark.suite import DIAGNOSTIC_INSTANCE
+from evogfn.benchmark.suite import DIAGNOSTIC_INSTANCE, _arm_parameters
 from evogfn.benchmark.tasks import Task
 from evogfn.env.mutation import MutationEnvironment, TerminalFeasibilityEnvironment
 from evogfn.landscapes.ehrlich import EhrlichLandscape
@@ -309,17 +312,22 @@ def rung(suffix):
 
 
 def diagnostic_task():
-    """A task on the landscape the ladder tier actually runs on.
+    """A task on the diagnostic landscape, at 32 positions over 20 tokens."""
+    return shaped_task("diagnostic", **DIAGNOSTIC_INSTANCE)
 
-    The parameter counts are only meaningful at one sizing -- the sequence length
+
+def shaped_task(name, **instance):
+    """A task on an Ehrlich instance of a named shape.
+
+    A parameter count is a statement about *one* sizing -- the sequence length
     fixes the trunk's input width and the alphabet fixes the action head's output
-    -- so the capacity control has to be measured on the landscape it will be run
-    on rather than on `toy_task`.
+    -- so the capacity control has to be measured on each shape the tier runs, and
+    a helper that varies the shape is what makes "each shape" testable at all.
     """
     return Task(
-        name="diagnostic",
-        purpose="the diagnostic instance, for sizing the capacity control",
-        build=lambda: EhrlichLandscape(**DIAGNOSTIC_INSTANCE),  # type: ignore[arg-type]
+        name=name,
+        purpose="an instance of a named shape, for sizing the capacity control",
+        build=lambda: EhrlichLandscape(**instance),
         protocol=Protocol(rounds=ROUNDS, batch_size=BATCH, max_mutations=4),
         max_mutations=4,
         reanchor=True,
@@ -327,13 +335,16 @@ def diagnostic_task():
     )
 
 
-def parameter_count(arm):
-    """Learnable parameters in the policy an arm builds on the ladder's landscape.
+def parameter_count(arm, task=None):
+    """Learnable parameters in the policy an arm builds on a task.
 
     Counted off the policy the arm itself constructs rather than off one built to
     match it, so what is measured is the network that would train.
     """
-    return sum(int(p.numel()) for p in policy_of(arm(diagnostic_task(), 0)).parameters())
+    return sum(
+        int(p.numel())
+        for p in policy_of(arm(diagnostic_task() if task is None else task, 0)).parameters()
+    )
 
 
 def recorded_selection():
@@ -974,9 +985,12 @@ class TestTheVariantLadderIsAddedRatherThanApplied:
         # An arm that also moved the step count, the reward exponent, the
         # objective or the trunk width would be losing or winning on compute,
         # and the ladder would report that as a feasibility or conditioning
-        # result. `+wide` is exempted on width alone because width *is*
-        # what it varies -- and on nothing else, which is the whole of its
-        # claim to be a capacity control rather than a second configuration.
+        # result. `+wide` is exempted on the capacity flag alone because capacity
+        # *is* what it varies -- and on nothing else, which is the whole of its
+        # claim to be a capacity control rather than a second configuration. Its
+        # static `hidden_dim` is *not* exempted and must equal the base's: the
+        # width it trains at is resolved per task, so a static width that differed
+        # would be a second configuration hiding in the settings.
         arms = variant_arms(LADDER)
         base = settings(arms[LADDER.name])
         flags = ("terminal_feasibility", "anchor_conditioned")
@@ -986,8 +1000,8 @@ class TestTheVariantLadderIsAddedRatherThanApplied:
                 k: v for k, v in base.items() if k not in flags
             }, suffix
         control = settings(arms[rung("+wide")])
-        assert {k: v for k, v in control.items() if k != "hidden_dim"} == {
-            k: v for k, v in base.items() if k != "hidden_dim"
+        assert {k: v for k, v in control.items() if k != "match_anchor_capacity"} == {
+            k: v for k, v in base.items() if k != "match_anchor_capacity"
         }
 
     def test_the_flags_are_off_wherever_they_are_not_named(self):
@@ -1131,8 +1145,10 @@ class TestTheLadderIsBuiltOnTheConfigurationThatShips:
             steps=DEFAULT_TRAINING_STEPS,
             hidden_dim=32,
         )
-        assert matched_hidden_dim(32, learn_flow=False) != matched_hidden_dim(
-            LADDER.hidden_dim, learn_flow=False
+        shape = {"sequence_length": 32, "vocab_size": 20, "learn_flow": False}
+        assert (
+            matched_capacity(32, **shape).hidden_dim
+            != matched_capacity(LADDER.hidden_dim, **shape).hidden_dim
         ), "the two bases must size their controls differently or this proves nothing"
         assert not set(variant_arms(narrow)) & set(variant_arms(LADDER))
 
@@ -1210,11 +1226,27 @@ class TestTheLadderIsBuiltOnTheConfigurationThatShips:
 
 
 #: How far the capacity control may sit from the arm it controls for, as a share
-#: of that arm's parameter count. Half a percent is far below any effect the
-#: ladder could report and far above the residual no integer width can remove --
-#: the shipped pair differ by 0.13% -- so a failure here means the architecture
-#: moved rather than that the arithmetic is imprecise.
-CAPACITY_TOLERANCE = 0.005
+#: of that arm's parameter count. Two percent is far below any effect the ladder
+#: could report and far above the residual no integer width can remove -- the
+#: worst of the shipped shapes is 1.07% -- so a failure here means the
+#: architecture moved rather than that the arithmetic is imprecise.
+CAPACITY_TOLERANCE = 0.02
+
+#: Every shape the headline tier puts the control on, and the widths and residuals
+#: the module's docstrings quote for the shipped trunk of 64 with a flow head.
+#: Written out because they are the numbers a reader is asked to trust: a
+#: docstring quoting a residual that stopped being true is worse than one quoting
+#: none, since nothing tells the reader which it is looking at.
+#:
+#: 32 is the diagnostic instance; 64 is `feasibility` and both protocol tasks;
+#: four is `gb1-anchor` and `trpb-anchor`, whose Ehrlich stand-in here is exact
+#: for this purpose -- a parameter count reads the length and the alphabet and
+#: nothing else about a landscape.
+SHIPPED_SHAPES = (
+    (32, 20, 101, 179952, 179715),
+    (64, 20, 103, 355728, 354435),
+    (4, 20, 88, 27123, 26835),
+)
 
 
 class TestTheCapacityControlIsTheSizeOfTheArmItControlsFor:
@@ -1226,6 +1258,13 @@ class TestTheCapacityControlIsTheSizeOfTheArmItControlsFor:
     policy of matching size in the table, every reading of "conditioning helped"
     is equally a reading of "more parameters helped", and no column distinguishes
     them.
+
+    Every assertion here is taken **per shape**, because a parameter count is a
+    statement about one sizing and the headline tier runs three. Matched once at
+    the diagnostic shape, this control carried 1.63% *fewer* parameters than the
+    arm it controls for on the 64-position tasks -- an under-resourced control,
+    which is the one direction that manufactures the effect the arm exists to rule
+    out, on precisely the tasks the claims are drawn from.
 
     What would otherwise be silent is the drift. The widths are integers and the
     counts are quadratics, so the match is arithmetic that holds for one
@@ -1241,33 +1280,56 @@ class TestTheCapacityControlIsTheSizeOfTheArmItControlsFor:
             pytest.skip("no selection recorded, so there is no shipped width to match")
         return shipped_base()
 
-    def test_the_control_and_the_conditioned_arm_are_the_same_size(self):
+    def shapes(self):
+        """One task per shape the headline tier runs the control on."""
+        return [
+            shaped_task(
+                f"shape-{length}",
+                sequence_length=length,
+                vocab_size=20,
+                n_motifs=1,
+                motif_length=2,
+                transition_density=0.5,
+                seed=3,
+            )
+            for length in (32, 64, 8)
+        ]
+
+    @pytest.mark.parametrize("length", [32, 64, 8])
+    def test_the_control_and_the_conditioned_arm_are_the_same_size_on_every_shape(self, length):
         base = self.base()
         arms = variant_arms()
-        conditioned = parameter_count(arms[f"{base.name}+anchor"])
-        control = parameter_count(arms[f"{base.name}+wide"])
+        task = next(t for t in self.shapes() if t.name == f"shape-{length}")
+        conditioned = parameter_count(arms[f"{base.name}+anchor"], task)
+        control = parameter_count(arms[f"{base.name}+wide"], task)
 
         assert abs(control - conditioned) <= CAPACITY_TOLERANCE * conditioned
 
-    def test_the_control_errs_upward_rather_than_downward(self):
-        # The direction is the whole safety property. A control with slightly
-        # more capacity than the arm it controls for can only understate
-        # conditioning's effect; one with slightly less manufactures the effect
-        # the arm exists to rule out, and the table cannot tell the two apart.
+    @pytest.mark.parametrize("length", [32, 64, 8])
+    def test_the_control_errs_upward_rather_than_downward_on_every_shape(self, length):
+        # The direction is the whole safety property, and it is the property the
+        # single-shape sizing broke: at 64 positions the control was the *smaller*
+        # network. A control with slightly more capacity than the arm it controls
+        # for can only understate conditioning's effect; one with slightly less
+        # manufactures the effect the arm exists to rule out, and the table cannot
+        # tell the two apart.
         base = self.base()
         arms = variant_arms()
+        task = next(t for t in self.shapes() if t.name == f"shape-{length}")
 
-        assert parameter_count(arms[f"{base.name}+wide"]) >= parameter_count(
-            arms[f"{base.name}+anchor"]
+        assert parameter_count(arms[f"{base.name}+wide"], task) >= parameter_count(
+            arms[f"{base.name}+anchor"], task
         )
 
-    def test_no_narrower_width_would_do(self):
+    @pytest.mark.parametrize("length", [32, 64, 8])
+    def test_no_narrower_width_would_do(self, length):
         # The rule is the narrowest plain trunk that is not smaller, so one width
         # down must fall short. Without this the control could drift arbitrarily
         # wide and still pass the tolerance above by luck of the tolerance.
         base = self.base()
-        width = matched_hidden_dim(base.hidden_dim, learn_flow=base.learn_flow)
-        conditioned = parameter_count(variant_arms()[f"{base.name}+anchor"])
+        task = next(t for t in self.shapes() if t.name == f"shape-{length}")
+        width = matched_capacity_for(task, base.hidden_dim, learn_flow=base.learn_flow).hidden_dim
+        conditioned = parameter_count(variant_arms()[f"{base.name}+anchor"], task)
         narrower = gflownet(
             base.objective,
             beta=base.beta,
@@ -1276,25 +1338,189 @@ class TestTheCapacityControlIsTheSizeOfTheArmItControlsFor:
             hidden_dim=width - 1,
         )
 
-        assert parameter_count(narrower) < conditioned
+        assert parameter_count(narrower, task) < conditioned
 
-    def test_the_shipped_pair_are_the_counts_the_docstring_states(self):
-        # The numbers in `matched_hidden_dim`'s docstring, measured. A docstring
-        # quoting a residual that stopped being true is worse than one quoting
-        # none, since the reader has no way to know which.
+    @pytest.mark.parametrize(("length", "vocab", "width", "plain", "conditioned"), SHIPPED_SHAPES)
+    def test_the_shipped_shapes_are_the_counts_the_docstrings_state(
+        self, length, vocab, width, plain, conditioned
+    ):
         base = self.base()
-        if base.hidden_dim != 64:
-            pytest.skip("the stated counts are for the shipped width of 64")
+        if base.hidden_dim != 64 or not base.learn_flow:
+            pytest.skip("the stated counts are for the shipped width of 64 with a flow head")
+
+        match = matched_capacity(
+            base.hidden_dim, sequence_length=length, vocab_size=vocab, learn_flow=base.learn_flow
+        )
+
+        assert (match.hidden_dim, match.parameters, match.target) == (width, plain, conditioned)
+        assert match.residual > 0
+
+    def test_a_single_width_would_be_short_on_one_of_the_shapes(self):
+        # The bug, stated as the measurement that found it. 101 matches the
+        # diagnostic shape and is 1.63% *under* at 64 positions -- so this asserts
+        # that resolving per task is load-bearing rather than tidy, and it fails
+        # the day the architecture changes enough for one width to serve.
+        base = self.base()
+        if base.hidden_dim != 64 or not base.learn_flow:
+            pytest.skip("the stated counts are for the shipped width of 64 with a flow head")
+        shape = {"vocab_size": 20, "learn_flow": base.learn_flow}
+        diagnostic = matched_capacity(base.hidden_dim, sequence_length=32, **shape)
+        longer = matched_capacity(base.hidden_dim, sequence_length=64, **shape)
+
+        assert diagnostic.hidden_dim != longer.hidden_dim
+        assert (
+            _parameter_count(
+                diagnostic.hidden_dim,
+                sequence_length=64,
+                vocab_size=20,
+                learn_flow=base.learn_flow,
+                anchor_conditioned=False,
+            )
+            < longer.target
+        )
+
+    def test_the_record_carries_the_width_that_trained_and_the_residual_it_achieved(self):
+        # Where a reader can find it. The width is not in the arm's name and is
+        # not the one in its static settings -- that number is the *conditioned*
+        # trunk being matched -- so a record reporting the nominal 64 would
+        # describe a policy that never existed on any task.
+        base = self.base()
         arms = variant_arms()
+        task = self.shapes()[1]
+        control = arms[f"{base.name}+wide"]
+        match = matched_capacity_for(task, base.hidden_dim, learn_flow=base.learn_flow)
 
-        assert parameter_count(arms[f"{base.name}+anchor"]) == 179715
-        assert parameter_count(arms[f"{base.name}+wide"]) == 179952
-        assert settings(arms[f"{base.name}+wide"])["hidden_dim"] == 101
+        recorded = _arm_parameters(control, task)
 
-    def test_the_control_is_sized_for_the_landscape_the_tier_runs_on(self):
-        # A parameter count is a statement about one sizing. Were the ladder tier
-        # moved to another landscape, this control would be matched to a
-        # landscape nobody runs -- and every count above would still pass, being
-        # measured at the sizing this asserts.
-        assert DIAGNOSTIC_INSTANCE["sequence_length"] == LADDER_SEQUENCE_LENGTH
-        assert DIAGNOSTIC_INSTANCE["vocab_size"] == LADDER_VOCAB_SIZE
+        assert recorded["hidden_dim"] == match.hidden_dim
+        assert recorded["capacity_parameters"] == parameter_count(control, task)
+        assert recorded["capacity_target"] == parameter_count(arms[f"{base.name}+anchor"], task)
+        assert recorded["capacity_residual"] == pytest.approx(match.residual)
+        assert float(recorded["capacity_residual"]) > 0
+
+    def test_an_arm_that_matches_nothing_records_no_capacity_fields(self):
+        # The overlay is per arm, not per table. An arm without the flag has a
+        # width of its own and must not acquire a residual it never computed.
+        recorded = _arm_parameters(OBJECTIVES["gfn-tb"], self.shapes()[0])
+
+        assert recorded["hidden_dim"] == DEFAULT_HIDDEN_DIM
+        assert "capacity_residual" not in recorded
+
+    def test_matching_and_conditioning_at_once_is_refused(self):
+        # The control is the conditioned arm's size *without* the conditioning.
+        # An arm that is both would be its own control, and the search has no
+        # target to aim at.
+        with pytest.raises(ValueError, match="capacity control for itself"):
+            gflownet(TrajectoryBalance(), anchor_conditioned=True, match_anchor_capacity=True)
+
+
+class TestTwoRungsCannotBeMeasuredOnAnUnconstrainedTask:
+    """`+terminal` defers a rule that a landscape without a matrix does not have.
+
+    Where nothing constrains construction, `TerminalFeasibilityEnvironment` and
+    `MutationEnvironment` describe the identical graph: the rung is the base arm's
+    own campaign, and `+terminal+anchor` is `+anchor`'s. Running them costs the
+    campaigns twice and puts two pairs of identical rows in a headline table,
+    which reads as "we tested the mechanism here and it made no difference" --
+    a different and false claim from "there was nothing here to test".
+
+    The condition is read off the environment rather than off a list of task
+    names, which is what makes it survive a task gaining a transition matrix. A
+    list would go on naming the same rows as reproductions after the mechanism
+    became measurable on them.
+    """
+
+    def unconstrained_task(self, name):
+        """A task whose landscape publishes no transition matrix.
+
+        The structural shape of `gb1-anchor` and `trpb-anchor`, which are the two
+        tasks this applies to and which cannot be built here without their
+        datasets. An Ehrlich instance always carries a matrix -- even at density
+        1.0 -- so "no constraint" has to be modelled by removing the attribute the
+        environment reads, which is exactly what the empirical landscapes do by
+        never having it.
+        """
+
+        class Unconstrained(EhrlichLandscape):
+            """The same landscape with no constructibility rule to publish."""
+
+            @property
+            def transition_matrix(self):
+                """Nothing, as on a landscape whose tokens have no adjacency rule."""
+                return None
+
+        return Task(
+            name=name,
+            purpose="a landscape with no transition matrix, as the empirical tasks are",
+            build=lambda: Unconstrained(
+                sequence_length=16,
+                vocab_size=20,
+                n_motifs=1,
+                motif_length=2,
+                seed=4,
+            ),
+            protocol=Protocol(rounds=ROUNDS, batch_size=BATCH, max_mutations=4),
+            max_mutations=4,
+            attainable=None,
+        )
+
+    def test_an_unconstrained_task_reproduces_both_terminal_rungs(self):
+        base = shipped_base()
+        loose = self.unconstrained_task("loose")
+
+        assert not constrains_construction(loose)
+        assert reproduced_rungs(base, task=loose) == {
+            f"{base.name}+terminal": base.name,
+            f"{base.name}+terminal+anchor": f"{base.name}+anchor",
+        }
+
+    def test_a_constrained_task_reproduces_nothing(self):
+        # The guard, in the direction that matters: a task with a matrix has a
+        # mechanism to measure, so every rung must run. Derived rather than listed,
+        # so a task that gains one crosses this line without an edit.
+        base = shipped_base()
+        constrained = shaped_task(
+            "constrained",
+            sequence_length=16,
+            vocab_size=20,
+            n_motifs=1,
+            motif_length=2,
+            transition_density=0.15,
+            seed=5,
+        )
+
+        assert constrains_construction(constrained)
+        assert reproduced_rungs(base, task=constrained) == {}
+
+    def test_a_dense_matrix_is_still_a_matrix(self):
+        # The distinction the derivation has to get right, and the one a
+        # "nothing is forbidden here" reading would collapse: a landscape that
+        # permits every adjacency still *has* the rule, so the two environments
+        # are still different classes and the rung still runs. Reproducing there
+        # would be a copy standing in for a campaign that could have differed.
+        base = shipped_base()
+        dense = shaped_task(
+            "dense",
+            sequence_length=16,
+            vocab_size=20,
+            n_motifs=1,
+            motif_length=2,
+            transition_density=1.0,
+            seed=6,
+        )
+
+        assert constrains_construction(dense)
+        assert reproduced_rungs(base, task=dense) == {}
+
+    def test_the_two_environments_really_are_the_same_graph_where_it_says_so(self):
+        # The premise, measured rather than asserted. If these two ever disagreed
+        # on an unconstrained task, every reproduced row would be a fabrication.
+        loose = self.unconstrained_task("loose-graph")
+        landscape = loose.landscape()
+        plain = _environment(loose, landscape)
+        deferred = _environment(loose, landscape, terminal_feasibility=True)
+        state = plain.initial(4)
+
+        assert type(plain) is not type(deferred)
+        assert np.array_equal(plain.forward_mask(state), deferred.forward_mask(state))
+        assert plain.n_actions == deferred.n_actions

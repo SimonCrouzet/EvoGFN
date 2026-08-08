@@ -1279,6 +1279,35 @@ def _sampler_fields(sampler: Sampler) -> dict[str, object]:
     }
 
 
+def _arm_parameters(method: Methodology, task: Task) -> dict[str, str | float | bool]:
+    """What an arm declares it resolved to, on the task the record is for.
+
+    By attribute, like the sampler quantities beside it: an arm built by
+    [methods][evogfn.benchmark.methods] declares what it closed over, and a
+    methodology defined anywhere else is a plain callable that declares nothing.
+    Empty is then the honest record -- the settings were not stated, which is not
+    the same as an arm having none.
+
+    The task is passed because one setting is not knowable without it. The
+    capacity-matched control's trunk width is resolved from the task's own
+    sequence length and alphabet, so the number that trained is a property of the
+    pair; an arm asked only for its static settings would report the same width on
+    every shape and be wrong on all but one. Arms that resolve nothing per task
+    are unaffected and answer exactly as before.
+
+    Args:
+        method: The methodology, asked rather than inspected.
+        task: The task being recorded.
+
+    Returns:
+        The settings, ready for the record.
+    """
+    resolve = getattr(method, "parameters_for", None)
+    if resolve is not None:
+        return dict(resolve(task))
+    return dict(getattr(method, "parameters", {}))
+
+
 def _round_rows(records: Sequence[RoundRecord]) -> list[dict[str, float]]:
     """The per-round ledger, flattened for storage.
 
@@ -1395,7 +1424,7 @@ def _exhausted_record(  # noqa: PLR0913 - a record is defined by what it declare
         method=name,
         seed=seed,
         protocol=repr(task),
-        parameters=dict(getattr(method, "parameters", {})),
+        parameters=_arm_parameters(method, task),
         exhausted=True,
         best=float("nan"),
         regret=None,
@@ -1533,14 +1562,10 @@ def run_task(
                     # records at 4x96=384 that differ in search radius or in
                     # whether the anchor moved are not comparable.
                     protocol=repr(task),
-                    # By attribute, like the sampler quantities below: an arm
-                    # built by this module declares what it closed over, and a
-                    # methodology defined anywhere else is a plain callable that
-                    # declares nothing. Empty is then the honest record -- the
-                    # settings were not stated, which is not the same as an arm
-                    # having none, and the alternative would be inventing a
-                    # configuration for a closure nobody can see into.
-                    parameters=dict(getattr(method, "parameters", {})),
+                    # By attribute, like the sampler quantities below, and taken
+                    # against *this* task: one arm's width is resolved from the
+                    # task's own shape. See `_arm_parameters`.
+                    parameters=_arm_parameters(method, task),
                     **_scores(task, result, attainable),
                     diversity=(diversity(result.sequences) if len(result.sequences) > 1 else 0.0),
                     feasible_fraction=feasible,
@@ -1587,6 +1612,7 @@ def run_tier(
     store: ResultStore,
     *,
     report: Callable[[str], None] = print,
+    omit: Callable[[Task], Mapping[str, str]] | None = None,
 ) -> int:
     """Run every task in a tier.
 
@@ -1595,12 +1621,33 @@ def run_tier(
         methods: Methodologies by name.
         store: Where results go.
         report: Where progress lines go.
+        omit: Given a task, the arms on it whose campaign would repeat another
+            arm's -- mapped to the arm it repeats -- or ``None`` to run the full
+            cross. A tier is normally that cross, and this is the one departure
+            from it that is a property of the *pair* rather than of the tier: an
+            arm can be measurable on one of a tier's tasks and a duplicate of its
+            neighbour on the next, so the decision cannot be taken by dropping the
+            arm from the tier. What is omitted is said on the line where it would
+            otherwise have been run, because a campaign that silently does not
+            happen is indistinguishable from one nobody asked for.
 
     Returns:
-        How many campaigns were actually run.
+        How many campaigns were actually run. Omitted pairs are not counted: they
+        cost nothing and, unlike an exhausted campaign, nothing is now held for
+        them.
     """
     report(f"{tier!r}")
-    return sum(run_task(task, methods, store, tier.seeds, report=report) for task in tier.tasks)
+    ran = 0
+    for task in tier.tasks:
+        repeats = {} if omit is None else {k: v for k, v in omit(task).items() if k in methods}
+        for name, source in sorted(repeats.items()):
+            report(
+                f"  {task.name}/{name}: not run -- it is {source}'s own campaign on this task, "
+                f"reproduced at report time rather than measured twice"
+            )
+        runnable = {name: m for name, m in methods.items() if name not in repeats}
+        ran += run_task(task, runnable, store, tier.seeds, report=report)
+    return ran
 
 
 def run_anchor_study(

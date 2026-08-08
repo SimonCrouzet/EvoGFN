@@ -227,6 +227,7 @@ if TYPE_CHECKING:
     from evogfn.benchmark.protocol import Protocol
     from evogfn.benchmark.tasks import Task
     from evogfn.core.types import Fitness, Tokens
+    from evogfn.landscapes.base import FitnessLandscape
 
 #: A methodology turns a task and a seed into a runnable campaign.
 Methodology = Callable[["Task", int], Campaign]
@@ -323,10 +324,18 @@ class Arm:
     Attributes:
         run: The methodology, called unchanged.
         parameters: What it closed over, by name.
+        resolve: What it can only close over *once the task is known*, or
+            ``None`` for an arm whose settings are the same everywhere. A width
+            matched to the task's own sequence length and alphabet is the case
+            this exists for: the number is not a property of the arm, it is a
+            property of the arm on a task, and an arm carrying one static width
+            would record the same figure on every shape and be wrong on all but
+            one of them.
     """
 
     run: Methodology
     parameters: dict[str, ArmParameter]
+    resolve: Callable[[Task], dict[str, ArmParameter]] | None = None
 
     def __call__(self, task: Task, seed: int) -> Campaign:
         """Build the campaign, adding nothing to what the methodology does.
@@ -339,6 +348,29 @@ class Arm:
             The campaign the wrapped methodology builds.
         """
         return self.run(task, seed)
+
+    def parameters_for(self, task: Task) -> dict[str, ArmParameter]:
+        """What this arm resolved to *on this task*, for the record.
+
+        The store keys a record by ``(task, arm)``, so a per-task setting is
+        already in a cell of its own and cannot collide with the same arm's
+        setting elsewhere. What it must not do is go unrecorded: a control whose
+        width is resolved from the task is the one arm where "which configuration
+        produced this row" cannot be answered from the arm's name.
+
+        Args:
+            task: The task the record is being written for.
+
+        Returns:
+            The static settings, overlaid with whatever the task resolves. The
+            overlay direction is deliberate -- a resolved width replaces the
+            nominal one rather than appearing beside it, because two widths in
+            one record is a reader's problem to adjudicate and only one of them
+            trained.
+        """
+        if self.resolve is None:
+            return dict(self.parameters)
+        return {**self.parameters, **self.resolve(task)}
 
 
 def _objective_parameters(objective: GFlowNetObjective | None) -> dict[str, ArmParameter]:
@@ -439,13 +471,7 @@ def _parts(
         inherits it here rather than restating it and risking the two drifting.
     """
     landscape = task.landscape()
-    build_env = TerminalFeasibilityEnvironment if terminal_feasibility else MutationEnvironment
-    env = build_env(
-        task.parent(landscape),
-        landscape.alphabet,
-        max_mutations=task.max_mutations,
-        transitions=_feasibility_of(landscape),
-    )
+    env = _environment(task, landscape, terminal_feasibility=terminal_feasibility)
     surrogate = DeepEnsemble(
         n_tokens=landscape.alphabet.size,
         sequence_length=landscape.sequence_length,
@@ -454,6 +480,68 @@ def _parts(
         seed=seed,
     )
     return landscape, env, surrogate
+
+
+def _environment(
+    task: Task, landscape: FitnessLandscape, *, terminal_feasibility: bool = False
+) -> MutationEnvironment:
+    """The graph a campaign on this task walks.
+
+    Split out of `_parts` so that anything asking a question *about* the graph --
+    what it constrains, whether a mechanism defined on it can act -- asks the
+    environment a campaign would actually build, rather than a second
+    reconstruction of it that could drift. `constrains_construction` is the caller
+    that makes this matter: it decides whether a rung is run or reproduced, and a
+    decision taken against a differently-built environment would be a decision
+    about a graph nothing runs.
+
+    Args:
+        task: Fixes the wild type and the search radius.
+        landscape: The oracle, already built -- a caller that has one does not
+            pay for a second, and on the empirical landscapes that is a dataset
+            load.
+        terminal_feasibility: Defer the transition constraint to the stop action.
+
+    Returns:
+        The environment.
+    """
+    build = TerminalFeasibilityEnvironment if terminal_feasibility else MutationEnvironment
+    return build(
+        task.parent(landscape),
+        landscape.alphabet,
+        max_mutations=task.max_mutations,
+        transitions=_feasibility_of(landscape),
+    )
+
+
+def constrains_construction(task: Task) -> bool:
+    """Whether anything on this task constrains the *order* substitutions are made in.
+
+    The condition the ``+terminal`` mechanism is defined against. That rung defers
+    the feasibility rule from every intermediate state to the stop action, so what
+    it can possibly change is the set of construction orders the graph permits. On
+    a landscape with no transition matrix there is no such rule to defer:
+    [TerminalFeasibilityEnvironment][evogfn.env.mutation.TerminalFeasibilityEnvironment]
+    and [MutationEnvironment][evogfn.env.mutation.MutationEnvironment] then
+    describe the identical graph, and a campaign under the flag is the campaign
+    without it, edge for edge and seed for seed.
+
+    Read off the environment rather than off a list of task names, and that is the
+    whole design of this function. The empirical four-site landscapes are the two
+    tasks this is currently true of, and a list saying so would keep saying so
+    after somebody gave one of them a transition matrix -- at which point the
+    mechanism becomes measurable and the rung would go on being reproduced from an
+    arm it no longer equals. Asking the environment cannot be stale: it is the
+    same object the campaign runs against, built by the same function.
+
+    Args:
+        task: The task in question.
+
+    Returns:
+        ``True`` when the graph enforces adjacency during construction, which is
+        exactly when deferring it to the terminal can change something.
+    """
+    return _environment(task, task.landscape()).constrains_intermediates
 
 
 def _feasibility_of(landscape: object) -> npt.NDArray[np.floating] | None:
@@ -865,6 +953,7 @@ def gflownet(  # noqa: PLR0913 - an arm is defined by its hyperparameters
     carry_policy: bool = True,
     terminal_feasibility: bool = False,
     anchor_conditioned: bool = False,
+    match_anchor_capacity: bool = False,
 ) -> Methodology:
     """A GFlowNet trained against the surrogate proxy.
 
@@ -906,12 +995,43 @@ def gflownet(  # noqa: PLR0913 - an arm is defined by its hyperparameters
             policy fits a function over anchors, which is something only an arm
             with a policy can do at all: a genetic algorithm's representation of
             where it is *is* its population.
+        match_anchor_capacity: Widen the plain trunk, per task, until it carries
+            what an anchor-conditioned trunk of `hidden_dim` would carry on that
+            task's own shape. Off is every arm but the capacity control. It has
+            to be a flag rather than a width passed in, because the width is not
+            knowable at the call site: the tier runs five tasks of three shapes
+            and the matching width differs on each, so a number chosen here would
+            be right on one of them and silently wrong -- in the direction that
+            manufactures the effect the control exists to rule out -- on the rest.
+            See `matched_capacity`.
 
     Returns:
-        A methodology, carrying its settings for the record.
+        A methodology, carrying its settings for the record. The capacity control
+        also carries a resolver, since its width is a property of the arm *on a
+        task* and a single recorded number would describe two thirds of its rows
+        wrongly.
+
+    Raises:
+        ValueError: If capacity matching is asked of an anchor-conditioned arm.
+            The control exists to be the conditioned arm's size *without* the
+            conditioning; an arm that is both would be matched against itself and
+            would take a width the search cannot even define.
     """
+    if match_anchor_capacity and anchor_conditioned:
+        raise ValueError(
+            "match_anchor_capacity widens a plain trunk to an anchor-conditioned one's size, "
+            "so an arm that is already anchor-conditioned has nothing to match; an arm setting "
+            "both would be the capacity control for itself"
+        )
+
+    def width_on(task: Task) -> int:
+        """The trunk width this arm trains at on this task."""
+        if not match_anchor_capacity:
+            return hidden_dim
+        return matched_capacity_for(task, hidden_dim, learn_flow=learn_flow).hidden_dim
 
     def methodology(task: Task, seed: int) -> Campaign:
+        width = width_on(task)
         landscape, env, ensemble = _parts(task, seed, terminal_feasibility=terminal_feasibility)
         # Built once and closed over when the policy is carried, so a rebuild
         # for a moved anchor keeps the trained weights. It survives the move
@@ -921,7 +1041,7 @@ def gflownet(  # noqa: PLR0913 - an arm is defined by its hyperparameters
         carried = (
             _policy(
                 env,
-                hidden_dim=hidden_dim,
+                hidden_dim=width,
                 learn_flow=learn_flow,
                 seed=seed,
                 anchor_conditioned=anchor_conditioned,
@@ -948,7 +1068,7 @@ def gflownet(  # noqa: PLR0913 - an arm is defined by its hyperparameters
                 if carried is not None
                 else _policy(
                     anchored,
-                    hidden_dim=hidden_dim,
+                    hidden_dim=width,
                     learn_flow=learn_flow,
                     seed=stream,
                     anchor_conditioned=anchor_conditioned,
@@ -971,6 +1091,27 @@ def gflownet(  # noqa: PLR0913 - an arm is defined by its hyperparameters
 
         return _campaign(task, landscape, env, make, ensemble, pool_size=DEFAULT_POOL)
 
+    def resolved(task: Task) -> dict[str, ArmParameter]:
+        """What the capacity control came out at on this task, for the record.
+
+        The residual is the reason this is stored rather than left derivable. It
+        is the arm's entire warrant -- a control that is not smaller than the arm
+        it controls for can only understate that arm's effect -- and it is
+        different on every shape the tier runs. Put on the record it is checkable
+        from the results alone, by a reader who has neither the architecture nor
+        this module in front of them; left implicit, "the control was the right
+        size" is an assertion about code somebody would have to re-run to test.
+        """
+        match = matched_capacity_for(task, hidden_dim, learn_flow=learn_flow)
+        return {
+            # Overwrites the nominal width, which on this arm is the *conditioned*
+            # trunk being matched and never the one that trained.
+            "hidden_dim": match.hidden_dim,
+            "capacity_parameters": match.parameters,
+            "capacity_target": match.target,
+            "capacity_residual": match.residual,
+        }
+
     return Arm(
         methodology,
         {
@@ -984,7 +1125,9 @@ def gflownet(  # noqa: PLR0913 - an arm is defined by its hyperparameters
             "carry_policy": carry_policy,
             "terminal_feasibility": terminal_feasibility,
             "anchor_conditioned": anchor_conditioned,
+            "match_anchor_capacity": match_anchor_capacity,
         },
+        resolved if match_anchor_capacity else None,
     )
 
 
@@ -1566,23 +1709,16 @@ SELECTED_CONFIGURATION = Path("results/selected.json")
 #: result as the shipped configuration.
 _SELECTED_AXES = ("objective", "arm", "beta", "steps", "lam", "mix", "hidden_dim")
 
-#: The landscape shape the capacity-matched control is sized at: the diagnostic
-#: instance, which is the only landscape the ladder tier runs on.
-#:
-#: A parameter count depends on the sequence length and the alphabet -- they fix
-#: the trunk's input width and the action head's output width -- so "the plain
-#: policy that matches the conditioned one" is a statement about *one* sizing.
-#: Named here rather than imported from
-#: [suite][evogfn.benchmark.suite] because that module imports this one, and a
-#: test pins the pair against the diagnostic instance so that a tier moved to
-#: another landscape fails loudly instead of shipping a control matched to a
-#: landscape nobody runs.
-LADDER_SEQUENCE_LENGTH = 32
-LADDER_VOCAB_SIZE = 20
 
-
-def _parameter_count(hidden_dim: int, *, learn_flow: bool, anchor_conditioned: bool) -> int:
-    """Parameters a ladder policy of this width carries, by construction.
+def _parameter_count(
+    hidden_dim: int,
+    *,
+    sequence_length: int,
+    vocab_size: int,
+    learn_flow: bool,
+    anchor_conditioned: bool,
+) -> int:
+    """Parameters a policy of this width carries on this shape, by construction.
 
     Built and counted rather than computed from a formula. The closed forms are
     easy to write and easy to get subtly wrong -- an embedding table, a bias, a
@@ -1591,6 +1727,10 @@ def _parameter_count(hidden_dim: int, *, learn_flow: bool, anchor_conditioned: b
 
     Args:
         hidden_dim: Width of the trunk.
+        sequence_length: Positions the policy reads and writes. Half of what
+            fixes both the trunk's input width and the action head's output
+            width, so a count is a statement about *one* shape.
+        vocab_size: Tokens in the alphabet, the other half.
         learn_flow: Whether the policy carries a flow head.
         anchor_conditioned: Whether the anchor is fed alongside the state.
 
@@ -1599,31 +1739,74 @@ def _parameter_count(hidden_dim: int, *, learn_flow: bool, anchor_conditioned: b
         than a parameter and so is correctly not counted: it is data the policy
         reads, not capacity it has.
     """
-    n_actions = LADDER_SEQUENCE_LENGTH * LADDER_VOCAB_SIZE + 1
     shape = {
-        "n_tokens": LADDER_VOCAB_SIZE,
-        "sequence_length": LADDER_SEQUENCE_LENGTH,
-        "n_actions": n_actions,
+        "n_tokens": vocab_size,
+        "sequence_length": sequence_length,
+        "n_actions": sequence_length * vocab_size + 1,
         "hidden_dim": hidden_dim,
         "learn_flow": learn_flow,
         "seed": 0,
     }
     policy = (
-        AnchorConditionedPolicy(anchor=np.zeros(LADDER_SEQUENCE_LENGTH, dtype=np.int64), **shape)  # type: ignore[arg-type]
+        AnchorConditionedPolicy(anchor=np.zeros(sequence_length, dtype=np.int64), **shape)  # type: ignore[arg-type]
         if anchor_conditioned
         else SequencePolicy(**shape)  # type: ignore[arg-type]
     )
     return sum(int(p.numel()) for p in policy.parameters())
 
 
+@dataclass(frozen=True, slots=True)
+class CapacityMatch:
+    """A plain trunk width, and how near it came to the size it had to match.
+
+    The residual is carried rather than recomputed by whoever wants it, because
+    the *sign* of it is the safety property the whole control rests on and a
+    reader has no other way to check it. A row of a headline table that says
+    "conditioning helped" is only attributable if the plain policy beside it was
+    not the smaller network; a residual printed with the row is that claim,
+    stated as a measurement, at the shape it was measured on.
+
+    Attributes:
+        hidden_dim: The plain trunk width this resolved to.
+        parameters: What the plain policy carries at that width.
+        target: What the anchor-conditioned policy carries, and therefore what
+            was being matched.
+    """
+
+    hidden_dim: int
+    parameters: int
+    target: int
+
+    @property
+    def residual(self) -> float:
+        """Signed share by which the control over- or under-shoots its target.
+
+        Returns:
+            ``(parameters - target) / target``. Positive is the safe direction
+            and is what the search guarantees; negative would mean the control
+            is the smaller network, which manufactures the effect it exists to
+            rule out.
+        """
+        return (self.parameters - self.target) / self.target
+
+    def __repr__(self) -> str:
+        """The width, and the residual a reader has to see beside it."""
+        return (
+            f"hidden_dim={self.hidden_dim} at {self.parameters} parameters "
+            f"against {self.target} ({self.residual:+.2%})"
+        )
+
+
 @cache
-def matched_hidden_dim(hidden_dim: int, *, learn_flow: bool) -> int:
+def matched_capacity(
+    hidden_dim: int, *, sequence_length: int, vocab_size: int, learn_flow: bool
+) -> CapacityMatch:
     """Trunk width at which a plain policy carries a conditioned one's capacity.
 
     Anchor conditioning widens the trunk's *input* -- the state embedding, the
     anchor embedding and one difference indicator per position -- so an
     anchor-conditioned policy has more parameters than a plain one of the same
-    trunk width. At the ladder's sizing and ``hidden_dim = 64`` that is 179,715
+    trunk width. At the diagnostic shape and ``hidden_dim = 64`` that is 179,715
     against 112,131, a 60% difference in capacity. Any gain the ``+anchor`` rung
     shows is confounded with that until a plain policy of matching size has been
     measured, and no amount of care about the other axes removes the confound.
@@ -1633,10 +1816,24 @@ def matched_hidden_dim(hidden_dim: int, *, learn_flow: bool) -> int:
     trunk that is not smaller* than the conditioned one, which fixes the residual
     on the safe side: a control that slightly over-resources the comparator can
     only understate conditioning's effect, while one that under-resources it
-    manufactures the effect the arm exists to rule out. At the shipped width of
-    64 this resolves to 101, which is 179,952 parameters -- 237 above the
-    conditioned arm's 179,715, or 0.13% -- and 101 is also the *closest* integer
-    either way, the next width down being 178,083 and so 1,632 short.
+    manufactures the effect the arm exists to rule out.
+
+    The shape is an argument, and that is the point
+    -----------------------------------------------
+
+    A parameter count depends on the sequence length and the alphabet, so "the
+    plain policy that matches the conditioned one" is a statement about *one*
+    sizing and is false at every other. Resolved once at a fixed shape -- which
+    is what this used to do -- the control was correct on the landscape the rungs
+    were first run on and wrong everywhere the tier subsequently went: at the
+    shipped width of 64 and a flow head, matching the 32-position diagnostic gives
+    width 101, and that same 101 carries **1.63% fewer** parameters than the
+    conditioned arm at the 64-position tasks and 20.5% more at the four-site
+    empirical ones. The shortfall is the fatal direction: an under-resourced
+    control cannot rule out capacity, so the row would have flattered conditioning
+    on exactly the tasks the claim is drawn from. Per shape, the residuals are
+    +0.13% at 32 positions (width 101), +0.37% at 64 (width 103) and +1.07% at
+    four (width 88) -- all above zero, which is the property that has to hold.
 
     Searched rather than solved, and every candidate is built and counted, so a
     change to the architecture moves this instead of leaving it stating a
@@ -1644,27 +1841,59 @@ def matched_hidden_dim(hidden_dim: int, *, learn_flow: bool) -> int:
 
     Args:
         hidden_dim: Width of the anchor-conditioned trunk to match.
+        sequence_length: Positions in the task's designs.
+        vocab_size: Tokens in the task's alphabet.
         learn_flow: Whether both policies carry a flow head. The objective
             decides this, so it is read from the base arm rather than assumed:
             matched at the wrong setting the two counts differ by a head.
 
     Returns:
-        The plain trunk width.
+        The width and what it achieved, so the residual travels with the number
+        instead of having to be re-derived by anything that reports it.
     """
-    target = _parameter_count(hidden_dim, learn_flow=learn_flow, anchor_conditioned=True)
+    shape = {"sequence_length": sequence_length, "vocab_size": vocab_size, "learn_flow": learn_flow}
+    target = _parameter_count(hidden_dim, **shape, anchor_conditioned=True)  # type: ignore[arg-type]
     low = hidden_dim
     high = max(hidden_dim, 1) * 2
-    while _parameter_count(high, learn_flow=learn_flow, anchor_conditioned=False) < target:
+    while _parameter_count(high, **shape, anchor_conditioned=False) < target:  # type: ignore[arg-type]
         low, high = high, high * 2
     # Invariant: `low` is short of the target and `high` is not, so the answer is
     # the first width above `low`, and the loop cannot return an untested width.
     while high - low > 1:
         middle = (low + high) // 2
-        if _parameter_count(middle, learn_flow=learn_flow, anchor_conditioned=False) < target:
+        if _parameter_count(middle, **shape, anchor_conditioned=False) < target:  # type: ignore[arg-type]
             low = middle
         else:
             high = middle
-    return high
+    return CapacityMatch(
+        hidden_dim=high,
+        parameters=_parameter_count(high, **shape, anchor_conditioned=False),  # type: ignore[arg-type]
+        target=target,
+    )
+
+
+def matched_capacity_for(task: Task, hidden_dim: int, *, learn_flow: bool) -> CapacityMatch:
+    """The capacity match at the shape this task's policies are built on.
+
+    The one place the task's shape is read for this purpose, so the width a
+    campaign trains at and the width its record reports come from the same call
+    rather than from two that could disagree.
+
+    Args:
+        task: The task the control will run on.
+        hidden_dim: Width of the conditioned trunk being matched.
+        learn_flow: Whether both policies carry a flow head.
+
+    Returns:
+        The match.
+    """
+    landscape = task.landscape()
+    return matched_capacity(
+        hidden_dim,
+        sequence_length=int(landscape.sequence_length),
+        vocab_size=int(landscape.alphabet.size),
+        learn_flow=learn_flow,
+    )
 
 
 @dataclass(frozen=True)
@@ -1915,27 +2144,49 @@ def variant_arms(base: LadderBase | None = None) -> dict[str, Methodology]:
     ``B+wide`` is a control, not a step. Anchor conditioning widens the
     trunk's input, so ``+anchor`` is *both* a conditioning change and a capacity
     change, and a win there is unattributable until a plain policy of the same
-    size has been measured. Its width is resolved by `matched_hidden_dim`, which
-    builds candidates and counts them; at the shipped width it is 101, carrying
-    179,952 parameters against the conditioned arm's 179,715 -- 237 over, 0.13%,
-    and over rather than under on purpose, since a control given slightly more
-    capacity can only understate the mechanism it exists to isolate.
+    size has been measured. Its width is resolved by `matched_capacity`, which
+    builds candidates and counts them, **per task**: at the shipped width of 64
+    that is 101 on a 32-position landscape, 103 on a 64-position one and 88 on
+    the four-site empirical ones, each over its target rather than under -- by
+    0.13%, 0.37% and 1.07% -- since a control given slightly more capacity can
+    only understate the mechanism it exists to isolate.
+
+    Per task and not once, because the tier runs five tasks of three shapes and a
+    parameter count is a statement about one of them. Sized at the diagnostic
+    shape alone, this arm carried 1.63% *fewer* parameters than ``+anchor`` on the
+    64-position tasks -- an under-resourced control, which cannot rule out
+    capacity and so flatters conditioning on precisely the tasks the claim is
+    drawn from. The width therefore does not appear in the arm's name or in its
+    static settings; it is resolved when the task is known and written onto every
+    record, beside the residual it achieved there.
 
     It carries the base arm's prefix for the same reason the rungs do, and it is
     the arm that needed it most. Its *width* is derived from the base
-    configuration -- 101 matches a conditioned trunk of 64, and would match
-    nothing else -- so under the bare name it used to have, a stored record from
-    one selection and a record sized against a different selection were the same
-    ``(task, arm)`` cell and indistinguishable in the store. The rungs were
-    rebuilt to stand on the recorded selection precisely to close that drift; a
-    control left outside the naming scheme kept it open for the one arm whose
-    number is not on the ladder anywhere else.
+    configuration -- and now from the task as well -- so under the bare name it
+    used to have, a stored record from one selection and a record sized against a
+    different selection were the same ``(task, arm)`` cell and indistinguishable
+    in the store. The rungs were rebuilt to stand on the recorded selection
+    precisely to close that drift; a control left outside the naming scheme kept
+    it open for the one arm whose number is not on the ladder anywhere else. The
+    task half of the drift needs no name: the store keys by ``(task, arm)``
+    already, so two shapes are already two cells.
 
     Kept out of `OBJECTIVES` deliberately. That mapping is read as a set of
     *training objectives* -- the configuration sweep resolves each of its keys to
     an objective instance by name -- and none of these varies the objective; what
     differs is the graph one of them walks, the input another one reads and the
     width of a third.
+
+    Two rungs are not measurable on every task
+    ------------------------------------------
+
+    ``+terminal`` has something to defer only where something constrains
+    construction. On a landscape with no transition matrix it and the base are the
+    identical graph, and ``+terminal+anchor`` and ``+anchor`` likewise. Those rows
+    are reproduced rather than run -- see `reproduced_rungs`, which decides it from
+    the environment and not from a list of tasks. This function still builds all
+    five arms everywhere, because *what the arm is* does not depend on the task;
+    what depends on the task is whether running it would measure anything.
 
     No rung is available to a classical arm, and that is a property of the
     methods rather than of this module: conditioning needs a policy to condition,
@@ -1956,9 +2207,51 @@ def variant_arms(base: LadderBase | None = None) -> dict[str, Methodology]:
         f"{base.name}+terminal+anchor": base.rung(
             terminal_feasibility=True, anchor_conditioned=True
         ),
-        f"{base.name}+wide": base.rung(
-            hidden_dim=matched_hidden_dim(base.hidden_dim, learn_flow=base.learn_flow)
-        ),
+        f"{base.name}+wide": base.rung(match_anchor_capacity=True),
+    }
+
+
+def reproduced_rungs(base: LadderBase | None = None, *, task: Task) -> dict[str, str]:
+    """Rungs whose campaign on this task *is* another rung's, and which one.
+
+    ``+terminal`` defers the feasibility rule from every intermediate state to the
+    stop action. Where nothing constrains construction there is no rule to defer,
+    so the two environments describe the identical graph and the rung reproduces
+    the base bit for bit; ``+terminal+anchor`` stands in the same relation to
+    ``+anchor``. Running them would spend the campaigns twice and put two pairs of
+    identical rows in a headline table, which a reader may quote as "we tested the
+    mechanism here and it made no difference" -- a different and false claim from
+    "there was nothing here to test".
+
+    So they are reproduced rather than run, and **nothing is stored**. A stored
+    copy is indistinguishable from a measurement the moment it is written: it
+    lands in the same ``(task, arm)`` cell shape, carries the same fingerprint and
+    the same seeds, and every reader of the store -- the instance analysis, the
+    statistics, a script somebody writes next year -- would count it as an
+    independent campaign. Marking it would only move the problem, since the mark
+    then has to be honoured by every one of those readers and the one that forgets
+    is the one that double-counts. Reproducing at report time keeps the store a
+    record of what was *measured*, and puts the copy where the claim is made,
+    where it can be labelled in the same line a reader takes the number from.
+
+    Derived from the environment rather than from a list of task names -- see
+    `constrains_construction` -- so a task that gains a transition matrix stops
+    being reproduced and starts being run, with no edit here.
+
+    Args:
+        base: The ladder's base rung, or ``None`` for the recorded selection.
+        task: The task the rungs would run on.
+
+    Returns:
+        Rung name to the arm whose campaign it repeats, or empty where the
+        mechanism has something to act on and every rung must be run.
+    """
+    if constrains_construction(task):
+        return {}
+    base = shipped_base() if base is None else base
+    return {
+        f"{base.name}+terminal": base.name,
+        f"{base.name}+terminal+anchor": f"{base.name}+anchor",
     }
 
 

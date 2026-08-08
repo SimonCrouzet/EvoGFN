@@ -404,7 +404,7 @@ line they appear on. A reader who takes one for the yardstick is reading exactly
 this arrangement exists to prevent: the reference is `genetic`, a published pipeline, because a
 pipeline is what a lab actually chooses between.
 
-### The GFlowNet has a ladder of its own, and a separate step to ship a rung
+### The GFlowNet has a ladder of its own, reported and never selected from
 
 `variant_arms()` crosses two GFlowNet mechanisms on the configuration the project ships. Writing
 `B` for the shipped arm's name, which the ladder resolves from `results/selected.json` rather than
@@ -428,46 +428,90 @@ inferred by addition.
 `B+wide` is a **capacity control, not a step**. Anchor conditioning widens the trunk's input — the
 state embedding, the anchor embedding and one difference indicator per position — so `+anchor` is
 both a conditioning change and a capacity change, and a win there is unattributable until a plain
-policy of the same size has been measured. Its width is resolved by `matched_hidden_dim`, which
-*builds candidates and counts their parameters* rather than evaluating a closed form; at the
-shipped trunk width of 64 it comes out at 101. No integer width matches exactly, so the rule is
-the narrowest plain trunk that is **not smaller** than the conditioned one, which puts the residual
-on the safe side: a control given slightly more capacity can only understate the mechanism it
-exists to isolate. It carries the base arm's prefix because its width is derived from the base
-configuration and would match no other — under a bare name, a record sized against one selection
-and a record sized against another would be the same `(task, arm)` cell.
+policy of the same size has been measured. Its width is resolved by `matched_capacity`, which
+*builds candidates and counts their parameters* rather than evaluating a closed form. No integer
+width matches exactly, so the rule is the narrowest plain trunk that is **not smaller** than the
+conditioned one, which puts the residual on the safe side: a control given slightly more capacity
+can only understate the mechanism it exists to isolate.
+
+**The width is resolved per task, and that is load-bearing rather than tidy.** A parameter count
+reads the sequence length and the alphabet, so it is a statement about one shape and the headline
+tier runs three. At the shipped trunk width of 64 with a flow head:
+
+| Task shape | Matched width | Parameters | `+anchor` carries | Residual |
+|---|---|---|---|---|
+| 32 positions (the diagnostics) | 101 | 179,952 | 179,715 | **+0.13%** |
+| 64 positions (`feasibility`, both protocol tasks) | 103 | 355,728 | 354,435 | **+0.37%** |
+| four sites (`gb1-anchor`, `trpb-anchor`) | 88 | 27,123 | 26,835 | **+1.07%** |
+
+Sized once at the diagnostic shape — which is what this used to do — the control carried **1.63%
+fewer** parameters than `+anchor` on the 64-position tasks. That is the fatal direction: an
+under-resourced control cannot rule capacity out, so the row would have flattered conditioning on
+exactly the tasks the claims are drawn from. Every residual above is positive, which is the
+property that has to hold. The resolved width and the achieved residual are written onto every
+record the arm produces — `hidden_dim`, `capacity_parameters`, `capacity_target` and
+`capacity_residual` — so a reader can check the control was not the smaller network from the
+results alone.
+
+It carries the base arm's prefix because its width is derived from the base configuration and
+would match no other — under a bare name, a record sized against one selection and a record sized
+against another would be the same `(task, arm)` cell. The *task* half of that drift needs no name:
+the store already keys by `(task, arm)`, so two shapes are already two cells.
 
 The base is what ships, not `gfn-tb`, and that is not cosmetic: the selection study measured the
 reward exponent on trajectory balance and then again on sub-trajectory balance, and **the curve
 reversed direction between them**. An effect measured on one objective is therefore not known to
 transfer to the other here, so a ladder built on `gfn-tb` would be a study of an arm nobody runs.
 
-!!! warning "A rung reaches the headline table only through `--promote`"
-    The ladder runs on the diagnostic landscape under `Purpose.SELECTION`. Its rungs do **not**
-    appear in `main` because the tier exists; they appear because somebody ran
+!!! note "The rungs are in `main`, and nothing is picked from them"
+    All five rungs run in the headline tier beside the baselines: the shipped arm as the base, and
+    the other four as decomposition rows. **No rung is selected**, there is no promotion step and
+    no file that records one. The table reports what each mechanism does on the tasks that carry
+    the claim, and stops there.
 
-    ```bash
-    uv run python experiments/run_suite.py --promote RUNG
-    ```
+    That replaced a `variant-ladder` tier under `Purpose.SELECTION` and an explicit `--promote`
+    step. The ordering that step enforced — decide off the test set, then promote — is the right
+    one *when a choice is being made*. It buys nothing when none is, and it cost the thing the
+    study is for: deciding a mechanism on a diagnostic instance and inferring to the headline tasks
+    is exactly the inference this project has already been burned by, since the reward-exponent
+    curve reversed direction between trajectory balance and sub-trajectory balance. Because nothing
+    is selected there is no tuning-on-the-test-set to guard against, so the guard and the thing it
+    guarded were removed together rather than one being left behind to imply the other.
 
-    which runs nothing, reads the ladder's already-banked campaigns, prints every rung against the
-    base, and writes `results/promoted.json`. `methods_for` reads that file and nothing else, so
-    until it exists the headline tiers run exactly what they ran before the ladder was built.
+    What the rows owe a reader is the marking, and they owe it more than before. Four of the five
+    decompose the arm beside them and none is a pipeline anybody published; `+wide` is a
+    deliberately over-sized capacity control that nobody proposed as a method. They carry
+    `[ablation of ...]` on the row and an attribution line beside every p-value, exactly where
+    `genetic+search` does, and they are paired against the **shipped base** in a section of their
+    own — a rung's p-value against `genetic` would be a method comparison wearing an attribution
+    sentence.
 
-    The ordering is the whole point. If the rungs sat in `main` and the best were picked
-    afterwards, the configuration would have been chosen on the tasks that carry the claims —
-    tuning on the test set. The rung is **named by the caller and never derived**, because
-    deriving the winner would make promotion an automatic consequence of the ladder having run.
-    What the step checks is that the evidence permits the named rung: a non-base rung must have
-    beaten the base, paired across shared seeds, with the interval excluding zero; the base itself
-    may be promoted — "neither mechanism earns its compute" is a real outcome — but only when no
-    other rung beat it. A refusal exits non-zero rather than warning.
+!!! warning "Four of the twenty rungs are reproduced rather than run"
+    `+terminal` defers the feasibility rule from every construction step to the stop action, and
+    `gb1-anchor` and `trpb-anchor` have **no transition matrix at all**. With no adjacency to
+    defer, `TerminalFeasibilityEnvironment` and `MutationEnvironment` describe the identical graph:
+    `+terminal` *is* the base arm's campaign there and `+terminal+anchor` is `+anchor`'s, bit for
+    bit. Running them would spend ~400 campaigns — some 28 core-hours — recomputing numbers the
+    table already holds, and would put two pairs of identical rows in the headline table that a
+    reader could quote as "we tested the mechanism here and it made no difference". That is a
+    different and false claim from "there was nothing here to test".
 
-    Once promoted, all five rungs enter the default path: the promoted one as the method, the rest
-    as decomposition rows labelled `[ablation of ...]` exactly where `genetic+search` is, each
-    carrying an attribution line beside its p-value. It is not free — five GFlowNet arms in place
-    of one is four extra campaigns per task per seed — and that cost is paid only by somebody who
-    both promotes and then runs.
+    So those rows are **reproduced at report time and nothing is stored for them**. A stored copy
+    is indistinguishable from a measurement the moment it is written — same cell shape, same
+    fingerprint, same seeds — and every reader of the store would count it as an independent
+    campaign; a marker would only move the problem to whichever reader forgets to honour it.
+    Reproduced in the report, the copy sits where the claim is made: the row prints in *italic*
+    with `[reproduced from ...]` beside it and a legend under the table naming the arm it repeats,
+    and it is **not paired** against anything, since its difference from a third arm is its
+    source's and its difference from the source is exactly zero by construction.
+
+    Which rows those are is derived from the environment — `constrains_construction()` asks the
+    task's own environment whether it constrains transitions — and never from a list of task names.
+    A list would keep naming the same rows after a task gained a matrix, at which point the
+    mechanism becomes measurable and the row would be a copy of an arm it no longer equals. If the
+    store ever holds campaigns for a row the suite declares a reproduction, `--report` **raises**:
+    both claims cannot be true, and silently preferring either one would print a fabricated row or
+    discard a real measurement.
 
 That leaves exactly one method in the table with no published settings to inherit: ours. A
 GFlowNet run at defaults against a tuned field is not being compared to it — the comparison
@@ -494,9 +538,8 @@ something readable.
 |---|---|---|---|---|
 | `objectives` | `DIAGNOSTIC` | 50 | `objectives` | `OBJECTIVES` plus the flow-head family; GFlowNet-only, since a classical baseline has no objective to vary |
 | `sensitivity` | `SELECTION` | 50 | `objectives` | nine arms, one setting moved at a time |
-| `variant-ladder` | `SELECTION` | **100** | `objectives` | the five rungs of `variant_arms()` |
-| `main` | `BENCHMARK` | 100 | `gb1-anchor`, `trpb-anchor`, `feasibility`, `protocol-alde`, `protocol-evolvepro` | every baseline plus the shipped GFlowNet arm |
-| `replication` | `BENCHMARK` | 100 | the six replicate tasks | the same arms as `main` |
+| `main` | `BENCHMARK` | 100 | `gb1-anchor`, `trpb-anchor`, `feasibility`, `protocol-alde`, `protocol-evolvepro` | every baseline, plus **all five rungs** of `variant_arms()` — the shipped GFlowNet arm is the base rung, so the tier gains four arms and not five |
+| `replication` | `BENCHMARK` | 100 | the six replicate tasks | as `main`, **less the four rungs** — this tier asks whether the ordering survives another draw, and a mechanism's size is not part of that ordering |
 | `rounds-curve` | `DIAGNOSTIC` | 50 | `rounds-8x48`, `rounds-4x96` | as `main`, less `mlde-over-budget` |
 | `budget-gradient` | `DIAGNOSTIC` | 50 | the four budget tasks | as `main`, less `mlde-over-budget` |
 | `constraint-density` | `DIAGNOSTIC` | 50 | the five density rungs | `DENSITY_ARMS`: `genetic`, `genetic-feasible`, `gfn-tb`, `genetic-gfn` |
@@ -516,11 +559,15 @@ claims differing.
 lower-powered replicate could not distinguish "the ordering broke" from "we ran out of seeds",
 which is the one thing it exists to decide.
 
-**`variant-ladder` is seeded like the headline despite being a selection tier**, because the rung
-that justifies the fourth arm is an *interaction*: `+terminal+anchor` earns its compute only by
-beating what the two single rungs predict by addition, and a difference of differences carries
-about twice the standard error of either main effect. At the diagnostic count that rung comes back
-inconclusive against its own prediction — the one answer this tier must not return.
+**The mechanism rungs take `main`'s seed count because they run in `main`**, and that count is
+what the fourth rung needs rather than a number inherited: `+terminal+anchor` earns its compute
+only by beating what the two single rungs predict by addition, and a difference of differences
+carries about twice the standard error of either main effect. At the diagnostic count it comes back
+inconclusive against its own prediction — the one answer this study must not return. The cost is
+decided rather than drifted into: four extra arms across five tasks at a hundred seeds is 2,000
+campaigns, of which 400 are reproduced rather than run, leaving **1,600** — on the order of 113
+core-hours at the recorded ~255s per campaign. They stay in `main` alone; the same four on
+`replication` would be 2,400 more to replicate a decomposition rather than a claim.
 
 **`constraint-density` and `anchor-study` both take the diagnostic count, and specifically the
 `objectives` count**, because in each the pivotal cell *is* an `objectives` campaign: the rung at
@@ -563,7 +610,6 @@ uv run python experiments/run_suite.py --diagnostic-seeds 100   # diagnostics (d
 uv run python experiments/run_suite.py --seed-from 0 --seed-to 25   # one seed shard
 uv run python experiments/run_suite.py --results results-scratch   # write elsewhere
 uv run python experiments/run_suite.py --report         # no runs, just read
-uv run python experiments/run_suite.py --promote RUNG   # ship a ladder rung, and stop
 ```
 
 Safe to interrupt and safe to re-run. Every campaign is written to `results/` the moment it
@@ -575,22 +621,24 @@ Sharding is by process, not by thread. `--task`, `--method` and the `--seed-from
 range each narrow the run; the store keeps one file per task and method so writers never collide;
 and every campaign is seeded from its own seed rather than from process order. A sharded run and a
 serial one therefore produce identical records. Raising the thread count instead would not — see
-the reproducibility note below. Two details worth knowing: a seed shard still *reports* the tier's
-full seed set, so a shard says what the store holds rather than what that process was handed; and
+the reproducibility note below. Three details worth knowing: a seed shard still *reports* the tier's
+full seed set, so a shard says what the store holds rather than what that process was handed;
 `--method` is refused inside `anchor-study`, which runs named `(task, arm)` cells rather than a
-cross, because an arm filter there would silently drop whole cells.
+cross, because an arm filter there would silently drop whole cells; and on `gb1-anchor` and
+`trpb-anchor` the two `+terminal` rungs are skipped with a line saying so, because there they are
+their neighbours' own campaigns — see the reproduction note above.
 
-`--report` and `--promote` run no campaigns. Everything else refuses to start unless threading is
-pinned, exiting with code 3.
+`--report` runs no campaigns. Everything else refuses to start unless threading is pinned, exiting
+with code 3.
 
-The headline tiers read `results/selected.json` for the GFlowNet arm they should run, and
-`results/promoted.json` for the ladder rung. A selection **has** been recorded — the shipped arm is
-`gfn-subtb@b0.1-s300-l0.9-h64`, and it replaces the untuned GFlowNet arms rather than joining them
-— while **no promotion has**, so the ladder's rungs do not appear in the headline tiers. If either
-file is absent the suite falls back and says so, rather than reporting untuned defaults as though
-they had been chosen; if either is *unfinished*, it raises rather than falling back, because a
-partial record describes a configuration no rule ever chose. Check the files themselves rather than
-this paragraph, and `--report` will print the arm names a tier actually resolves to.
+The headline tiers read `results/selected.json` for the GFlowNet arm they should run, and nothing
+else — there is no promotion file, because no rung is selected. A selection **has** been recorded:
+the shipped arm is `gfn-subtb@b0.1-s300-l0.9-h64`, and it replaces the untuned GFlowNet arms rather
+than joining them, while the four mechanism rungs are built on top of it and reported beside it. If
+the file is absent the suite falls back to the untuned arms and says so, rather than reporting
+defaults as though they had been chosen; if it is *unfinished*, it raises rather than falling back,
+because a partial record describes a configuration no rule ever chose. Check the file itself rather
+than this paragraph, and `--report` will print the arm names a tier actually resolves to.
 
 ### The other entry points
 
@@ -684,7 +732,7 @@ separated these arms" when what happened is that nothing was tested.
 | everything not listed below | `genetic` | the Ehrlich paper's own algorithm at its own hyperparameters — a **published pipeline**, because a pipeline is what a lab chooses between. Pairing against `genetic+search` would pair every headline number against a hybrid we invented |
 | `objectives` | `gfn-tb` | trajectory balance, the objective the others are alternatives to |
 | `sensitivity` | `steps-300` | the shipped setting, so each swept value reads as a change from what the headline rows were produced at |
-| `variant-ladder` | the ladder's own base rung | resolved from the recorded selection rather than named, so it cannot become an arm the tier stopped running |
+| `main`, second block | the shipped arm | the mechanism rungs get a **second** paired block of their own, against the base they are one step from. Their difference from `genetic` is not what they measure, and a rung's attribution line sitting beneath a p-value taken against a different arm is a row explaining itself wrongly. Resolved from the recorded selection rather than named, so it cannot become an arm the tier stopped running |
 | `anchor-study` | `gfn-tb` | so the printed pair on the re-anchored task is rebuilt-against-carried: the amortisation cell, and the only cell a paired test can reach here. The other axis — moved against fixed — is across two *tasks*, and is read off the two tables rather than tested |
 
 Three numbers, and all three are needed.
@@ -731,8 +779,14 @@ quoted.
   significance against a ceiling is significance about the task.
 * **`[ablation of ...]`** — a decomposition row, on the table line *and* beside every p-value it
   appears in, with a sentence naming which attribution question it answers: a classical ablation
-  splits a surrogate's contribution from a sampler's, a promoted ladder rung splits one GFlowNet
-  mechanism from another.
+  splits a surrogate's contribution from a sampler's, a mechanism rung splits one GFlowNet
+  mechanism of the shipped configuration from the rest. The mechanism sentence says *nothing is
+  selected from these rows* in as many words, because the obvious misreading of a five-row block in
+  a headline table is that the best row is the method.
+* **An *italic* row and `[reproduced from ...]`** — a row that is not a measurement at all: the
+  rung's campaign on this task is another arm's campaign under a second name, so the numbers are
+  copied and their agreement is arithmetic. A legend under the table names the arm it repeats and
+  says why the mechanism could not act here, and the row is not paired against anything.
 
 Where a comparison cannot be drawn it is said rather than skipped. An omitted line reads as "these
 did not separate", which is the opposite of what happened; so a tier with no reference arm, a
