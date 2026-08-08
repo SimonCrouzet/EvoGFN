@@ -112,26 +112,30 @@ The pipelines, which are what the headline table compares:
   this is the pipeline a lab would otherwise run. Bare on purpose: a reference
   that is itself a hybrid nobody published would pair every headline number
   against something a reviewer does not have to accept.
-* `gfn-tb` -- a trajectory-balance GFlowNet over a **fixed** weighted-sum
-  scalarisation. Read the name as GFlowNet-AL under one preference, not as
-  MOGFN-PC: MOGFN-PC samples a preference per step and conditions the policy on
-  it, and *that arm now exists* --
-  [preference_conditioned_arm][evogfn.benchmark.multi_objective.preference_conditioned_arm],
-  registered as `mogfn-pc` in the `preferences` tier. The two are not the same
-  method and must not be read as one; `gfn-tb`'s name would be better as
-  `gfn-tb-scalar` and the rename is deferred rather than declined, because it is
-  a registry key several test files pin by hand and it costs nothing only while
-  no record is stored under either name.
+* `gfn-tb-scalar` -- a trajectory-balance GFlowNet over a **fixed** weighted-sum
+  scalarisation. GFlowNet-AL under one preference, and the scalarised *control*
+  rather than this suite's GFlowNet entry. The name says `-scalar` because
+  `mogfn-pc` now stands beside it in the same table: MOGFN-PC samples a
+  preference per step and conditions the policy on it, the two are not the same
+  method, and a row named plain `gfn-tb` directly above one named `mogfn-pc`
+  invites exactly the reading the scope note exists to refuse. The rename was
+  made while nothing was stored under either key, which is the only time it is
+  free -- every record is keyed by the arm name.
+* `mogfn-pc` -- one policy conditioned on the trade-off, trained once over the
+  whole simplex and queried across a grid of them. The published
+  preference-conditioned GFlowNet, and the arm the section below is about.
 
 ## The one arm that is not a fixed preference
 
-`mogfn-pc` -- one policy conditioned on the trade-off, trained once over the
-whole simplex, queried across a grid of them. It lives in the `preferences` tier
-rather than in `ARMS` because the row it has to be read against is
-`gfn-tb-pref{N}`, which lives there: one conditioned model on the full budget
-versus ``N`` replicated ones on ``1/N`` each, at the same ``N`` trade-offs. That
-is the only comparison that isolates *amortisation* from everything else a
-GFlowNet does.
+`mogfn-pc` is registered twice, and the two registrations answer different
+questions. In `ARMS` it is a headline row, a published pipeline against the other
+published pipelines -- and it has to be there, because `main` is the only tier
+that carries results, so an arm reachable only from a diagnostic tier can never
+appear in a claim at all. In the `preferences` tier it is read against
+`gfn-tb-pref{N}`: one conditioned model on the full budget versus ``N``
+replicated ones on ``1/N`` each, at the same ``N`` trade-offs, which is the only
+comparison that isolates *amortisation* from everything else a GFlowNet does. The
+table says whether it wins; the diagnostic says what the win is made of.
 
 It is also the one arm here outside the reduction the rest of this module sits
 inside. Every other arm applies its preference before the surrogate predicts
@@ -2107,7 +2111,7 @@ def _as_multi_objective(task: Task) -> MultiObjectiveTask:
     return task
 
 
-#: The arms of the main and explanatory tiers: four published pipelines, then
+#: The arms of the main and explanatory tiers: five published pipelines, then
 #: three decomposition rows, in a stable order so a report reads the same way
 #: each run. Laid out to match [evogfn.benchmark.methods][]'s `BASELINES`, arm
 #: for arm where the two suites can share an arm at all:
@@ -2118,7 +2122,8 @@ def _as_multi_objective(task: Task) -> MultiObjectiveTask:
 #: ``random``          ``random``                     plate
 #: ``nsga2``           none (multi-objective only)    4 plates
 #: ``genetic``         ``genetic``                    plate
-#: ``gfn-tb``          ``gfn-tb``                     2048
+#: ``gfn-tb-scalar``   ``gfn-tb``                     2048
+#: ``mogfn-pc``        none (multi-objective only)    2048
 #: ``random+screen``   ``random+screen``              2048
 #: ``genetic+screen``  ``genetic+screen``             2048
 #: ``genetic+search``  ``genetic+search``             2048
@@ -2134,7 +2139,14 @@ ARMS: dict[str, MultiObjectiveMethodology] = {
     "random": classical_arm(_random),
     "nsga2": nsga2_arm(),
     "genetic": classical_arm(_genetic),
-    "gfn-tb": scalarized_gflownet_arm(),
+    "gfn-tb-scalar": scalarized_gflownet_arm(),
+    # The preference-conditioned pipeline, and the only arm here whose policy is
+    # trained on the multi-objective problem rather than on a scalarisation of
+    # it. Registered at the same defaults `preference_arms` builds it at, so the
+    # headline row and the diagnostic's conditioned row are the same arm: were
+    # they configured differently, F2's finding would be about something other
+    # than the row the table reports and only the shared name would say so.
+    "mogfn-pc": preference_conditioned_arm(),
     # Ablations. Each keeps the library pool because a screen with nothing to
     # screen is not a screen: at a plate the model would rank 96 candidates into
     # 96 wells and change nothing at all.
@@ -2158,25 +2170,24 @@ ABLATIONS: dict[str, str] = {
 }
 
 #: Arms whose name would be read as a stronger claim than the arm supports, and
-#: the sentence a report has to print beside them. ``gfn-tb`` is the case this
-#: exists for: it is GFlowNet-AL over a *fixed* weighted-sum scalarisation, and a
-#: reader who has met MOGFN-PC will otherwise assume a preference-conditioned
-#: policy. Stated in the report rather than folded into the arm's name, because
-#: the name is what every stored record is keyed by and the scope note is longer
-#: than a name should be.
+#: the sentence a report has to print beside them. ``gfn-tb-scalar`` is the case
+#: this exists for: it is GFlowNet-AL over a *fixed* weighted-sum scalarisation,
+#: and a reader who has met MOGFN-PC will otherwise assume a
+#: preference-conditioned policy. Stated in the report rather than left to the
+#: name alone, because a name short enough to head a column cannot carry the
+#: distinction and a scope note can.
 #:
-#: The note got sharper rather than shorter when ``mogfn-pc`` was built. A scope
-#: note saying "this suite does not run MOGFN-PC" stops being enough the moment
-#: the suite does, and a name that reads as the other method while sitting two
-#: tiers away from it is worse than one that merely overclaims. Renaming
-#: ``gfn-tb`` to ``gfn-tb-scalar`` is the right fix, it is free while nothing is
-#: stored under either name, and it is deferred here only because the key is
-#: pinned by hand in test files this edit does not own.
+#: The name now carries half of it. It was plain ``gfn-tb`` until ``mogfn-pc``
+#: joined `ARMS`: a note saying "this suite does not run MOGFN-PC" stops being
+#: true the moment the suite does, and a row named for the other method two lines
+#: above that method is worse than one that merely overclaims. The rename landed
+#: while nothing was stored under either key -- every record is keyed by the arm
+#: name, so afterwards it would have orphaned the campaigns instead.
 SCOPE_NOTES: dict[str, str] = {
-    "gfn-tb": (
+    "gfn-tb-scalar": (
         "single-preference GFlowNet-AL over a fixed weighted sum; NOT MOGFN-PC, "
         "which samples a preference per step and conditions the policy on it -- "
-        "that arm is `mogfn-pc`, in the preferences tier"
+        "that arm is `mogfn-pc`, which this same table now carries"
     ),
 }
 
@@ -2209,7 +2220,11 @@ def preference_arms(
     One conditioned policy on the full budget against ``N`` replicated ones on
     ``1/N`` of it each, at the same ``N`` trade-offs -- which is why its grid is
     [PC_PREFERENCE_COUNT][evogfn.benchmark.multi_objective.PC_PREFERENCE_COUNT]
-    rather than a number of its own. Note the asymmetry in what `learn_flow`
+    rather than a number of its own. It is the same name and, at this function's
+    defaults, the same configuration `ARMS` registers for the headline table:
+    deliberately, since the whole use of the diagnostic is to explain the row the
+    table prints, and two differently-built arms sharing one key would let it
+    explain a different one. Note the asymmetry in what `learn_flow`
     means for it: the preference-conditioned loop does not score intermediate
     states, so a detailed-balance objective is refused there rather than run, and
     that is a known gap rather than a supported configuration.

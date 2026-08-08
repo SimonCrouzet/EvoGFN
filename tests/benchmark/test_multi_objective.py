@@ -1,7 +1,7 @@
 """Tests for the multi-objective suite: what it declares, and what a run stores.
 
-Four failures are under test, and each is one this suite could plausibly ship
-with because none of them raises.
+These are the failures under test, and each is one this suite could plausibly
+ship with because none of them raises.
 
 **An indicator measured from nowhere.** Hypervolumes taken from different
 reference points are not comparable and neither number records its point, so a
@@ -34,6 +34,13 @@ pipeline it ablates and paired every result against it.
 surrogate, or a rung quietly carrying two changes, is a table of hybrids again
 and nothing in the numbers would say so.
 
+**An arm that exists but can never be reported.** This one had also shipped:
+`mogfn-pc` was built and unit-tested, and every tier that ran it was a
+diagnostic, so the only genuinely multi-objective arm in the suite was reachable
+from nothing that carries results. An unregistered arm looks exactly like an arm
+that lost -- it is simply absent from the table -- so the same class pins which
+tier reaches it, and pins the two registrations of it against each other.
+
 The CH65 tests need the downloaded dataset and say so. The end-to-end arm tests
 are kept to a two-round toy with a four-design plate, which is enough to exercise
 every seam the suite has and cheap enough to run on every commit.
@@ -46,6 +53,7 @@ from evogfn.acquisition.rules import Greedy
 from evogfn.algorithms.baselines.genetic import GeneticAlgorithm
 from evogfn.algorithms.baselines.nsga2 import NSGA2
 from evogfn.algorithms.gflownet.flow_objectives import SubTrajectoryBalance
+from evogfn.algorithms.gflownet.preference_sampler import PreferenceConditionedSampler
 from evogfn.algorithms.inner_loop import ProxyOptimising
 from evogfn.benchmark.multi_objective import (
     ABLATIONS,
@@ -61,12 +69,14 @@ from evogfn.benchmark.multi_objective import (
     MultiObjectiveTask,
     PreferenceEnsemble,
     ScalarizedObserving,
+    arms_for_tier,
     ch65_reference_front,
     conflict_sweep,
     enumerated_front,
     multi_objective_tiers,
     objective_count_sweep,
     preference_arms,
+    preference_conditioned_arm,
     preference_task,
     preference_vectors,
     recombination_front,
@@ -484,7 +494,32 @@ def test_a_scalar_acquisition_is_refused_against_several_objectives():
 #: The arms that are pipelines as published -- bare, and the comparison the paper
 #: is actually about. Everything else in `ARMS` is a decomposition row and says so
 #: in its own name.
-PUBLISHED = ("random", "nsga2", "genetic", "gfn-tb")
+PUBLISHED = ("random", "nsga2", "genetic", "gfn-tb-scalar", "mogfn-pc")
+
+#: The two arms `ARMS` holds at their shipped training budget, and the toy
+#: rebuilds an end-to-end test runs instead. 300 gradient steps a round is
+#: minutes per case on tests that run on every commit, and the conditioned arm's
+#: eight-trade-off grid costs another factor of four on top -- 22 s against 5 s,
+#: measured. Everything else is the registry's own construction, so what these
+#: exercise is still the shipped arm's wiring rather than a lookalike.
+TOY_TRAINING = {
+    "gfn-tb-scalar": scalarized_gflownet_arm(1, steps=4),
+    "mogfn-pc": preference_conditioned_arm(2, steps=4),
+}
+
+
+def toy_arm(name):
+    """`ARMS[name]`, at a training budget a per-commit test can afford."""
+    return TOY_TRAINING.get(name, ARMS[name])
+
+
+#: The arms whose surrogate is constitutive of the pipeline rather than an
+#: addition to it: both GFlowNets, whose policies are not trainable at 384 assays
+#: without one. Spelled out rather than taken from `TOY_TRAINING`'s keys, which
+#: are the same two arms for an unrelated reason -- one list is about what a
+#: pipeline *is*, the other about what a test can afford, and tying them would
+#: make a future cheap GFlowNet silently count as bare.
+CONSTITUTIVE_SURROGATE = ("gfn-tb-scalar", "mogfn-pc")
 
 #: What each arm's own paper says its candidate pool is, written the way
 #: `PLATE_POOL` is resolved -- against the task rather than as a literal. A
@@ -492,12 +527,16 @@ PUBLISHED = ("random", "nsga2", "genetic", "gfn-tb")
 #: mutagenesis proposes a neighbourhood of the current point, so both are one
 #: plate; NSGA-II's generation is neither a plate nor a library; and every
 #: screened rung keeps the library, because at a plate the model would rank
-#: `BATCH` candidates into `BATCH` wells and change nothing at all.
+#: `BATCH` candidates into `BATCH` wells and change nothing at all. `mogfn-pc`
+#: keeps it for a different reason again: it divides the pool between its
+#: trade-offs, so a plate would leave one design each and the per-preference
+#: ranking would rank nothing.
 EXPECTED_POOL = {
     "random": BATCH,
     "nsga2": BATCH * UNSELECTED_POOL_PLATES,
     "genetic": BATCH,
-    "gfn-tb": DEFAULT_POOL,
+    "gfn-tb-scalar": DEFAULT_POOL,
+    "mogfn-pc": DEFAULT_POOL,
     "random+screen": DEFAULT_POOL,
     "genetic+screen": DEFAULT_POOL,
     "genetic+search": DEFAULT_POOL,
@@ -523,12 +562,17 @@ class TestTheLadderIsWhatItSaysItIs:
     @pytest.mark.parametrize("name", PUBLISHED)
     def test_every_published_arm_is_bare(self, name):
         # A deep ensemble in front of a baseline whose paper has none is what
-        # made the headline comparison a comparison between hybrids. `gfn-tb` is
-        # the one arm excluded: its surrogate is constitutive of the pipeline
-        # rather than an extra, being what makes a policy trainable at this
-        # budget at all.
-        if name == "gfn-tb":
-            pytest.skip("the surrogate is constitutive of the GFlowNet pipeline")
+        # made the headline comparison a comparison between hybrids. The two
+        # GFlowNet arms are excluded: their surrogate is constitutive of the
+        # pipeline rather than an extra, being what makes a policy trainable at
+        # this budget at all. `mogfn-pc` has to be excluded by name rather than
+        # left to the assertions, which it would *pass* -- its campaign-level
+        # surrogate is `None`, but because one there would re-rank its
+        # preference-diverse pool under a single trade-off, not because the
+        # pipeline has no model. Its model is on the sampler, and a check that
+        # read `_surrogate is None` as "bare" would call this arm bare forever.
+        if name in CONSTITUTIVE_SURROGATE:
+            pytest.skip("the surrogate is constitutive of the GFlowNet pipelines")
         campaign = ARMS[name](toy_task(), 0)
         assert isinstance(campaign, Campaign)
 
@@ -578,12 +622,46 @@ class TestTheLadderIsWhatItSaysItIs:
         assert campaign._pool_size == EXPECTED_POOL[name]
 
     def test_an_arm_whose_name_overclaims_carries_a_scope_note(self):
-        # `gfn-tb` is GFlowNet-AL over a fixed weighted sum, and a reader who has
-        # met MOGFN-PC will assume a preference-conditioned policy. The report
+        # `gfn-tb-scalar` is GFlowNet-AL over a fixed weighted sum, and a reader
+        # who has met MOGFN-PC will assume a preference-conditioned policy --
+        # more so now that the real one is a row of the same table. The report
         # prints this beside the row; without it the arm's name is the only thing
         # saying what was run, and it says something stronger than the truth.
-        assert "MOGFN-PC" in SCOPE_NOTES["gfn-tb"]
+        assert "MOGFN-PC" in SCOPE_NOTES["gfn-tb-scalar"]
+        # A note keyed to a name no arm has is a note that never prints, which is
+        # exactly what a rename leaves behind if the key is not moved with it.
         assert set(SCOPE_NOTES) <= set(ARMS)
+        # And the arm the note redirects to has to be somewhere the reader can
+        # find it: the note names `mogfn-pc`, so a suite that dropped that arm
+        # would leave the redirect pointing at nothing.
+        assert "mogfn-pc" in ARMS
+
+    def test_the_conditioned_arm_reaches_the_tier_that_carries_results(self):
+        # The failure this closes, which shipped once already: `mogfn-pc` was
+        # built, tested and registered in `preference_arms`, and every tier that
+        # ran it was a diagnostic -- so the one arm in this suite that is
+        # genuinely multi-objective could not appear in a result at all. Nothing
+        # raised and no test failed; the row was simply never produced.
+        headline = [tier for tier in multi_objective_tiers(1, 1) if tier.headline]
+        assert all("mogfn-pc" in arms_for_tier(tier) for tier in headline)
+
+    def test_the_two_registrations_of_the_conditioned_arm_agree(self):
+        # `mogfn-pc` is registered twice under one name -- in `ARMS` for the
+        # headline row, in `preference_arms` for the decomposition that explains
+        # it. Configured differently they would be two arms sharing a key, the
+        # diagnostic would be evidence about a row the table never printed, and
+        # only the name would claim otherwise. Compared by construction rather
+        # than by identity: the two are built by separate calls, so `is` would
+        # fail on arms that are in fact the same.
+        task = toy_task()
+        headline = ARMS["mogfn-pc"](task, 0)
+        diagnostic = preference_arms()["mogfn-pc"](task, 0)
+        assert isinstance(headline, Campaign)
+        assert isinstance(diagnostic, Campaign)
+        assert isinstance(headline.sampler, PreferenceConditionedSampler)
+        assert isinstance(diagnostic.sampler, PreferenceConditionedSampler)
+        assert headline._pool_size == diagnostic._pool_size
+        np.testing.assert_array_equal(headline.sampler.preferences, diagnostic.sampler.preferences)
 
 
 class TestEveryArmSpendsItsWholeBudget:
@@ -597,8 +675,7 @@ class TestEveryArmSpendsItsWholeBudget:
         # more saturated than their single-objective counterparts, so a plate
         # pool is exactly where an arm would run out of unmeasured designs.
         task = toy_task()
-        arm = ARMS[name] if name != "gfn-tb" else scalarized_gflownet_arm(1, steps=4)
-        result = arm(task, 0).run()
+        result = toy_arm(name)(task, 0).run()
 
         assert result.oracle_calls == task.protocol.rounds * task.protocol.batch_size
         assert [record.evaluated for record in result.rounds] == [BATCH] * ROUNDS
@@ -610,8 +687,7 @@ class TestEveryArmSpendsItsWholeBudget:
         # attribute, so a share that goes missing or leaves [0, 1] lands in the
         # table as a silently empty -- or silently wrong -- column. It is also
         # the column that says what a plate-sized population costs.
-        arm = ARMS[name] if name != "gfn-tb" else scalarized_gflownet_arm(1, steps=4)
-        result = arm(toy_task(), 0).run()
+        result = toy_arm(name)(toy_task(), 0).run()
 
         assert 0.0 <= result.duplicate_fraction <= 1.0
 
@@ -619,8 +695,7 @@ class TestEveryArmSpendsItsWholeBudget:
 @pytest.mark.parametrize("name", sorted(ARMS))
 def test_every_arm_runs_and_reports_both_indicators(name):
     task = toy_task()
-    arm = ARMS[name] if name != "gfn-tb" else scalarized_gflownet_arm(1, steps=4)
-    result = arm(task, 0).run()
+    result = toy_arm(name)(task, 0).run()
 
     assert result.oracle_calls == task.protocol.budget
     assert result.values.shape[1] == 2

@@ -188,12 +188,18 @@ class TestItIsTheAblationsTwin:
         names = set(arms_for_tier(tier))
         assert {"mogfn-pc", "gfn-tb-pref1", "nsga2", "random"} <= names
 
-    def test_the_other_tiers_are_untouched(self):
-        # Registering the arm must not change what any tier that carries results
-        # runs, because those tiers' arm lists are pinned by
-        # `test_multi_objective.py` and by every table read off them.
+    def test_the_arm_is_in_the_headline_table_and_its_ablation_is_not(self):
+        # The arm belongs in `main`, and only there does it mean anything: that
+        # is the one tier carrying results, so an arm reachable from diagnostics
+        # alone can never appear in a claim -- and an absent arm is
+        # indistinguishable from one that lost. Its *ablation* must stay out.
+        # `gfn-tb-pref{N}` deliberately splits one budget N ways, so a row of it
+        # standing among published pipelines reads as a method beaten on merit
+        # rather than as the sub-budget arm it is.
         tier = next(t for t in multi_objective_tiers(1, 1) if t.name == "main")
-        assert "mogfn-pc" not in arms_for_tier(tier)
+        names = set(arms_for_tier(tier))
+        assert "mogfn-pc" in names
+        assert not any(name.startswith("gfn-tb-pref") for name in names)
 
 
 class TestTheScalarisationIsChosenRatherThanInherited:
