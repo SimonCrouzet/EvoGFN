@@ -52,7 +52,7 @@ nothing else: it never launders a repeat the sampler produced inside one plate.
 reports what that cost, so it is measurable rather than assumed.
 
 **Both halves are counted, and they are twins.** ``duplicate_fraction`` is
-repetition *within* one plate; [RoundRecord.redundant][evogfn.loop.ledger.RoundRecord.redundant]
+repetition *within* one plate; `RoundRecord.redundant`
 is repetition against the campaign's memory *across* rounds -- the skip below,
 which used to happen silently. A converged sampler produces both at once, so
 reading either alone attributes the other's cost to itself, and resolving that
@@ -843,7 +843,7 @@ class Campaign:
                 # memory is off. The count is a measurement only where something
                 # did the measuring, and a campaign run without screening never
                 # looked -- see
-                # [RoundRecord.redundant][evogfn.loop.ledger.RoundRecord.redundant].
+                # `RoundRecord.redundant`.
                 return (
                     proposed,
                     (remembered if self._skip_measured else None),

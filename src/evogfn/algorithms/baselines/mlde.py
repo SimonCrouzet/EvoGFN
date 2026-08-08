@@ -148,7 +148,7 @@ protocol allots, fills every plate, makes the same proposals, and reports a best
 value and a regret arithmetically indistinguishable from a fitted run's.
 [MLDE.is_fitted][evogfn.algorithms.baselines.mlde.MLDE.is_fitted] is the only
 thing that separates the two, which is why it is stored per campaign as
-[RunRecord.fitted][evogfn.benchmark.store.RunRecord.fitted] rather than left as
+`RunRecord.fitted` rather than left as
 state on an object the store never sees.
 
 Our adaptation: a training size a constrained screen can return
@@ -696,7 +696,7 @@ class MLDE(Sampler):
         **This is the only thing that distinguishes MLDE from random
         mutagenesis in a finished campaign's numbers**, and it is read off the
         sampler at the end of a run and stored as
-        [RunRecord.fitted][evogfn.benchmark.store.RunRecord.fitted] for exactly
+        `RunRecord.fitted` for exactly
         that reason. A campaign whose handover never happened charges every
         oracle call, fills every plate and reports a best value and a regret in
         the same range as one whose handover did; nothing derivable from the

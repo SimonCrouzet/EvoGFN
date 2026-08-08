@@ -113,7 +113,7 @@ Three of those four steps have no faithful reading here:
   only the applied substitutions, and at the shipped defaults those differ by
   roughly a factor of six in how much they destroy. Neither is the paper's, and
   picking one is a choice we make on the baseline's behalf -- the same objection
-  that keeps [_cmaes_exact][evogfn.benchmark.methods._cmaes_exact] out of the
+  that keeps `_cmaes_exact` out of the
   table.
 * **It is a GFlowNet.** δ-CS is trajectory balance plus a destroy-and-rebuild
   operator and a proxy ensemble; this project's arms are trajectory balance
@@ -1770,7 +1770,7 @@ def shipped_base() -> LadderBase:
 
     Read from `SELECTED_CONFIGURATION` rather than restated, and built through
     the selection phase's own
-    [_build_objective][evogfn.benchmark.selection._build_objective], so the base
+    `_build_objective`, so the base
     rung and the arm ``experiments/run_suite.py`` puts in the headline table are
     the same arm resolved from the same file by the same builder. Restating the
     chosen settings here instead -- ``gfn-subtb`` at beta 0.1, 300 steps, lambda

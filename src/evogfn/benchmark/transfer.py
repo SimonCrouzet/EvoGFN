@@ -1579,7 +1579,7 @@ class ArmAtAnchor:
         sampler: The classical sampler behind the proposal, where there is one --
             **the moved one**, the object `propose` actually draws from, not the
             one that stood at A. Held because
-            [RunRecord.fitted][evogfn.benchmark.store.RunRecord.fitted] is state
+            `RunRecord.fitted` is state
             on the sampler and is not derivable from anything the round returns:
             a `mlde-carried` arm that never fitted at A carries nothing to B and
             is random mutagenesis there, while charging the same assays, filling

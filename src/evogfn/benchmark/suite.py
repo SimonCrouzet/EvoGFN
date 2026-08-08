@@ -1234,7 +1234,7 @@ def _sampler_fields(sampler: Sampler) -> dict[str, object]:
     first as the second on every classical row in the table. So its neutral
     value is ``None`` -- read by attribute like the rest, defaulting to ``None``
     rather than to a measurement. See
-    [RunRecord.fitted][evogfn.benchmark.store.RunRecord.fitted].
+    `RunRecord.fitted`.
 
     One helper rather than the same block written at two call sites, and the
     reason is which two: the completed run and the run that raised. The
@@ -1683,13 +1683,13 @@ def records_to_metric(
     What the exclusion costs is that the failure is now *invisible here*, which
     is exactly what it was before this function had anything to exclude. So a
     caller that reports a mean must also report how many seeds it left out --
-    [RunRecord.exhausted][evogfn.benchmark.store.RunRecord.exhausted] is stored
+    `RunRecord.exhausted` is stored
     per seed for that purpose, and ``experiments/run_suite.py`` prints the count
     beside the row. A shorter array with nothing said about why is the absence
     this whole mechanism exists to end.
 
     **Not the reader for**
-    [RunRecord.fitted][evogfn.benchmark.store.RunRecord.fitted]. Every field this
+    `RunRecord.fitted`. Every field this
     returns is a quantity to be averaged, and ``None`` is mapped to ``nan``
     because for ``regret`` it means "no audit covers this task" -- an absence
     that should propagate. ``fitted`` is tri-valued in a different way: ``None``
