@@ -157,12 +157,20 @@ class TestTheConstraintDensitySweepHoldsTheSupervisedPair:
 # Which rows are decompositions rather than pipelines.
 # --------------------------------------------------------------------------
 
-#: Arms whose ``+`` marks a *replaced parameter* rather than an added rung, so
-#: they decompose nothing and must not carry an attribution line. `mlde+earlyfit`
-#: is MLDE at a training size of ours -- a smaller method than the arm beside it,
-#: not a step above it -- and the attribution sentence the report prints beside a
-#: decomposition row would be false of it.
-NOT_DECOMPOSITIONS = frozenset({"mlde+earlyfit"})
+#: Arms whose ``+`` marks something other than an added rung, and which are
+#: therefore allowed to carry no ``[ablation of ...]`` mark.
+#:
+#: Empty, and the emptiness is the point. `mlde+earlyfit` was here on the
+#: argument that it replaces a parameter rather than adding a component, so it
+#: decomposes nothing -- but what makes a row a decomposition is that reading it
+#: against its base isolates one thing, and `mlde` against it isolates whether
+#: the published pipeline ever reached its model. Replacing rather than adding
+#: changes which sentence explains the row, which is why `_attribution` now
+#: chooses one, not whether the row needs a mark.
+#:
+#: Kept rather than deleted so the next arm with a ``+`` in its name meets the
+#: argument that was already had, instead of having it again.
+NOT_DECOMPOSITIONS: frozenset[str] = frozenset()
 
 
 class TestEveryLadderRungIsMarked:
@@ -189,6 +197,17 @@ class TestEveryLadderRungIsMarked:
             f"{', '.join(sorted(unmarked))} would print among published pipelines with no "
             f"[ablation of ...] mark and no attribution line beside its p-value"
         )
+
+    def test_every_marked_row_gets_a_sentence_that_is_true_of_it(self, run_suite):
+        # A row explaining itself wrongly is worse than an unexplained row. The
+        # surrogate sentence claims the arm separates a surrogate's contribution
+        # from a sampler's, which is false of an arm that changes neither; the
+        # handover sentence says the arm is ours and names no published method.
+        # Both would print, and only one is true, so the wrong one would read as
+        # a claim about what the row measures.
+        assert "surrogate" not in run_suite._attribution("mlde+earlyfit")
+        assert "never reached its model" in run_suite._attribution("mlde+earlyfit")
+        assert "surrogate" in run_suite._attribution("genetic+search")
 
     def test_it_names_only_arms_that_exist(self, run_suite):
         # A misspelling here marks nothing and raises nothing: `ablations()` is a

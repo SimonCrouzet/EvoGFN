@@ -835,16 +835,20 @@ DEFAULT_REFERENCE = "genetic"
 #: are pipelines somebody published -- and neither is. ``+screen`` is a genetic
 #: algorithm handed a deep ensemble, which appears in no paper this suite is read
 #: against, and ``+distinct`` is a plate rule of the harness's rather than of any
-#: method. `mlde+earlyfit` carries a ``+`` too and is deliberately **not** here:
-#: it replaces a parameter of a published pipeline rather than adding a rung to
-#: one, so it decomposes nothing, and the attribution sentence beside these rows
-#: would be false of it. What it needs is its own scope note, which it does not
-#: yet have.
+#: method. `mlde+earlyfit` is here too, on the same reasoning rather than in
+#: spite of it: what makes a row a decomposition is that it isolates one thing
+#: about the pipeline beside it, and reading `mlde` against it separates "MLDE
+#: loses because it suits a constrained space badly" from "MLDE loses because it
+#: never fitted". That it reaches that by replacing a parameter rather than
+#: adding a component changes which sentence explains it, not whether it needs
+#: one -- and an unmarked row named `mlde+...` in a table of published pipelines
+#: is the single likeliest thing here to be quoted as MLDE.
 ABLATIONS = {
     "genetic+screen": "genetic",
     "genetic+search": "genetic",
     "genetic+distinct": "genetic",
     "random+screen": "random",
+    "mlde+earlyfit": "mlde",
 }
 
 #: What each family of decomposition row separates, keyed by the pipeline it
@@ -862,7 +866,21 @@ _ATTRIBUTIONS = {
         "was decided on the diagnostic landscape and is a decomposition of the "
         "promoted arm, not a method a lab would run"
     ),
+    "handover": (
+        "separates whether the published pipeline is unsuited to this landscape "
+        "from whether it never reached its model at all; it is our adaptation, "
+        "run at a training size no paper specifies, and no row of it may be "
+        "quoted as the published method"
+    ),
 }
+
+#: Decomposition rows whose question is the handover rather than the surrogate.
+#: Kept as a set beside `ABLATIONS` rather than folded into it, because the two
+#: mappings answer different questions -- one says what a row decomposes, the
+#: other says which sentence explains it -- and a row that reached the table
+#: with the wrong sentence would be explaining itself wrongly, which is worse
+#: than an unexplained row.
+_HANDOVER_ROWS = frozenset({"mlde+earlyfit"})
 
 
 def ablations() -> dict[str, str]:
@@ -884,6 +902,8 @@ def ablations() -> dict[str, str]:
 
 def _attribution(name: str) -> str:
     """Which question a decomposition row answers, in the row's own terms."""
+    if name in _HANDOVER_ROWS:
+        return _ATTRIBUTIONS["handover"]
     kind = "mechanism" if name in promoted_ablations() else "surrogate"
     return _ATTRIBUTIONS[kind]
 
