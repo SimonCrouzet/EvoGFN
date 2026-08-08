@@ -21,11 +21,17 @@ CLADE (Qiu & Wei 2021)                        96       5     480
 TrpB (Buller, *PNAS* 2015), classical   528/1408/1144   3   ~3,080
 ======================================  ========  ======  ======
 
-Against which the machine-learning convention -- 10 rounds of 100 or 128, and
-10,000 for GFN-AL on AMP -- sits above even *classical* directed evolution. The
-sharp version: MLDE's entire claim is reaching the answer in ~480 assays instead
-of ~3,000, and a benchmark run at 10,000 has given that back before the first
-comparison is made.
+Against which the machine-learning convention -- 10 rounds of 100 or 128, 15 of
+256 on the harder GFP splits, and 10,000 for GFN-AL on AMP -- sits above even
+*classical* directed evolution. The sharp version: MLDE's entire claim is
+reaching the answer in ~480 assays instead of ~3,000, and a benchmark run at
+10,000 has given that back before the first comparison is made.
+
+And these are the *charitable* figures. `ML_CONVENTION` counts what the active
+rounds spend and nothing else, while several of the methods behind those rows
+are handed a labelled offline corpus before round one -- 1,024 to 32,898
+sequences for delta-CS, depending on the task -- which no budget any of them
+reports includes.
 
 `WET_LAB_PROTOCOLS` names the real ones so an experiment can cite a
 campaign rather than a round number someone liked.
@@ -116,9 +122,30 @@ WET_LAB_PROTOCOLS: tuple[Protocol, ...] = (
 
 #: The machine-learning convention, included so the gap to a wet-lab budget can
 #: be measured rather than asserted.
+#:
+#: Every figure here is **oracle queries spent by the active rounds, and nothing
+#: else**. That is the narrow reading and it is the one that flatters these
+#: papers, because several of them are handed a labelled corpus before round one
+#: that none of these numbers count. delta-CS is the sharpest case: it takes an
+#: initial offline dataset as an argument to its algorithm, and across the tasks
+#: it reports that dataset runs from 1,024 to 32,898 labelled sequences --
+#: between two and eighty-six times this suite's entire 384-assay budget, spent
+#: before its first query. The same holds for CbAS, DbAS and MINs, which is why
+#: none of them is run here. A budget column that showed only the round spend
+#: would therefore *understate* the gap it exists to measure, and the paragraph
+#: in ``docs/limitations.md`` is where that is stated rather than implied.
 ML_CONVENTION: tuple[Protocol, ...] = (
     Protocol(rounds=10, batch_size=100, label="AdaLead/PEX/DyNA-PPO"),
+    # delta-CS runs *two* published protocols, not one, and an entry carrying
+    # only the first would let a comparison be drawn against whichever number
+    # suited it. This is the RNA / TF-Bind-8 / GFP / AAV setting.
     Protocol(rounds=10, batch_size=128, label="delta-CS/SILO"),
+    # The second: Kirjner et al.'s GFP-medium and GFP-hard, where delta-CS
+    # follows LatProtRL's protocol instead of its own. Three times the budget of
+    # the row above it, on the benchmark whose difficulty is the point -- so a
+    # result quoted from those tasks was bought at 3,840 queries and must not be
+    # read against the 1,280 the other row names.
+    Protocol(rounds=15, batch_size=256, label="delta-CS (GFP-medium/hard, after LatProtRL)"),
     Protocol(rounds=10, batch_size=1000, label="GFN-AL (AMP)"),
 )
 
