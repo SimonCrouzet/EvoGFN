@@ -185,7 +185,7 @@ def report(store: ResultStore, tier: Tier, reference: str | None = None) -> str:
       reference is then read as a ranking of methods rather than as the
       attribution it is. Marked on the row *and* under its paired outcome,
       because either is read alone.
-    * **where an arm's name overclaims.** ``gfn-tb`` is single-preference
+    * **where an arm's name overclaims.** ``gfn-tb-scalar`` is single-preference
       GFlowNet-AL over a fixed scalarisation, and a reader who has met MOGFN-PC
       will assume a preference-conditioned policy unless told otherwise. See
       [SCOPE_NOTES][evogfn.benchmark.multi_objective.SCOPE_NOTES].

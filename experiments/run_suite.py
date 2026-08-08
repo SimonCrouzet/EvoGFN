@@ -243,7 +243,27 @@ REPLICATION_TIER = "replication"
 #:   every step and so can only reach the constructible part in the first place,
 #:   `genetic-feasible` pays for the same set by rejection, and `genetic` ignores
 #:   the constraint entirely and is the reference the tier pairs against.
-DENSITY_ARMS = ("genetic", "genetic-feasible", "gfn-tb", "genetic-gfn")
+#:
+#: The MLDE pair is here for the same reason the sweep exists at all. A dense
+#: constraint starves a supervised arm's training set -- an infeasible assay
+#: carries no fitness to regress on -- so `mlde` can spend its whole budget
+#: screening at random and still be tabled under a supervised method's name, and
+#: `mlde+earlyfit` exists to say whether the method or the fit was the problem.
+#: That pair is currently a single observation on the one headline task that
+#: constrains feasibility, with nothing to read it against; density is the axis it
+#: is a function of, and this tier is the axis. Both, never one: `mlde+earlyfit`
+#: alone would be a control on a tier that does not hold the thing it controls,
+#: and the row a reader would then quote is the adapted arm's -- which must never
+#: be read as MLDE. `mlde-over-budget` stays out, its extra plate being a second
+#: axis this tier does not vary.
+DENSITY_ARMS = (
+    "genetic",
+    "genetic-feasible",
+    "gfn-tb",
+    "genetic-gfn",
+    "mlde",
+    "mlde+earlyfit",
+)
 
 #: Tiers whose **axis is the budget**, and from which `OVER_BUDGET_ARMS` are
 #: therefore removed.
@@ -807,8 +827,23 @@ DEFAULT_REFERENCE = "genetic"
 #: attribution question, and its answer belongs in a decomposition row. Naming
 #: them in the table is what keeps a reader from reading one as the yardstick:
 #: drop this and `genetic+search` looks like just another baseline that lost.
+#:
+#: **Every** rung of the ``genetic+`` ladder, not the top one alone. A ladder
+#: marked only at its last rung is the worst of both readings: `genetic+screen`
+#: and `genetic+distinct` then sit unmarked in a table whose other decomposition
+#: rows *are* marked, so the absence of a mark reads as a positive claim that they
+#: are pipelines somebody published -- and neither is. ``+screen`` is a genetic
+#: algorithm handed a deep ensemble, which appears in no paper this suite is read
+#: against, and ``+distinct`` is a plate rule of the harness's rather than of any
+#: method. `mlde+earlyfit` carries a ``+`` too and is deliberately **not** here:
+#: it replaces a parameter of a published pipeline rather than adding a rung to
+#: one, so it decomposes nothing, and the attribution sentence beside these rows
+#: would be false of it. What it needs is its own scope note, which it does not
+#: yet have.
 ABLATIONS = {
+    "genetic+screen": "genetic",
     "genetic+search": "genetic",
+    "genetic+distinct": "genetic",
     "random+screen": "random",
 }
 

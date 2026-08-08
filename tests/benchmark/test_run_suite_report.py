@@ -1,6 +1,6 @@
 """Tests for what ``experiments/run_suite.py`` runs, and what its report refuses to hide.
 
-Two failures, and both are silent in the direction of flattering a table.
+Four failures, every one of them silent in the direction of flattering a table.
 
 **An arm that never fitted, printed as one that lost.** A supervised method that
 never leaves its random-screening stage spends the same budget, fills the same
@@ -20,6 +20,19 @@ rung and a 1% perturbation at the 10,000-call one. The same arm would be a
 different distortion at every rung, and the curve would read as a property of the
 methods.
 
+**A control on a tier that does not hold what it controls.** ``mlde+earlyfit`` is
+MLDE at a training size a constrained screen can return, and it means nothing
+except beside the published arm whose starved handover it exists to explain. On
+the density sweep either row alone reads as a complete answer about MLDE under
+feasibility constraints, and the wrong one of the two is the row that must never
+be quoted as MLDE at all.
+
+**A ladder rung printed without its mark.** ``genetic+screen``,
+``genetic+search`` and ``genetic+distinct`` are rungs, not pipelines. In a table
+where some decomposition rows carry ``[ablation of ...]`` and an attribution line
+beside their p-value, an unmarked one does not read as unlabelled -- it reads as a
+positive claim that somebody published it.
+
 The module under test is a script rather than a package module, so it is loaded
 by path. That is deliberate: importing what the suite actually runs is the only
 way these tests can fail when it changes.
@@ -31,6 +44,7 @@ from pathlib import Path
 
 import pytest
 
+from evogfn.benchmark.methods import BASELINES
 from evogfn.benchmark.store import ResultStore, RunRecord
 from evogfn.benchmark.suite import Purpose, Tier, budget_gradient, objective_task, rounds_curve
 
@@ -109,6 +123,81 @@ class TestTheOverBudgetArm:
 
         assert "gfn-chosen" in arms
         assert "mlde-over-budget" not in arms
+
+
+class TestTheConstraintDensitySweepHoldsTheSupervisedPair:
+    """A control on a tier without the arm it controls reports the wrong thing."""
+
+    def test_both_mlde_arms_run_on_the_density_axis(self, run_suite):
+        # `mlde+earlyfit` exists because a dense feasibility constraint starves
+        # `mlde`'s training set, so the handover never happens and a random
+        # screen is tabled under a supervised method's name. Density is the axis
+        # that finding is a function of, and this tier is that axis -- but the
+        # two rows only separate "the method is a poor fit here" from "the method
+        # never fitted" when both are present. Either one alone reads as a
+        # complete answer, which is the silent part.
+        arms = run_suite.methods_for(_tier("constraint-density"))
+
+        assert {"mlde", "mlde+earlyfit"} <= set(arms)
+
+    def test_the_over_budget_arm_stays_off_it(self, run_suite):
+        # It would move a second axis. The pair above differs in the training
+        # size alone; adding the arm that also spends an extra plate would make
+        # a difference across the family unattributable between the two.
+        assert "mlde-over-budget" not in run_suite.methods_for(_tier("constraint-density"))
+
+    def test_every_named_arm_exists(self, run_suite):
+        # `methods_for` looks these up by name out of `MAIN_METHODS`. A name that
+        # stopped existing raises there rather than sweeping a smaller set, and
+        # this says so before a night of compute rather than during one.
+        assert set(run_suite.DENSITY_ARMS) <= set(run_suite.MAIN_METHODS)
+
+
+# --------------------------------------------------------------------------
+# Which rows are decompositions rather than pipelines.
+# --------------------------------------------------------------------------
+
+#: Arms whose ``+`` marks a *replaced parameter* rather than an added rung, so
+#: they decompose nothing and must not carry an attribution line. `mlde+earlyfit`
+#: is MLDE at a training size of ours -- a smaller method than the arm beside it,
+#: not a step above it -- and the attribution sentence the report prints beside a
+#: decomposition row would be false of it.
+NOT_DECOMPOSITIONS = frozenset({"mlde+earlyfit"})
+
+
+class TestEveryLadderRungIsMarked:
+    """An unmarked decomposition row among published pipelines is read as one."""
+
+    def test_no_rung_reaches_the_table_unmarked(self, run_suite):
+        # A rung is an arm named `base+something` whose base is also an arm. That
+        # is the whole ladder rather than its top step, and marking only the top
+        # step is worse than marking none: in a table where the other
+        # decomposition rows *are* labelled, an absent label reads as a positive
+        # claim that the row is a pipeline somebody published.
+        rungs = {
+            name: name.split("+", 1)[0]
+            for name in BASELINES
+            if "+" in name and name.split("+", 1)[0] in BASELINES
+        }
+        unmarked = {
+            name
+            for name, base in rungs.items()
+            if name not in NOT_DECOMPOSITIONS and run_suite.ABLATIONS.get(name) != base
+        }
+
+        assert not unmarked, (
+            f"{', '.join(sorted(unmarked))} would print among published pipelines with no "
+            f"[ablation of ...] mark and no attribution line beside its p-value"
+        )
+
+    def test_it_names_only_arms_that_exist(self, run_suite):
+        # A misspelling here marks nothing and raises nothing: `ablations()` is a
+        # lookup by name, so a typo silently returns the row to looking like a
+        # pipeline. Both sides are checked -- the row and what it decomposes --
+        # because a mark pointing at an arm that is not in the table is a
+        # reference a reader cannot follow.
+        assert set(run_suite.ABLATIONS) <= set(BASELINES)
+        assert set(run_suite.ABLATIONS.values()) <= set(BASELINES)
 
 
 # --------------------------------------------------------------------------

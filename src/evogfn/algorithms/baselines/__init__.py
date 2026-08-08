@@ -24,6 +24,15 @@ from evogfn.algorithms.baselines.directed_evolution import (
 )
 from evogfn.algorithms.baselines.genetic import GeneticAlgorithm
 from evogfn.algorithms.baselines.mlde import (
+    # Every training size the module defines, and the two constants the last of
+    # them is derived from. `ADAPTED_TRAINING_SIZE` is the one that must not be
+    # missing: it is **ours** rather than Wittmann et al.'s, so the reader who
+    # reaches this package having found `PUBLISHED_TRAINING_SIZE` in it is the
+    # reader most likely to quote the adapted arm as MLDE -- and exporting only
+    # the published names is what makes them look like the only ones there are.
+    ADAPTED_TRAINING_SIZE,
+    CAMPAIGN_PLATES,
+    CONSTRAINED_FEASIBLE_FRACTION,
     DEFAULT_TRAINING_SIZE,
     MLDE,
     PUBLISHED_BATCH_SIZE,
@@ -43,7 +52,10 @@ from evogfn.algorithms.baselines.nsga2 import (
 )
 
 __all__ = [
+    "ADAPTED_TRAINING_SIZE",
+    "CAMPAIGN_PLATES",
     "CMAES",
+    "CONSTRAINED_FEASIBLE_FRACTION",
     "DEFAULT_RECOMBINE_PROB",
     "DEFAULT_THRESHOLD",
     "DEFAULT_TRAINING_SIZE",
