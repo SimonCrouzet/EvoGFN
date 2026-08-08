@@ -51,6 +51,13 @@ nothing else: it never launders a repeat the sampler produced inside one plate.
 [RoundRecord.duplicate_fraction][evogfn.loop.ledger.RoundRecord.duplicate_fraction]
 reports what that cost, so it is measurable rather than assumed.
 
+**Both halves are counted, and they are twins.** ``duplicate_fraction`` is
+repetition *within* one plate; [RoundRecord.redundant][evogfn.loop.ledger.RoundRecord.redundant]
+is repetition against the campaign's memory *across* rounds -- the skip below,
+which used to happen silently. A converged sampler produces both at once, so
+reading either alone attributes the other's cost to itself, and resolving that
+misattribution is the only reason the second number exists.
+
 ``distinct_batch`` is the ablation that moves the line, filling the plate with
 ``batch_size`` distinct designs instead of ``batch_size`` proposals. It is a
 separate arm rather than a post-hoc correction because deduplicating changes
@@ -520,7 +527,9 @@ class Campaign:
             # so the batch is always `batch_size` and a running check against
             # the budget would be a branch that can never be taken. `spent` is
             # kept because the tracker reports it, not because it gates anything.
-            proposed, screened, batch, predicted = self._design(index, measured, values, seen)
+            proposed, redundant, screened, batch, predicted = self._design(
+                index, measured, values, seen
+            )
 
             scores = self._landscape.evaluate(batch)
             spent += batch.shape[0]
@@ -532,6 +541,7 @@ class Campaign:
             record = self._record(
                 index=index,
                 proposed=proposed,
+                redundant=redundant,
                 screened=screened,
                 batch=batch,
                 scores=scores,
@@ -572,6 +582,12 @@ class Campaign:
                 metrics["hypervolume"] = record.hypervolume
             if wild_type is not None:
                 metrics["anchor_distance"] = float(record.anchor_distance)
+            # Same rule as the two above, for the same reason: a campaign with
+            # no cross-round memory never consulted one, and logging a zero for
+            # it would average into a table as "this arm repeated nothing"
+            # rather than as "this arm was not screened".
+            if record.redundant is not None:
+                metrics["redundant_fraction"] = record.redundant_fraction
             self._tracker.log_metrics(metrics, step=index)
 
             if self._reanchor:
@@ -614,7 +630,7 @@ class Campaign:
         measured: list[Tokens],
         values: list[Fitness],
         seen: set[bytes],
-    ) -> tuple[int, int, Tokens, npt.NDArray[np.floating] | None]:
+    ) -> tuple[int, int | None, int, Tokens, npt.NDArray[np.floating] | None]:
         """Choose the batch, returning proposals generated, pool screened, and batch.
 
         Round 0 has nothing to fit a surrogate on, so it is the sampler's own
@@ -630,8 +646,9 @@ class Campaign:
                 batch has actually been charged.
 
         Returns:
-            Proposals generated, proposals that reached the selector, the batch
-            of exactly ``batch_size`` designs to measure, and what the surrogate
+            Proposals generated, proposals refused as already measured in an
+            earlier round, proposals that reached the selector, the batch of
+            exactly ``batch_size`` designs to measure, and what the surrogate
             predicted for them where there was one.
 
         Raises:
@@ -657,20 +674,20 @@ class Campaign:
                 self._surrogate.fit(np.concatenate(measured), history)
                 fitted = True
 
-        proposed, pool = self._fill(index, seen, size)
+        proposed, redundant, pool = self._fill(index, seen, size)
         screened = pool.shape[0]
         # Round 0 has no model to score with, so the pool order stands. Taking a
         # prefix is not arbitrary: a sampler that ranks its own output -- MLDE
         # returns its library best-first -- has already said which designs it
         # would send to the lab, and reordering them would measure the harness.
         if index == 0 or self._surrogate is None or not fitted:
-            return proposed, screened, pool[:size], None
+            return proposed, redundant, screened, pool[:size], None
 
         mean, spread = self._surrogate.predict(pool)
         best_observed = self._best_observed(values)
         scored = self._acquisition.score(mean, spread, best_observed=best_observed)
         chosen = self._selector.select(pool, scored, size)
-        return proposed, screened, pool[chosen], mean[chosen]
+        return proposed, redundant, screened, pool[chosen], mean[chosen]
 
     def _stamp_anchor(self, record: RoundRecord, wild_type: Tokens | None) -> RoundRecord:
         """Record which design this round searched from, and how far out it was.
@@ -772,7 +789,7 @@ class Campaign:
         self._environment = env
         return float(flat[position])
 
-    def _fill(self, index: int, seen: set[bytes], size: int) -> tuple[int, Tokens]:
+    def _fill(self, index: int, seen: set[bytes], size: int) -> tuple[int, int | None, Tokens]:
         """Ask the sampler until the plate can be filled, and say what that cost.
 
         One call to a sampler whose pool is its published population -- 96 for a
@@ -795,9 +812,10 @@ class Campaign:
             size: Wells to fill.
 
         Returns:
-            Candidates generated across every call made, and the pool the
-            selector will choose from -- at least ``size`` rows, in the order
-            the sampler produced them.
+            Candidates generated across every call made; how many of them the
+            campaign's memory refused, or ``None`` when there is no memory to
+            refuse with; and the pool the selector will choose from -- at least
+            ``size`` rows, in the order the sampler produced them.
 
         Raises:
             RuntimeError: If ``MAX_PROPOSAL_ATTEMPTS`` calls could not between
@@ -809,17 +827,28 @@ class Campaign:
         """
         proposed = 0
         held = 0
+        remembered = 0
         collected: list[Tokens] = []
         plated: set[bytes] = set()
         for attempt in range(MAX_PROPOSAL_ATTEMPTS):
             chunk = np.ascontiguousarray(self._propose(index, attempt))
             proposed += chunk.shape[0]
-            keep = self._admissible(chunk, seen, plated)
+            keep, repeats = self._admissible(chunk, seen, plated)
+            remembered += repeats
             if keep.size:
                 collected.append(chunk[keep])
                 held += int(keep.size)
             if held >= size:
-                return proposed, np.concatenate(collected)
+                # ``None`` rather than the zero the accumulator holds when the
+                # memory is off. The count is a measurement only where something
+                # did the measuring, and a campaign run without screening never
+                # looked -- see
+                # [RoundRecord.redundant][evogfn.loop.ledger.RoundRecord.redundant].
+                return (
+                    proposed,
+                    (remembered if self._skip_measured else None),
+                    np.concatenate(collected),
+                )
         raise RuntimeError(
             f"{self._sampler.name} filled {held} of {size} wells in round {index} across "
             f"{MAX_PROPOSAL_ATTEMPTS} proposal calls ({proposed} candidates); it cannot produce "
@@ -846,7 +875,7 @@ class Campaign:
 
     def _admissible(
         self, pool: Tokens, seen: set[bytes], plated: set[bytes]
-    ) -> npt.NDArray[np.intp]:
+    ) -> tuple[npt.NDArray[np.intp], int]:
         """Positions in ``pool`` this round may still spend a well on.
 
         Args:
@@ -858,27 +887,40 @@ class Campaign:
                 separately.
 
         Returns:
-            The positions to keep, in order.
+            The positions to keep, in order, and how many were dropped because
+            an *earlier round* had already measured them. That second number is
+            a raw count and always an integer here; turning "the memory was
+            never consulted" into ``None`` is
+            [_fill][evogfn.loop.campaign.Campaign._fill]'s job, because it is
+            the only place that knows whether any call was made at all.
         """
         if not self._skip_measured and not self._distinct_batch:
-            return np.arange(pool.shape[0], dtype=np.intp)
+            return np.arange(pool.shape[0], dtype=np.intp), 0
         keep: list[int] = []
+        redundant = 0
         for position, row in enumerate(pool):
             key = row.tobytes()
             if self._skip_measured and key in seen:
+                # Counted rather than merely skipped. Without this the drop was
+                # invisible, and the proposals-to-screened gap conflated it with
+                # a within-plate repeat ``distinct_batch`` had removed -- two
+                # different costs, one number, and no way to tell which had
+                # produced it.
+                redundant += 1
                 continue
             if self._distinct_batch:
                 if key in plated:
                     continue
                 plated.add(key)
             keep.append(position)
-        return np.asarray(keep, dtype=np.intp)
+        return np.asarray(keep, dtype=np.intp), redundant
 
     def _record(  # noqa: PLR0913 - a round record is its fields
         self,
         *,
         index: int,
         proposed: int,
+        redundant: int | None,
         screened: int,
         batch: Tokens,
         scores: Fitness,
@@ -892,6 +934,8 @@ class Campaign:
             index: Zero-based round number.
             proposed: Candidates the sampler generated, across every proposal
                 call the round needed.
+            redundant: Proposals refused because an earlier round had already
+                measured them, or ``None`` where the campaign keeps no memory.
             screened: Proposals that reached the selector.
             batch: The sequences measured.
             scores: Their ``(n, n_objectives)`` measured values.
@@ -919,7 +963,12 @@ class Campaign:
             batch_diversity=(diversity(batch) if batch.shape[0] >= _MIN_FOR_DIVERSITY else 0.0),
             surrogate_correlation=_correlation(predicted, flat),
             hypervolume=self._hypervolume(history),
+            # The twins, written together so a reader of this call site sees
+            # that they are two counts of two different things: wells spent on
+            # the same design inside this plate, and proposals refused for
+            # having been measured in an earlier one.
             duplicates=_duplicates(batch),
+            redundant=redundant,
         )
 
     def _hypervolume(self, history: list[Fitness] | None) -> float:

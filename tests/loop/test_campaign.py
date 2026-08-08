@@ -231,6 +231,17 @@ class TestRounds:
         assert np.array_equal(result.sequences[:2], design)
 
 
+def design_at(index):
+    """The ``index``-th sequence, as its digits in base ``|alphabet|``.
+
+    Module level so that two samplers can enumerate the *same* designs in the
+    same order. A test that a design measured in round one comes back in round
+    two only means anything if both rounds agree on what design number seven is.
+    """
+    digits = [(index // ALPHABET.size**place) % ALPHABET.size for place in range(LENGTH)]
+    return np.asarray(digits, dtype=np.int32)
+
+
 class RepetitiveSampler(Sampler):
     """Proposes from a tiny fixed menu, so a plate is mostly repeats.
 
@@ -259,8 +270,37 @@ class RepetitiveSampler(Sampler):
     @staticmethod
     def _design(index):
         """The ``index``-th sequence, as its digits in base ``|alphabet|``."""
-        digits = [(index // ALPHABET.size**place) % ALPHABET.size for place in range(LENGTH)]
-        return np.asarray(digits, dtype=np.int32)
+        return design_at(index)
+
+
+class LingeringSampler(Sampler):
+    """Proposes a window that slides slower than the plate consumes it.
+
+    The cross-round case, and deliberately not `RepetitiveSampler`'s: every
+    design in any one call here is distinct, so this sampler *cannot* produce a
+    repeat within a plate. What it does produce is designs an earlier round has
+    already measured, which is the other half of the accounting -- the half the
+    campaign used to absorb without saying so.
+
+    The two samplers together are what make the twin counters falsifiable. Each
+    exercises exactly one of them, so a counter that were secretly measuring the
+    other would come back zero where it must be positive.
+    """
+
+    def __init__(self, stride=4):
+        super().__init__()
+        self._stride = stride
+        self._offset = 0
+
+    def propose(self, n):
+        self._count(n)
+        # Distinct within the call, and starting from a window that advances by
+        # less than the plate holds -- so every round overlaps the last one's
+        # measurements and still has something new below the overlap.
+        return np.stack([design_at(self._offset + i) for i in range(n)])
+
+    def observe(self, sequences, values):  # noqa: ARG002 - it advances on the round, not the data
+        self._offset += self._stride
 
 
 class TestThePlateIsAlwaysFull:
@@ -446,6 +486,85 @@ class TestThePlateRule:
             skip_measured=False,
         ).run()
         assert landscape.calls == 24
+
+
+class TestTheTwoRepetitionCounts:
+    """``duplicates`` and ``redundant``: one plate, one memory, never one number.
+
+    What was silent before these ran together: the campaign skipped a candidate
+    it had measured in an earlier round and recorded nothing about the skip, so
+    the only visible trace was a proposals-to-screened gap that ``distinct_batch``
+    also widens. A converged sampler produces both kinds of repeat at once, and a
+    reader with one number had no way to tell which cost had produced it -- they
+    would attribute a plate of duplicates to mode collapse across rounds, or the
+    reverse, and either reading is a claim about the method.
+
+    Each test below drives a sampler that can only produce one of the two, so a
+    counter that were quietly measuring the other would read zero where it has
+    to be positive.
+    """
+
+    def test_repeats_confined_to_one_plate_are_not_counted_against_the_memory(self):
+        # `RepetitiveSampler` retires its menu every round, so it repeats itself
+        # constantly and never re-proposes something already measured. Anything
+        # non-zero in `redundant` here would be `duplicates` leaking into it.
+        result = Campaign(
+            landscape=CountingLandscape(),
+            sampler=RepetitiveSampler(menu=2),
+            rounds=3,
+            batch_size=8,
+            pool_size=8,
+        ).run()
+
+        assert all(record.duplicates > 0 for record in result.rounds)
+        assert all(record.redundant == 0 for record in result.rounds)
+        assert all(record.redundant_fraction == 0.0 for record in result.rounds)
+
+    def test_repeats_against_earlier_rounds_are_not_counted_against_the_plate(self):
+        # The mirror image, and the case that had no number at all. Every call
+        # this sampler makes holds distinct designs, so no well can hold a
+        # repeat; what it does re-propose is what earlier rounds measured, and
+        # the count of those has to rise as the memory fills.
+        result = Campaign(
+            landscape=CountingLandscape(),
+            sampler=LingeringSampler(stride=4),
+            rounds=3,
+            batch_size=8,
+            pool_size=16,
+        ).run()
+        # The memory is on, so every round has a count rather than a `None`.
+        assert all(record.redundant is not None for record in result.rounds)
+        redundant = [record.redundant or 0 for record in result.rounds]
+
+        assert all(record.duplicates == 0 for record in result.rounds)
+        assert redundant[0] == 0, "round zero has no earlier round to repeat"
+        assert redundant == sorted(redundant)
+        assert redundant[-1] > 0
+        # Denominated in proposals, not in wells: a refused candidate never
+        # reached one. Reading it against `evaluated` would make the two twins
+        # look addable, and their sum is not a quantity.
+        last = result.rounds[-1]
+        assert last.redundant is not None
+        assert last.redundant_fraction == pytest.approx(last.redundant / last.proposed)
+
+    def test_a_campaign_with_no_memory_reports_nothing_rather_than_zero(self):
+        # `skip_measured=False` is the ablation that removes the screening
+        # entirely. Zero here would say "this sampler never repeated itself",
+        # which is the opposite of what an unscreened campaign knows -- it
+        # never looked. `nan` propagates; a zero would average into a column.
+        result = Campaign(
+            landscape=CountingLandscape(),
+            sampler=RepetitiveSampler(menu=2),
+            rounds=3,
+            batch_size=8,
+            pool_size=8,
+            skip_measured=False,
+        ).run()
+
+        assert all(record.redundant is None for record in result.rounds)
+        assert all(np.isnan(record.redundant_fraction) for record in result.rounds)
+        # And the duplicates twin is unaffected: the plate rule did not change.
+        assert any(record.duplicates > 0 for record in result.rounds)
 
 
 class TestFeasibility:

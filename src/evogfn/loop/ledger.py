@@ -6,7 +6,7 @@ literature puts a realistic total in the hundreds -- so a result reported at
 20,000 evaluations is not a result about directed evolution. The ledger exists
 so that the number every claim is indexed by cannot be quietly wrong.
 
-Five counts are kept separate because they diverge, and the gaps are the
+Six counts are kept separate because they diverge, and the gaps are the
 interesting part:
 
 * **proposals** -- candidates the sampler generated. Free. A rejection-sampling
@@ -16,6 +16,11 @@ interesting part:
   rounds and reached the selector. A sampler that has collapsed onto one mode
   re-proposes what it has already measured, and the gap from proposals to
   screened is where that shows.
+* **redundant** -- of the proposals that did *not* survive, how many were
+  refused because an earlier round had already measured that design. This is
+  the named half of the proposals-to-screened gap; the rest of that gap is
+  ``distinct_batch`` dropping a repeat off the same plate, and until the two
+  were counted apart neither could be read off the other.
 * **evaluated** -- oracle calls charged. The constrained resource.
 * **duplicates** -- of those evaluated, how many repeated a design already on
   the same plate. Charged like any other well, because they are.
@@ -33,6 +38,16 @@ situation: the point of running rounds is that each one is informed by what the
 last measured, so the campaign remembers and does not re-order. Folding the two
 into one number would report a method that never repeats itself as wasteful
 merely for having searched somewhere it had already been.
+
+``duplicates`` and ``redundant`` are the twins that keep those two apart, and
+which is which is the whole of it: **``duplicates`` is repetition within one
+plate**, charged in wells; **``redundant`` is repetition against the campaign's
+memory across rounds**, charged in proposals and in nothing else. A converged
+sampler produces both at once, so reading either alone misattributes the
+other's cost -- a ledger showing only the first reads the collapse as a
+within-round convenience fee, and one showing only the second reads it as mode
+collapse the plate never paid for. That confusion is precisely what the pair
+exists to resolve, which is why they are reported side by side and never summed.
 
 Infeasible designs are charged
 ------------------------------
@@ -104,7 +119,22 @@ class RoundRecord:
         duplicates: How many of the evaluated candidates repeated a design
             already on the same plate. Zero for a campaign filling its plate
             with distinct designs, and zero for a sampler that does not repeat
-            itself; anything else is the wells convergence cost.
+            itself; anything else is the wells convergence cost. The **within a
+            plate** twin of ``redundant``; see the module docstring for why the
+            two are read together and never summed.
+        redundant: How many proposals the campaign refused because it had
+            measured that design in an *earlier round*. The **across rounds**
+            twin of ``duplicates``: this repetition costs proposals and no
+            wells, because the candidate never reached one, while a duplicate
+            costs a well and is charged.
+
+            ``None`` when the campaign has no cross-round memory to consult --
+            ``skip_measured`` off, the ablation that removes the screening
+            entirely -- and that is not the same finding as a campaign that
+            consulted its memory and refused nothing. Zero would conflate the
+            two, and would do it in the direction that reads as "this sampler
+            never repeated itself". ``None``/``nan`` for a quantity nobody
+            obtained is the convention ``surrogate_correlation`` already sets.
         best_in_round: Best objective value measured this round. With more than
             one objective this is the best *scalarised* value, under the
             trade-off the campaign's acquisition rule states -- the same one the
@@ -154,6 +184,7 @@ class RoundRecord:
     anchor: tuple[int, ...] | None = None
     anchor_distance: int = 0
     duplicates: int = 0
+    redundant: int | None = None
 
     @property
     def feasible_fraction(self) -> float:
@@ -170,6 +201,28 @@ class RoundRecord:
         wells, and this is the only place that cost is visible.
         """
         return self.duplicates / self.evaluated if self.evaluated else 0.0
+
+    @property
+    def redundant_fraction(self) -> float:
+        """Share of the round's *proposals* the campaign's memory refused.
+
+        Denominated in proposals where
+        [duplicate_fraction][evogfn.loop.ledger.RoundRecord.duplicate_fraction]
+        is denominated in wells, and the mismatch is the point rather than an
+        oversight: a duplicate consumed a well and is charged, a redundant
+        candidate was dropped before selection and cost only the compute that
+        generated it. Putting both over ``evaluated`` would invite adding them,
+        and their sum is not a quantity -- it would count some of the sampler's
+        output twice and some of the plate not at all.
+
+        Returns:
+            The share in ``[0, 1]``, or ``nan`` when the campaign had no memory
+            to consult, which is not the same as having consulted it and
+            refused nothing.
+        """
+        if self.redundant is None or not self.proposed:
+            return float("nan")
+        return self.redundant / self.proposed
 
     @property
     def rejection_ratio(self) -> float:

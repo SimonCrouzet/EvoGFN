@@ -50,9 +50,14 @@ from evogfn.benchmark.suite import (
     CAPPED,
     CONSTRAINT_DENSITIES,
     DIAGNOSTIC_DENSITY,
+    DIAGNOSTIC_MUTATIONS,
+    DIAGNOSTIC_PROTOCOL,
     MAIN,
+    REJECTION_RADII,
     REPLICATION_SEEDS,
     TRPB_MUTATIONS,
+    _matched_kernel_genetic,
+    _round_rows,
     anchor_study,
     budget_gradient,
     constraint_density,
@@ -60,14 +65,19 @@ from evogfn.benchmark.suite import (
     fixed_anchor_task,
     objective_task,
     records_to_metric,
+    rejection_arms,
+    rejection_curve,
     replicate_instance,
     replication,
     rounds_curve,
     run_task,
 )
 from evogfn.benchmark.tasks import Attainable, Task
+from evogfn.core.types import Alphabet
+from evogfn.env.mutation import MutationEnvironment
 from evogfn.landscapes.ehrlich import EhrlichLandscape
 from evogfn.loop.campaign import Campaign
+from evogfn.loop.ledger import RoundRecord
 
 #: A landscape small enough to run a real campaign against inside a test, and
 #: chosen so that random mutagenesis improves on the parent more than once in
@@ -1035,6 +1045,216 @@ def test_the_density_rungs_the_audit_does_not_cover_declare_nothing():
             assert task.attainable is None, (
                 f"{task.name} declares an attainable optimum nobody audited at its density"
             )
+
+
+# --------------------------------------------------------------------------
+# The two repetition counts, and the hop that carries them into a record.
+# --------------------------------------------------------------------------
+
+
+def a_round(**overrides) -> RoundRecord:
+    """A minimal round record, for testing the storage hop rather than a campaign."""
+    fields = {
+        "index": 0,
+        "proposed": 8,
+        "screened": 8,
+        "evaluated": 8,
+        "feasible": 8,
+        "best_in_round": 1.0,
+        "best_so_far": 1.0,
+        "mean_in_round": 1.0,
+        "batch_diversity": 0.0,
+    }
+    return RoundRecord(**{**fields, **overrides})
+
+
+def test_a_stored_round_carries_both_repetition_counts(tmp_path):
+    """Guards the hop that is not automatic and not loud when it is missed.
+
+    `_round_rows` builds its dict key by key, so a field added to `RoundRecord`
+    is present in memory, absent from every stored record, and silent about the
+    difference: nothing raises, the rounds still serialise, and the column
+    simply never exists. The pair is asserted together because they are only
+    readable together -- within-plate repetition and cross-round repetition are
+    different costs, and either one alone gets the other's attributed to it.
+    """
+    record = stored(tmp_path, toy_task(reanchor=True, attainable=None))
+
+    assert record.rounds
+    for row in record.rounds:
+        assert {"duplicates", "duplicate_fraction", "redundant", "redundant_fraction"} <= set(row)
+        # This arm runs with the campaign's memory on, so the count is a
+        # measurement rather than the absence tested below.
+        assert not np.isnan(row["redundant"])
+
+
+def test_a_round_that_never_consulted_a_memory_stores_nothing_rather_than_zero():
+    # Zero is a measurement -- "the memory refused nothing" -- and it would
+    # average into a column beside real ones as evidence that the arm never
+    # repeated itself. A campaign run without the screen never looked, which is
+    # the opposite finding, and `nan` is what the store already uses for a
+    # quantity nobody obtained.
+    absent = _round_rows([a_round(redundant=None)])[0]
+    measured = _round_rows([a_round(redundant=0)])[0]
+
+    assert np.isnan(absent["redundant"])
+    assert np.isnan(absent["redundant_fraction"])
+    assert measured["redundant"] == 0.0
+    assert measured["redundant_fraction"] == 0.0
+
+
+# --------------------------------------------------------------------------
+# The rejection curve: an axis, and a kernel that can actually travel it.
+# --------------------------------------------------------------------------
+
+#: The protein alphabet the diagnostic instance uses, for measuring a mutation
+#: kernel on its own terms.
+KERNEL_ALPHABET = Alphabet.from_string("ACDEFGHIKLMNPQRSTVWY")
+
+#: The diagnostic instance's length, which is what ``p_m = 1/L`` is one over.
+KERNEL_LENGTH = 32
+
+
+def substitutions(build, radius, n=512):
+    """Mean substitutions an arm's offspring carry at a given per-round radius.
+
+    Measured with **nothing forbidden**, so the number is the mutation kernel's
+    and not the feasibility filter's. That separation is the entire point of the
+    arm being tested: an acceptance rate that stops falling as the radius widens
+    means either that the filter has stopped refusing or that the kernel stopped
+    producing anything for it to refuse, and only a measurement taken without a
+    filter can tell those apart.
+    """
+    parent = np.zeros(KERNEL_LENGTH, dtype=np.int32)
+    env = MutationEnvironment(parent, KERNEL_ALPHABET, max_mutations=radius)
+    offspring = np.asarray(build(env, 0, DIAGNOSTIC_PROTOCOL).propose(n))
+    return float((offspring != parent).sum(axis=1).mean())
+
+
+def published_kernel(env, seed, _protocol):
+    """``genetic-feasible``'s sampler, built here for what it does *not* pass.
+
+    Its builder is private to the methods module, and the argument under test is
+    the one neither of them supplies: a mutation rate. The default is Stanton et
+    al.'s ``p_m = 1/L``, and the claim is that it does not move with the radius.
+    """
+    from evogfn.algorithms.baselines.genetic import GeneticAlgorithm  # noqa: PLC0415
+
+    return GeneticAlgorithm(env, seed=seed, feasible_only=True, max_attempts=200)
+
+
+def test_the_rejection_sweep_reuses_the_task_it_already_defines():
+    # Same failure the density sweep's version guards, in the family that would
+    # hit it hardest: the store keys on (task, arm), so a rung defined as a
+    # renamed copy of the shared diagnostic runs its campaigns a second time and
+    # files them where nothing compares them to the first.
+    rungs = {task.name: task for task in rejection_curve()}
+    shared = objective_task()
+
+    assert shared.name in rungs, (
+        f"the rejection sweep defines {sorted(rungs)} and none of them is {shared.name}, "
+        f"so the rung at radius {DIAGNOSTIC_MUTATIONS} is a twin of a task that already exists"
+    )
+    reused = rungs[shared.name]
+    assert repr(reused) == repr(shared)
+    assert reused.attainable == shared.attainable
+    assert reused.build is shared.build
+
+
+def test_every_rejection_rung_varies_the_radius_and_nothing_else():
+    # A sweep whose rungs differ in a second parameter is not measuring its own
+    # axis, and nothing downstream could tell: every rung would still produce an
+    # acceptance rate, and the curve through them would still look like a curve.
+    tasks = rejection_curve()
+
+    assert len({instance_shape(task) for task in tasks}) == 1
+    assert len({permitted_share(task) for task in tasks}) == 1
+    assert {task.protocol.budget for task in tasks} == {objective_task().protocol.budget}
+    assert {task.reanchor for task in tasks} == {True}
+    assert [task.max_mutations for task in tasks] == list(REJECTION_RADII)
+
+
+def test_the_rejection_axis_brackets_the_radius_every_other_diagnostic_runs_at():
+    # An axis that only widens cannot say whether the shared radius sits on a
+    # slope or on a plateau, and an axis that only narrows cannot reach the
+    # region where the published kernel runs out of proposal mass -- which is
+    # the confound the family exists to make visible rather than assume away.
+    assert list(REJECTION_RADII) == sorted(REJECTION_RADII)
+    assert min(REJECTION_RADII) < DIAGNOSTIC_MUTATIONS < max(REJECTION_RADII)
+    # And the widest rung is still a real constraint at L=32 rather than a
+    # formality that reaches every sequence.
+    assert max(REJECTION_RADII) < KERNEL_LENGTH
+
+
+def test_the_rejection_rungs_the_audit_does_not_cover_declare_nothing():
+    # In both directions and for two reasons. The narrow rungs reach a strictly
+    # smaller set than `DIAGNOSTIC_ATTAINABLE` was audited over, so its value
+    # would be a floor no method on them could clear; the wide rungs reach a
+    # larger set nobody has audited at all. Either way a borrowed bound is the
+    # failure the attainability mechanism exists to prevent.
+    shared = objective_task()
+    for task in rejection_curve():
+        if task.name == shared.name:
+            assert task.attainable is not None
+        else:
+            assert task.attainable is None, (
+                f"{task.name} declares an attainable optimum nobody audited at its radius"
+            )
+
+
+def test_the_published_kernel_does_not_follow_the_radius():
+    """The confound, as a measurement rather than as a caveat in prose.
+
+    ``p_m = 1/L`` makes the substitution count Poisson(1) at *every* rung, so
+    widening the radius changes almost nothing about what gets proposed. A
+    flat acceptance rate over the wide rungs is therefore the kernel and not the
+    filter, and a claim that reads it as the filter is the overreach the second
+    column exists to prevent.
+    """
+    counts = [substitutions(published_kernel, radius) for radius in REJECTION_RADII]
+
+    assert counts[-1] == pytest.approx(1.0, abs=0.4), (
+        f"the published kernel carries {counts[-1]:.2f} substitutions at a radius of "
+        f"{REJECTION_RADII[-1]}; if it followed the axis this family would need no second arm"
+    )
+    assert max(counts) < 2.0
+
+
+def test_the_matched_kernel_reaches_the_radii_the_published_one_never_does():
+    # The separation, as an assertion. Without a column whose proposals actually
+    # carry the substitutions the axis permits, the wide rungs measure an empty
+    # region and the family assumes what it was built to test.
+    matched = [substitutions(_matched_kernel_genetic, radius) for radius in REJECTION_RADII]
+    published = [substitutions(published_kernel, radius) for radius in REJECTION_RADII]
+
+    assert matched == sorted(matched)
+    assert matched[-1] > 0.5 * REJECTION_RADII[-1]
+    assert matched[-1] > 5 * published[-1]
+    # The axis's own control: at a radius of one the matched rate *is* 1/L, so
+    # the two arms are the same configuration and must measure the same thing. A
+    # gap here would be a fault in the measurement rather than a kernel effect,
+    # and it would be invisible anywhere else on the axis.
+    assert matched[0] == pytest.approx(published[0])
+
+
+def test_the_rejection_arms_differ_in_the_kernel_and_in_nothing_else():
+    # An attribution test. The whole family is read as "the difference between
+    # these two columns is the mutation rate", and a second difference -- a
+    # surrogate, a wider pool, another plate rule -- would be silently folded
+    # into that reading.
+    arms = rejection_arms()
+    # Read by attribute, which is how `run_task` reads them -- so this compares
+    # what the two arms would actually store rather than what they hold.
+    published = dict(getattr(BASELINES["genetic-feasible"], "parameters", {}))
+    matched = dict(getattr(arms["genetic-feasible-matched"], "parameters", {}))
+
+    # Looked up rather than rebuilt, so the shipped cell stays the cell the
+    # store already keys.
+    assert arms["genetic-feasible"] is BASELINES["genetic-feasible"]
+    assert matched["sampler"] == "matched-kernel-genetic"
+    assert {k: v for k, v in matched.items() if k != "sampler"} == {
+        k: v for k, v in published.items() if k != "sampler"
+    }
 
 
 def test_the_fixed_anchor_control_is_the_diagnostic_task_with_one_thing_changed():

@@ -82,6 +82,7 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
+from evogfn.algorithms.baselines.genetic import GeneticAlgorithm
 from evogfn.benchmark.determinism import is_deterministic
 from evogfn.benchmark.protocol import PLATE, Protocol, round_sweep
 from evogfn.benchmark.tasks import Attainable, Task
@@ -97,6 +98,7 @@ if TYPE_CHECKING:
     from evogfn.benchmark.attainable import AttainableOptimum
     from evogfn.benchmark.methods import Methodology
     from evogfn.benchmark.store import ResultStore, RunRecord
+    from evogfn.env.mutation import MutationEnvironment
     from evogfn.landscapes.base import FitnessLandscape
     from evogfn.loop.campaign import Campaign
     from evogfn.loop.ledger import CampaignResult, RoundRecord
@@ -730,6 +732,157 @@ def constraint_density() -> tuple[Task, ...]:
     )
 
 
+#: Per-round mutation radii the rejection diagnostic sweeps. The axis is how
+#: many substitutions a design is *permitted* to carry, which is what the
+#: feasibility filter is ultimately refusing: each substitution is another
+#: chance to break an adjacency the transition matrix forbids.
+#:
+#: What each rung is for:
+#:
+#: * **1** and **2** -- below the radius every other diagnostic runs at, where
+#:   the ceiling binds even the published mutation kernel and the acceptance
+#:   rate is at its highest. Two rungs rather than one, because a single point
+#:   below the shared radius cannot say whether the axis is a line or a knee.
+#:   The rung at **1** is also the axis's own control: a kernel matched to a
+#:   radius of one *is* ``p_m = 1/L`` on the diagnostic instance, so the two
+#:   columns `rejection_arms` builds are the same configuration there and must
+#:   report the same acceptance rate. A gap at that rung is a fault in the
+#:   measurement rather than a property of either kernel.
+#: * **`DIAGNOSTIC_MUTATIONS`** -- the radius every other diagnostic runs at, so
+#:   the curve passes through the configuration the rest are read at. This rung
+#:   is `objective_task` itself, not a copy of it.
+#: * **8** and **16** -- above it, where the published kernel has essentially no
+#:   proposal mass and the curve therefore *stops moving*. That flattening is
+#:   the confound rather than a result, and having two rungs in it is what makes
+#:   the flattening visible as flattening instead of as one point that happened
+#:   to land near its neighbour.
+#:
+#: The top rung is half the diagnostic instance's length, so a design there may
+#: differ from its anchor at half its positions and the ceiling is still a real
+#: constraint rather than a formality.
+REJECTION_RADII: tuple[int, ...] = (1, 2, DIAGNOSTIC_MUTATIONS, 8, 16)
+
+
+def rejection_curve() -> tuple[Task, ...]:
+    """Tasks varying how many substitutions a design may carry.
+
+    The axis the three ``draws_*`` counters need and do not have. They are
+    campaign totals -- so many offspring bred, so many refused as unreachable,
+    so many of the survivors the anchor unchanged -- measured at one radius on
+    tasks designed to measure something else, which makes them telemetry rather
+    than a result: three numbers, at one setting, with nothing to read them
+    against.
+
+    The claim they are wanted for is about **acceptance as a function of
+    mutation count**. Every substitution an offspring carries is another chance
+    to break an adjacency the transition matrix forbids, so the share the filter
+    admits should fall as the permitted count rises, and *how fast* it falls is
+    what decides whether rejection sampling is a cost a method absorbs or a wall
+    it hits. Varying the radius is what turns the counters into that curve.
+    Everything else is held at `DIAGNOSTIC_INSTANCE` and `DIAGNOSTIC_PROTOCOL`,
+    so a rate that moves across the family moves with the radius and nothing
+    else.
+
+    The confound, which travels with any claim drawn from this
+    ---------------------------------------------------------
+
+    The published mutation rate is ``p_m = 1/L`` -- Stanton et al.'s setting,
+    and what `BASELINES`'s rejection arm runs -- so the number of substitutions
+    an offspring carries is **Poisson(1) whatever this axis says**. About 37% of
+    draws carry none at all, 98% carry four or fewer, and the mass above that is
+    a fraction of a percent. Widening the radius past three or four therefore
+    changes almost nothing about what is *proposed*: the designs the filter
+    would have refused were never bred in the first place.
+
+    So confinement near the anchor is rejection **and** the published kernel
+    together, and this family cannot attribute it to rejection alone. Claiming
+    the whole gap for rejection is overreach. `rejection_arms` is what makes the
+    separation possible rather than assumed: a second column whose kernel is
+    scaled to each rung's radius, so the designs the axis permits are actually
+    drawn. Read as a pair, the difference *between* columns at one radius is the
+    kernel's share and the slope *within* a column is what the filter costs once
+    the proposal mass is there. Read alone, either column is the overreach.
+
+    The matched column is expected to give up on the widest rungs, and that is
+    a result rather than a gap in the family: an exhausted campaign still stores
+    its ``draws_*`` counters, which are the very quantities this curve is read
+    on, so a rung that could not fill a plate reports the acceptance rate that
+    explains why.
+
+    Returns:
+        One task per entry in `REJECTION_RADII`, in that order. The rung at
+        `DIAGNOSTIC_MUTATIONS` **is** `objective_task`, returned rather than
+        copied, for the reason `constraint_density` returns it: the store keys
+        on ``(task, arm)``, so a renamed twin of a task already defined pays for
+        the same campaigns twice and files the two under keys nothing can
+        compare.
+
+        Every other rung declares no attainable optimum, in both directions and
+        for two different reasons. `DIAGNOSTIC_ATTAINABLE` is what four
+        re-anchored rounds *of four* reach: the narrow rungs reach a strictly
+        smaller set, so carrying that value across would put a floor no method
+        could clear into every regret on them; the wide rungs reach a larger set
+        that no audit has covered, and a bound declared on some rungs of a family
+        and not others gives a regret column that cannot be read down its own
+        length. This family is read on the ``draws_*`` columns, not on regret.
+    """
+    return tuple(
+        objective_task()
+        if radius == DIAGNOSTIC_MUTATIONS
+        else _task(
+            f"radius-{radius}",
+            f"How much does the feasibility filter refuse when a design may "
+            f"carry {radius} substitutions? The shared diagnostic instance in "
+            f"every parameter but the per-round radius, so the acceptance rate "
+            f"moves with the permitted mutation count alone. {CUMULATIVE}",
+            DIAGNOSTIC_LANDSCAPE,
+            # Rebuilt from the shared protocol with one field replaced, so the
+            # rungs cannot differ in the budget as well as in the radius.
+            replace(DIAGNOSTIC_PROTOCOL, max_mutations=radius),
+            reanchor=True,
+            attainable=None,
+        )
+        for radius in REJECTION_RADII
+    )
+
+
+def _matched_kernel_genetic(env: MutationEnvironment, seed: int, _protocol: Protocol) -> Sampler:
+    """A rejection GA whose mutation kernel is scaled to the radius it searches.
+
+    The arm that makes `rejection_curve` separable. The published kernel is
+    ``p_m = 1/L`` at every radius, so the substitution count is Poisson(1) on
+    every rung and the wide rungs of the axis are never actually visited -- an
+    acceptance rate that stops falling there says the offspring stopped
+    changing, not that the filter stopped refusing. This one sets
+    ``p_m = max_mutations / L``, which puts the *mean* draw at the ceiling the
+    environment is enforcing, so a design carrying that many substitutions is an
+    ordinary draw rather than a tail event.
+
+    Everything else is `BASELINES`'s ``genetic-feasible`` configuration, its 200
+    attempts included, so a difference between the two columns is the kernel and
+    nothing else.
+
+    Args:
+        env: Supplies the parent, the alphabet, the radius the kernel is scaled
+            to, and the feasibility rule the draws are filtered against.
+        seed: Seeds the population and the operators.
+        _protocol: Unused; the radius comes from the environment, which is the
+            object that will actually refuse an over-budget design.
+
+    Returns:
+        The sampler. The rate is capped at 1.0 for a radius at or above the
+        sequence length, where every position is expected to mutate and the
+        ceiling has stopped constraining anything anyway.
+    """
+    return GeneticAlgorithm(
+        env,
+        seed=seed,
+        mutation_prob=min(1.0, env.max_mutations / env.sequence_length),
+        feasible_only=True,
+        max_attempts=200,
+    )
+
+
 def fixed_anchor_task() -> Task:
     """The shared diagnostic task with the anchor held still.
 
@@ -834,6 +987,47 @@ def constraint_density_tier(seeds: Sequence[int]) -> Tier:
         is not a row anyone may claim a method won.
     """
     return Tier("constraint-density", constraint_density(), tuple(seeds), Purpose.DIAGNOSTIC)
+
+
+def rejection_arms() -> dict[str, Methodology]:
+    """The two mutation kernels `rejection_curve` is read across.
+
+    One axis of the diagnostic is the task's radius; this is the other, and it
+    is an arm rather than a task because the mutation rate belongs to the
+    sampler. Two columns is the minimum that separates anything: a single column
+    at the published rate measures rejection and the kernel together and cannot
+    say which produced the shape it draws.
+
+    Returns:
+        The shipped rejection arm under its own name, looked up rather than
+        rebuilt so that the cells it shares with the rest of the suite stay the
+        cells the store already keys, and `_matched_kernel_genetic` beside it.
+        The two differ in the mutation rate and in nothing else -- same class,
+        same attempt budget, same everything the campaign supplies -- which is
+        what makes the difference between the columns attributable.
+    """
+    from evogfn.benchmark.methods import BASELINES, classical  # noqa: PLC0415 - arms import tasks
+
+    return {
+        "genetic-feasible": BASELINES["genetic-feasible"],
+        "genetic-feasible-matched": classical(_matched_kernel_genetic),
+    }
+
+
+def rejection_tier(seeds: Sequence[int]) -> Tier:
+    """The rejection sweep as a tier.
+
+    Args:
+        seeds: Seeds per arm.
+
+    Returns:
+        A `Purpose.DIAGNOSTIC` tier over `rejection_curve`. Diagnostic and not
+        benchmark, on the same reasoning `constraint_density_tier` carries: it
+        explains what a rejection-sampling method is up against on a landscape
+        and at radii we chose, which informs the discussion and is not a row
+        anyone may claim a method won.
+    """
+    return Tier("rejection-curve", rejection_curve(), tuple(seeds), Purpose.DIAGNOSTIC)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1088,6 +1282,12 @@ def _sampler_fields(sampler: Sampler) -> dict[str, object]:
 def _round_rows(records: Sequence[RoundRecord]) -> list[dict[str, float]]:
     """The per-round ledger, flattened for storage.
 
+    Built key by key rather than from the dataclass, which is what makes this
+    the second of two hops a new ledger field has to be walked through by hand:
+    a field added to
+    [RoundRecord][evogfn.loop.ledger.RoundRecord] and not added here is present
+    in memory, absent from every stored record, and silent about the difference.
+
     Args:
         records: The rounds that completed. On an exhausted campaign this is
             short of the protocol's round count, which is itself the record of
@@ -1114,6 +1314,24 @@ def _round_rows(records: Sequence[RoundRecord]) -> list[dict[str, float]]:
             # which is the difference between a budget of `max_mutations` and a
             # budget of `max_mutations` per round.
             "anchor_distance": float(record.anchor_distance),
+            # The two repetition counts, stored adjacent because they are only
+            # readable as a pair. `duplicates` is repetition **within** one
+            # plate and was charged a well; `redundant` is repetition against
+            # the campaign's memory **across** rounds and cost a proposal and
+            # nothing else. A converged sampler produces both at once, so either
+            # one alone attributes the other's cost to itself -- which is the
+            # confusion the pair exists to resolve, and it is only resolved
+            # where both numbers are stored.
+            "duplicates": float(record.duplicates),
+            "duplicate_fraction": record.duplicate_fraction,
+            # `nan` and never `0.0` where the campaign kept no cross-round
+            # memory: zero is the measurement "the memory refused nothing", and
+            # "there was no memory" is a different fact that would otherwise be
+            # indistinguishable from it -- the distinction
+            # `surrogate_correlation` above already makes with `nan`, applied
+            # to the counter that needs it for the same reason.
+            "redundant": float("nan") if record.redundant is None else float(record.redundant),
+            "redundant_fraction": record.redundant_fraction,
         }
         for record in records
     ]
@@ -1418,6 +1636,36 @@ def run_anchor_study(
         tier = Tier(f"anchor:{cell!r}", (cell.task,), tuple(seeds), Purpose.DIAGNOSTIC)
         ran += run_tier(tier, {cell.arm: arms[cell.arm]}, store, report=report)
     return ran
+
+
+def run_rejection_curve(
+    store: ResultStore,
+    seeds: Sequence[int],
+    *,
+    report: Callable[[str], None] = print,
+) -> int:
+    """Run whatever the rejection curve is missing, with the arms it needs.
+
+    The tier and its arms are paired here rather than left to a caller, and that
+    pairing is the whole content of this function. Only an arm that *rejects*
+    has draws to report, so this family run against the suite's default
+    methodologies would produce a full grid of records whose ``draws_attempted``
+    is zero -- and a column of zeros reads as "nothing was refused" rather than
+    as "nothing ran a rejection loop". `constraint_density` warns about the same
+    failure in prose; this refuses it in code.
+
+    Args:
+        store: Where results go, and what says which cells are already held.
+        seeds: Seeds per cell.
+        report: Where progress lines go.
+
+    Returns:
+        How many campaigns were actually run, counting those that exhausted --
+        which on the widest rungs of the matched-kernel column is expected to be
+        most of them, and which is a measurement rather than a loss: the
+        counters the curve is read on are stored either way.
+    """
+    return run_tier(rejection_tier(seeds), rejection_arms(), store, report=report)
 
 
 def records_to_metric(
