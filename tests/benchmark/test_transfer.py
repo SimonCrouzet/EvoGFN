@@ -21,6 +21,15 @@ measuring surrogate quality alongside policy transfer. Object identity is assert
 directly, and the stored digest is asserted to be the same on every record so the
 property is checkable from the store and not only from this file.
 
+**A supervised arm that never fitted.** `mlde-carried` exists to show that MLDE's
+state is anchor-independent and transfers in full. An MLDE that never reached its
+training size at anchor A carries nothing, so the arm is random mutagenesis at B
+-- at the same assay spend, the same plate, the same proposal count and a best
+value in the same range as a supervised method that transferred badly.
+`RunRecord.fitted` off the moved sampler is the only column that separates them,
+and the trap is that `FrozenSurrogate` answers to `is_fitted` too, is in scope at
+the call site, and is hard-coded `True`.
+
 **A plate that was never screened.** `Campaign._design` returns the first 96
 proposals unranked in round zero, which is why `measure_round` exists at all. A
 round that silently took a prefix would discard the surrogate and nothing in the
@@ -41,10 +50,14 @@ exercise every seam -- both anchors, all ten arms, the retrain, the store -- and
 cheap enough to run on every commit.
 """
 
+from dataclasses import replace
+
 import numpy as np
 import pytest
 import torch
 
+from evogfn.algorithms.base import Sampler
+from evogfn.algorithms.baselines.mlde import MLDE
 from evogfn.algorithms.gflownet.sampler import GFlowNetSampler
 from evogfn.algorithms.gflownet.training import TrainingConfig
 from evogfn.benchmark import methods
@@ -107,6 +120,63 @@ def probe_store(tmp_path_factory, toy):
     store = ResultStore(tmp_path_factory.mktemp("transfer"))
     ran = T.run_transfer_probe(store, [0], landscape=toy, budget=TOY_BUDGET, report=lambda _: None)
     return store, ran
+
+
+@pytest.fixture(scope="module")
+def prepared(toy):
+    """One seed's campaigns at anchor A, for the tests that rebuild arms by hand."""
+    return T.prepare_seed(toy, 0, TOY_BUDGET)
+
+
+def _near_pair(toy):
+    """The near anchor pair the toy budget gives, at seed 0."""
+    return T.anchor_pair(
+        toy,
+        seed=0,
+        level="near",
+        near_distance=TOY_BUDGET.near_distance,
+        far_distance=TOY_BUDGET.far_distance,
+    )
+
+
+def _arms_with(toy, prep, **overrides):
+    """Every arm at the near anchor, with named samplers swapped for stand-ins.
+
+    Returns the arms and the shared screen, because the screen is the thing the
+    fit-state tests have to be able to contrast against.
+    """
+    frozen = T.FrozenSurrogate(prep.surrogate.surrogate)
+    arms = T.arms_at_anchor(toy, replace(prep, **overrides), _near_pair(toy), frozen, TOY_BUDGET)
+    return arms, frozen
+
+
+class _MovingSampler(Sampler):
+    """A classical arm whose fit state differs between anchor A and anchor B.
+
+    Deliberately unlike any real sampler -- MLDE's `reanchored` carries its fit
+    across, which is the arm's whole premise -- and that is the point: the two
+    objects have to disagree for a test to be able to say *which one* was read.
+    A record built from the sampler as it stood at A would report ``True`` here;
+    only one built from the object the arm actually proposed through reports
+    ``False``.
+    """
+
+    def __init__(self, env, *, fitted):
+        super().__init__()
+        self._env = env
+        self._fitted = fitted
+        self.proposals = 0
+
+    @property
+    def is_fitted(self):
+        return self._fitted
+
+    def reanchored(self, env):
+        return _MovingSampler(env, fitted=not self._fitted)
+
+    def propose(self, n):
+        self.proposals += n
+        return np.stack([np.asarray(self._env.parent) for _ in range(n)])
 
 
 def _fitted(landscape, env, seed=0):
@@ -549,6 +619,83 @@ class TestWhatTheStoreEndsUpHolding:
         store, _ = probe_store
         record = store.load(T.task_name("near"), "plain-transferred")[0]
         assert "diagnostic" in record.protocol
+
+
+class TestWhetherASupervisedArmEverFitted:
+    """`mlde-carried` that never fitted is `random` under another name."""
+
+    def test_every_record_says_whether_its_arm_fitted(self, probe_store):
+        # The column has to be populated at all: before this it was `None` on
+        # every probe record regardless, because the probe stamps its own records
+        # rather than going through `suite._sampler_fields`.
+        store, _ = probe_store
+        for level in T.LEVELS:
+            fitted = {name: store.load(T.task_name(level), name)[0].fitted for name in T.ARM_NAMES}
+            # MLDE is the one arm here that fits a model of its own. At the toy
+            # budget it gets 8 assays against a training size of 96, so the
+            # handover never happens -- and `False`, not `None`, is what says so.
+            assert fitted["mlde-carried"] is False
+            assert all(fitted[name] is None for name in T.ARM_NAMES if name != "mlde-carried")
+
+    def test_an_arm_that_fits_nothing_records_none_and_not_false(self, probe_store):
+        # `False` is an accusation: it says a supervised arm ran its whole
+        # campaign in its screening stage. A genetic algorithm has no model whose
+        # state that could describe, so a share of nothing must not read as a
+        # failure to fit.
+        store, _ = probe_store
+        for name in ("random", "genetic-rebuilt", "cmaes-carried", "plain-transferred"):
+            assert store.load(T.task_name("near"), name)[0].fitted is None
+
+    def test_the_unfitted_mlde_is_not_read_off_the_screen(self, toy, prepared):
+        # The trap, pinned. `FrozenSurrogate` carries an `is_fitted` too, it is in
+        # scope where the record is built, and it is hard-coded `True` -- it
+        # refuses to wrap an unfitted model. Reading it would stamp `True` on all
+        # ten arms and the column would look populated while describing no
+        # sampler at all. This fails on exactly that substitution.
+        env = T.training_environment(toy, _near_pair(toy).moved)
+        never = MLDE(env, seed=0)
+        arms, frozen = _arms_with(toy, prepared, mlde=never)
+        assert frozen.is_fitted is True
+        assert not never.is_fitted
+        assert T.arm_fitted(arms["mlde-carried"]) is False
+
+    def test_a_fitted_mlde_is_recorded_as_fitted(self, toy, prepared):
+        # And the other direction, so the test above cannot be passed by a
+        # function that returns `False` unconditionally.
+        env = T.training_environment(toy, _near_pair(toy).moved)
+        # `feasible_only` and a repeat, because the toy landscape is constrained
+        # enough that a plate of unconstrained draws is mostly infeasible and
+        # `observe` learns from none of it -- which is the very mechanism the
+        # column exists to expose.
+        handed_over = MLDE(env, training_size=8, feasible_only=True, seed=0)
+        for _ in range(4):
+            designs = handed_over.propose(8)
+            handed_over.observe(designs, toy.evaluate(designs))
+        assert handed_over.is_fitted
+        arms, _ = _arms_with(toy, prepared, mlde=handed_over)
+        assert T.arm_fitted(arms["mlde-carried"]) is True
+
+    def test_it_reads_the_sampler_the_arm_proposed_through(self, toy, prepared):
+        # The moved sampler, not the one that stood at A, and not a second copy
+        # made for the record. `_MovingSampler` disagrees with itself across the
+        # move, so a record built from the wrong object reports the opposite
+        # value; and the proposal counter says which object the pool came from.
+        env = T.training_environment(toy, _near_pair(toy).moved)
+        at_a = _MovingSampler(env, fitted=True)
+        arms, _ = _arms_with(toy, prepared, mlde=at_a)
+        arm = arms["mlde-carried"]
+        arm.propose(3)
+        assert arm.sampler is not at_a
+        assert at_a.proposals == 0
+        assert arm.sampler.proposals == 3
+        assert T.arm_fitted(arm) is False
+
+    def test_a_policy_arm_holds_no_sampler_to_read(self, toy, prepared):
+        # The gflownet rungs propose through a frozen policy; there is no sampler
+        # object, so there is nothing to be tempted to substitute the screen for.
+        arms, _ = _arms_with(toy, prepared)
+        assert arms["plain-transferred"].sampler is None
+        assert T.arm_fitted(arms["plain-transferred"]) is None
 
 
 class TestWhatTheProbeMustNotDisturb:

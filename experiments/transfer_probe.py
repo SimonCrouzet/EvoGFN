@@ -88,6 +88,7 @@ import argparse
 import sys
 import time
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import numpy as np
 
@@ -101,6 +102,11 @@ from evogfn.benchmark.transfer import (
     run_transfer_probe,
     task_name,
 )
+
+if TYPE_CHECKING:
+    from collections.abc import Mapping
+
+    from evogfn.benchmark.store import RunRecord
 
 #: Seeds the specification declares. Paired: the same instance, the same anchor
 #: pair and the same screening surrogate across every arm within a seed.
@@ -154,6 +160,7 @@ def report(store: ResultStore, seeds: list[int], reference: str = REFERENCE_ARM)
         lines.append(f"\n{task}  ({len(shared)} paired seeds)")
         lines.append(_anchor_note(held.get(reference, {})))
         lines.append(_screen_note(held))
+        lines.extend(_fit_note(held))
 
         for name in ARM_NAMES:
             records = held[name]
@@ -191,7 +198,7 @@ def report(store: ResultStore, seeds: list[int], reference: str = REFERENCE_ARM)
     return "\n".join(lines)
 
 
-def _anchor_note(records: dict[int, object]) -> str:
+def _anchor_note(records: Mapping[int, RunRecord]) -> str:
     """The distribution of achieved anchor distances, which the spec asks for.
 
     Nominal distances are what was requested; achieved distances are what the
@@ -206,9 +213,9 @@ def _anchor_note(records: dict[int, object]) -> str:
         One line.
     """
     distances = [
-        float(record.parameters["achieved_distance"])  # type: ignore[attr-defined]
+        float(record.parameters["achieved_distance"])
         for record in records.values()
-        if "achieved_distance" in record.parameters  # type: ignore[attr-defined]
+        if "achieved_distance" in record.parameters
     ]
     if not distances:
         return "  no anchor distances recorded"
@@ -218,7 +225,7 @@ def _anchor_note(records: dict[int, object]) -> str:
     )
 
 
-def _screen_note(held: dict[str, dict[int, object]]) -> str:
+def _screen_note(held: Mapping[str, Mapping[int, RunRecord]]) -> str:
     """Whether every arm of every seed really did share one screen.
 
     The declared deviation is checkable from the store, and this is where it gets
@@ -236,7 +243,7 @@ def _screen_note(held: dict[str, dict[int, object]]) -> str:
     dataset: set[str] = set()
     for records in held.values():
         for seed, record in records.items():
-            parameters = record.parameters  # type: ignore[attr-defined]
+            parameters = record.parameters
             by_seed.setdefault(seed, set()).add(str(parameters.get("surrogate_dataset_digest")))
             dataset.add(str(parameters.get("surrogate_dataset")))
     if not by_seed:
@@ -245,6 +252,43 @@ def _screen_note(held: dict[str, dict[int, object]]) -> str:
     if split:
         return f"  WARNING: seeds {split} did not share one screen; do not compare their arms"
     return f"  one screen per seed, fitted on {sorted(dataset)}"
+
+
+def _fit_note(held: Mapping[str, Mapping[int, RunRecord]]) -> list[str]:
+    """How many seeds each supervised arm's own model actually took over on.
+
+    Printed because the column is worth nothing unread. `mlde-carried` is the arm
+    whose premise is that MLDE's state is anchor-independent and transfers in
+    full; an MLDE that never reached its training size at anchor A carries
+    nothing to B and the arm *is* random mutagenesis there, at the same assay
+    spend, the same plate and a regret in the same range as a supervised method
+    that transferred badly. Nothing else in the table above separates those two
+    readings -- see
+    [MLDE.is_fitted][evogfn.algorithms.baselines.mlde.MLDE.is_fitted].
+
+    Arms that fit nothing are silent here rather than reported at zero: a genetic
+    algorithm has no model whose state this could describe, and a share of
+    nothing is not a failure to fit.
+
+    Args:
+        held: Stored records by arm name and seed.
+
+    Returns:
+        One line per arm that measured a fit, or none.
+    """
+    lines = []
+    for name, records in held.items():
+        measured = [record.fitted for record in records.values() if record.fitted is not None]
+        if not measured:
+            continue
+        fitted = sum(1 for value in measured if value)
+        warning = (
+            ""
+            if fitted == len(measured)
+            else "  <-- the unfitted rows are a random screen under a supervised name"
+        )
+        lines.append(f"  {name}: model fitted on {fitted}/{len(measured)} seeds{warning}")
+    return lines
 
 
 def _interaction(store: ResultStore, seeds: list[int]) -> str:

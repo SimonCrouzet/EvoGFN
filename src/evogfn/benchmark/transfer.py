@@ -1576,12 +1576,23 @@ class ArmAtAnchor:
         parameters: What this arm resolved to, for the record. Provenance only.
         policy: The policy behind the proposal, where there is one, so a caller
             can read its anchor and its weights after the round.
+        sampler: The classical sampler behind the proposal, where there is one --
+            **the moved one**, the object `propose` actually draws from, not the
+            one that stood at A. Held because
+            [RunRecord.fitted][evogfn.benchmark.store.RunRecord.fitted] is state
+            on the sampler and is not derivable from anything the round returns:
+            a `mlde-carried` arm that never fitted at A carries nothing to B and
+            is random mutagenesis there, while charging the same assays, filling
+            the same plate and reporting a best value in the same range as one
+            that transferred badly. See
+            [MLDE.is_fitted][evogfn.algorithms.baselines.mlde.MLDE.is_fitted].
     """
 
     name: str
     propose: Callable[[int], Tokens]
     parameters: dict[str, ArmParameter]
     policy: SequencePolicy | None = None
+    sampler: Sampler | None = None
 
 
 def _frozen_arm(
@@ -1766,9 +1777,14 @@ def arms_at_anchor(
         )
 
     def classical_arm(name: str, sampler: Sampler) -> ArmAtAnchor:
+        # Moved once and kept, rather than moved inline into the closure: the
+        # object the arm proposes from is the object whose `is_fitted` the record
+        # has to carry, and a second `_reanchored` call for the record would
+        # produce a *different* copy -- one that never proposed anything.
+        moved = _reanchored(sampler, env)
         return ArmAtAnchor(
             name=name,
-            propose=_sampler_arm(_reanchored(sampler, env)),
+            propose=_sampler_arm(moved),
             parameters={
                 **common,
                 "family": "classical",
@@ -1776,6 +1792,7 @@ def arms_at_anchor(
                 "frozen": True,
                 "gradient_steps_at_b": 0.0,
             },
+            sampler=moved,
         )
 
     fresh = _policy(env, hidden_dim=TRANSFER_HIDDEN_DIM, seed=stream, anchor_conditioned=False)
@@ -2070,6 +2087,10 @@ def _run_level(  # noqa: PLR0913 - one argument per thing a level is
                 feasible_fraction=round_at_b.feasible_fraction,
                 oracle_calls=int(round_at_b.batch.shape[0]),
                 proposals=round_at_b.proposed,
+                # Off the moved sampler, not off `frozen` -- which also answers
+                # to `is_fitted`, is in scope right here, and is always True.
+                # See `arm_fitted`.
+                fitted=arm_fitted(arm),
                 deterministic=is_deterministic(),
                 trace=[round_at_b.best],
                 parameters={
@@ -2102,6 +2123,44 @@ def _run_level(  # noqa: PLR0913 - one argument per thing a level is
         f"{pair.achieved_distance}, attainable {attainable!r}"
     )
     return ran
+
+
+def arm_fitted(arm: ArmAtAnchor) -> bool | None:
+    """Whether this arm's own model had taken over, or ``None`` if it has none.
+
+    Read **off the arm's sampler**, by the same ``getattr(..., "is_fitted",
+    None)`` idiom [evogfn.benchmark.suite][]'s ``_sampler_fields`` uses, and
+    tri-valued for the same reason: ``None`` is "nothing here fits a model" --
+    a genetic algorithm, a frozen policy -- and ``False`` is a measurement, the
+    one that says an arm named for a supervised method spent its whole life in
+    its random-screening stage. Collapsing the two would accuse every classical
+    rung of a failure only one of them can have.
+
+    It matters most for `mlde-carried`, whose premise is that MLDE's state is
+    anchor-independent and transfers in full. If MLDE never fitted at A it
+    carries nothing to B and the arm *is* random mutagenesis there, at the same
+    assay spend, the same plate and a best value in the same range as a
+    supervised method that transferred badly.
+    [MLDE.is_fitted][evogfn.algorithms.baselines.mlde.MLDE.is_fitted] is the
+    only thing separating those two readings, and it lives on the object rather
+    than on anything the round returns.
+
+    **Not the surrogate.** [FrozenSurrogate][evogfn.benchmark.transfer.FrozenSurrogate]
+    also carries an ``is_fitted``, it is in scope at the call site, and it is
+    hard-coded ``True`` -- it refuses to wrap an unfitted model. Reading it here
+    would stamp ``True`` on all ten arms, including the ones that fit nothing,
+    and the column would look populated while saying nothing about any sampler.
+
+    Args:
+        arm: The arm just measured. Its ``sampler`` is the moved object the
+            proposals actually came from.
+
+    Returns:
+        The sampler's fit state, or ``None`` where there is no sampler or it
+        carries no such notion.
+    """
+    fitted = getattr(arm.sampler, "is_fitted", None)
+    return None if fitted is None else bool(fitted)
 
 
 def _anchor_fields(arm: ArmAtAnchor, pair: AnchorPair) -> dict[str, ArmParameter]:
