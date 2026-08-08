@@ -122,13 +122,26 @@ def test_a_task_out_of_reach_of_its_own_optimum_declares_it(task):
     )
 
 
+#: Tasks whose per-round radius deliberately *equals* the sequence length, so
+#: the mutation budget restricts nothing and is not meant to. Both are four-site
+#: empirical libraries: the assay varies four positions and the sequence is
+#: those four positions, so the ball is the whole published table -- and no
+#: narrower radius would do, since the best measured variant differs from the
+#: wild type at every one of the four on both datasets.
+#:
+#: Named rather than derived from ``max_mutations == length``, which is the
+#: condition the assertion below tests: deriving the exemption from it would
+#: excuse exactly the tasks that failed and leave the check asserting nothing.
+UNCONSTRAINED_BY_DESIGN = ("gb1-anchor", "trpb-anchor")
+
+
 @pytest.mark.parametrize("task", MAIN, ids=lambda t: t.name)
 def test_the_per_round_radius_is_below_the_sequence_length(task):
     # A radius at or above the sequence length is not a constraint, and a task
     # claiming to measure constrained search under one measures nothing.
     length = task.landscape().sequence_length
     assert task.max_mutations <= length
-    if task.name != "gb1-anchor":
+    if task.name not in UNCONSTRAINED_BY_DESIGN:
         assert task.protocol.constrains_search(length), (
             f"{task.name} allows {task.max_mutations} of {length} positions per round, so its "
             f"mutation budget does not restrict anything"

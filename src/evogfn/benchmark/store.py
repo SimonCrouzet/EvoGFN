@@ -372,6 +372,35 @@ class RunRecord:
             reads survivable, while the arm makes no progress. Without this
             column the rejection rate is the only evidence and it says the
             wrong thing.
+        fitted: For an arm that trains a model on its own measurements, whether
+            that model had **actually been fitted** by the time the campaign
+            ended. ``None`` for an arm that fits nothing, which is most of them:
+            a genetic algorithm has no model whose state this could describe, and
+            a share of nothing is not ``False``.
+
+            Tri-valued for the same reason ``repaired_fraction`` is read beside
+            the arm's name: ``None`` means the quantity was never measured -- the
+            sampler carries no such notion, or the record predates this field --
+            while ``False`` is a measurement, and the one that matters. It says a
+            supervised arm ran its whole campaign in its random-screening stage
+            and never handed over to the model it is named for.
+
+            That is not a hypothetical.
+            [MLDE.observe][evogfn.algorithms.baselines.mlde.MLDE.observe] drops
+            an infeasible assay, having no fitness to regress on, so on a
+            landscape with a transition constraint the screening plates yield far
+            fewer training examples than they cost -- six usable from twenty-four
+            on a constrained toy. Where the infeasible share is large the
+            handover never happens, and the row is a **random baseline reported
+            under a supervised method's name**. Nothing else stored says so: the
+            oracle calls, the plate count, the proposals and the regret are all
+            exactly what a fitted campaign would have written.
+
+            Defaulted to ``None`` so that every record written before this field
+            existed loads as what it is -- a campaign whose fit nobody recorded
+            -- rather than as one that demonstrably never fitted. A default of
+            ``False`` would retroactively accuse every stored campaign of the
+            failure this field exists to detect.
         exhausted: Whether the campaign that produced this record **failed to
             finish**: its sampler could not propose designs the campaign had not
             already measured, so the run raised rather than filling its plate.
@@ -498,6 +527,10 @@ class RunRecord:
     draws_attempted: int = 0
     draws_rejected: int = 0
     draws_unmutated: int = 0
+    # `bool | None` and not `bool`: the three states are "fitted", "never
+    # fitted" and "nobody measured", and collapsing the last two is what let an
+    # arm that never fitted read as a tuned supervised baseline that lost.
+    fitted: bool | None = None
     exhausted: bool = False
     unconstructible_fraction: float = 0.0
     repaired_fraction: float = 0.0

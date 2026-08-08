@@ -45,13 +45,17 @@ produced. Distance from the wild type then accumulates while the per-round
 budget does not. So every Ehrlich task here re-anchors, and its radius is the
 smallest one the audit put its own optimum inside the campaign's reach at.
 
-Two tasks are not like the others, and both for stated reasons. ``gb1-anchor``
-has four sites and a budget of four, so its ball is the whole space and there is
-nothing for an anchor to move towards. ``feasibility`` keeps a fixed anchor
-because what binds there is the transition matrix, not the radius. Leaving the
-anchor still is what keeps its attainable optimum an *enumerated* answer rather
-than a bracket, which is the difference between reporting a fact and reporting a
-search.
+Three tasks are not like the others, and all three for stated reasons. The two
+empirical anchors, ``gb1-anchor`` and ``trpb-anchor``, each have four measured
+sites and a budget of four, so each ball is that landscape's whole space and
+there is nothing for an anchor to move towards. That is a property to be checked
+per landscape and never inherited: it holds for both of these because both
+libraries vary four positions and nothing else, and it would fail the moment a
+task's sites outnumbered its budget -- at which point the task must re-anchor and
+its bound becomes a bracket. ``feasibility`` keeps a fixed anchor because what
+binds there is the transition matrix, not the radius. Leaving the anchor still is
+what keeps its attainable optimum an *enumerated* answer rather than a bracket,
+which is the difference between reporting a fact and reporting a search.
 
 The round-varying tasks are the ones this matters most for. Comparing 3x132
 against 8x48 asks whether many small rounds beat few large ones, and with a
@@ -83,6 +87,7 @@ from evogfn.benchmark.protocol import PLATE, Protocol, round_sweep
 from evogfn.benchmark.tasks import Attainable, Task
 from evogfn.landscapes.ehrlich import EhrlichLandscape
 from evogfn.landscapes.gb1 import GB1Landscape
+from evogfn.landscapes.trpb import TRPB_POSITIONS, TrpBLandscape
 from evogfn.metrics.diversity import diversity
 
 if TYPE_CHECKING:
@@ -99,6 +104,13 @@ if TYPE_CHECKING:
 #: GB1's four measured sites. Equal to the sequence length, so every variant in
 #: the published table is reachable and the anchor exercises no search radius.
 GB1_MUTATIONS = 4
+
+#: TrpB's four assayed active-site positions, and the per-round radius on
+#: ``trpb-anchor``. Taken from the landscape rather than written as ``4`` so that
+#: the claim the task rests on -- that the radius *equals* the number of sites,
+#: hence the ball is the whole 160,000-sequence library -- is structural rather
+#: than two literals happening to agree.
+TRPB_MUTATIONS = len(TRPB_POSITIONS)
 
 #: Per-round radius on the flagship task, at L=256. Four re-anchored rounds of
 #: this reach 248 substitutions -- the distance to the planted optimum -- while
@@ -273,6 +285,39 @@ MAIN: tuple[Task, ...] = (
         ),
     ),
     _task(
+        "trpb-anchor",
+        "Does the empirical result survive a second protein? Johnston et al.'s "
+        "four active-site positions of tryptophan synthase, a different assay "
+        "and a different reward geometry from GB1's -- and a harder one: 99.3% "
+        "of the 159,129 measured variants score below the wild type, against "
+        "90% for GB1, so there is far less gradient to climb. Same geometry as "
+        "gb1-anchor: four sites, no feasibility constraint, and a mutation "
+        "budget that reaches every sequence, so the bound below is an "
+        "enumeration rather than a search bracket.",
+        TrpBLandscape,
+        Protocol(rounds=4, batch_size=PLATE, max_mutations=TRPB_MUTATIONS, label="four plates"),
+        # GB1's special property, checked for this landscape rather than
+        # inherited from it: the four assayed positions *are* the sequence
+        # length, so the ball of radius four around ``VFVS`` is the entire
+        # 160,000-sequence library and there is nothing an anchor could move
+        # towards. One mutation per position is the environment's rule and it
+        # binds nothing here, since four positions admit four mutations.
+        reanchor=False,
+        # Audited for this landscape and not borrowed from ``gb1-anchor``:
+        # ``attainable_optimum`` enumerated all 160,000 reachable terminal states
+        # from ``VFVS`` at four mutations and found the maximum to be the
+        # landscape's own optimum, 2.4505 at ``AIKG`` -- which, like ``FWAA``,
+        # differs from the wild type at all four positions and so is exactly the
+        # design a narrower budget would have put out of reach. The regret floor
+        # is therefore genuinely zero, and ``whole_optimum`` is the declaration
+        # that says so by deferring to the landscape rather than by restating a
+        # number that would silently stop matching if the dataset were repinned.
+        attainable=Attainable.whole_optimum(
+            "exact: enumerated all 160,000 reachable terminal states at 4 mutations "
+            "over 4 sites, which is the whole TrpB library"
+        ),
+    ),
+    _task(
         "large-space",
         "Can the method search a space it cannot enumerate? Stanton et al.'s "
         "base configuration, L=256 with four motifs of length eight. The budget "
@@ -422,10 +467,53 @@ DIAGNOSTIC_ATTAINABLE = Attainable.exactly(
 #: ordering break and too few to characterise a distribution over instances,
 #: which is the honest scope: this replicates a result, it does not estimate how
 #: it varies.
+#:
+#: **Three was chosen a priori and has not been shown to be enough.**
+#: ``experiments/variance_pilot.py`` is what measures whether it is: it draws
+#: more instances at fewer seeds, separates the between-instance variance from
+#: the within-instance one, and applies a rule declared before the numbers.
+#: Until that has run this tuple is an assumption, and the report says so rather
+#: than letting the count pass for a design. Note that three draws cannot clear
+#: the sign-test floor at any seed count --
+#: [unanimity_floor][evogfn.benchmark.statistics.unanimity_floor] -- so the one
+#: thing already known about this value is that it is too small.
 REPLICATION_SEEDS: tuple[int, ...] = (3, 5, 7)
 
+#: How a replicate task's name is built, and the only place it is built. Read
+#: back by `replicate_instance`, so a rename cannot leave a parser matching the
+#: old shape -- which would silently report every replicate as belonging to no
+#: instance family, and a per-instance analysis over no families is a pooled one.
+_REPLICATE_NAME = "replicate-{shape}-i{draw}"
 
-def replication() -> tuple[Task, ...]:
+
+def replicate_instance(task: str) -> tuple[str, int] | None:
+    """Split a replicate task's name back into its protocol shape and its draw.
+
+    The inverse of the one format string `replication` builds names with, kept
+    beside it for that reason. Every reader that has to treat instance draws as
+    the unit of replication needs to know which tasks are draws *of the same
+    thing*, and a reader that re-derives it from a literal of its own is a
+    reader that stops agreeing with the suite the first time a name moves.
+
+    Args:
+        task: A task name.
+
+    Returns:
+        The ``(shape, draw)`` pair, or ``None`` when the name is not a
+        replicate's -- which is a real answer and not a failure: most tasks are
+        not replicates.
+    """
+    prefix, _, rest = _REPLICATE_NAME.partition("{shape}")
+    if not task.startswith(prefix):
+        return None
+    middle, _, _ = rest.partition("{draw}")
+    shape, separator, draw = task[len(prefix) :].rpartition(middle)
+    if not separator or not shape or not draw.isdigit():
+        return None
+    return shape, int(draw)
+
+
+def replication(draws: Sequence[int] = REPLICATION_SEEDS) -> tuple[Task, ...]:
     """The two protocol shapes, on landscape draws other than the shared one.
 
     Everything except the draw is held at the headline tasks' own settings --
@@ -433,9 +521,24 @@ def replication() -> tuple[Task, ...]:
     so a difference between a replicate and its headline task is a difference
     between instances and nothing else.
 
+    Args:
+        draws: Generator seeds to replicate across. Defaults to
+            `REPLICATION_SEEDS`, which is what the tier runs. A parameter rather
+            than a constant read inside, because the variance pilot has to build
+            tasks at *other* draws and a second builder written for it would
+            differ from this one in whatever the next edit here touched -- which
+            would leave the pilot sizing a design for tasks the tier does not
+            run.
+
     Returns:
         One task per (shape, draw), in a fixed order.
+
+    Raises:
+        ValueError: If a draw repeats, which would file two campaigns of the
+            same instance under one store key and read as two draws agreeing.
     """
+    if len(set(draws)) != len(tuple(draws)):
+        raise ValueError(f"landscape draws must be distinct, got {list(draws)}")
     shapes = (
         ("alde", Protocol(rounds=3, batch_size=132, max_mutations=ALDE_MUTATIONS, label="ALDE")),
         (
@@ -447,7 +550,7 @@ def replication() -> tuple[Task, ...]:
     )
     return tuple(
         _task(
-            f"replicate-{shape}-i{seed}",
+            _REPLICATE_NAME.format(shape=shape, draw=seed),
             f"Does the {shape} ordering survive a different landscape draw? Identical "
             f"to its headline task in every respect but the generator's seed.",
             _ehrlich(
@@ -475,7 +578,7 @@ def replication() -> tuple[Task, ...]:
             ),
         )
         for shape, protocol in shapes
-        for seed in REPLICATION_SEEDS
+        for seed in draws
     )
 
 
@@ -931,6 +1034,14 @@ def _sampler_fields(sampler: Sampler) -> dict[str, object]:
     reading in each case: an arm that breeds nothing bred nothing, and an arm
     that rejects nothing rejected nothing.
 
+    ``fitted`` is the one exception to that, and the exception is deliberate.
+    Zero is not its neutral value: an arm with no model to fit and an arm whose
+    model never fitted are opposite findings, and ``False`` would report the
+    first as the second on every classical row in the table. So its neutral
+    value is ``None`` -- read by attribute like the rest, defaulting to ``None``
+    rather than to a measurement. See
+    [RunRecord.fitted][evogfn.benchmark.store.RunRecord.fitted].
+
     One helper rather than the same block written at two call sites, and the
     reason is which two: the completed run and the run that raised. The
     exhausted one is where these numbers matter most -- the counters explaining
@@ -947,7 +1058,14 @@ def _sampler_fields(sampler: Sampler) -> dict[str, object]:
         Fields ready to pass to
         [ResultStore.stamp][evogfn.benchmark.store.ResultStore.stamp].
     """
+    fitted = getattr(sampler, "is_fitted", None)
     return {
+        # Read off the sampler the campaign *finished* with, which is what makes
+        # this answerable at all: `is_fitted` is state on the object, it is not
+        # derivable from anything the result carries, and a campaign that ended
+        # in its random-screening stage spends and proposes exactly what a fitted
+        # one does.
+        "fitted": None if fitted is None else bool(fitted),
         "proxy_calls": int(getattr(sampler, "proxy_calls", 0)),
         "bred_designs": int(getattr(sampler, "bred_designs", 0)),
         # The three rejection counters travel together or not at all: two of them
@@ -1322,6 +1440,15 @@ def records_to_metric(
     beside the row. A shorter array with nothing said about why is the absence
     this whole mechanism exists to end.
 
+    **Not the reader for**
+    [RunRecord.fitted][evogfn.benchmark.store.RunRecord.fitted]. Every field this
+    returns is a quantity to be averaged, and ``None`` is mapped to ``nan``
+    because for ``regret`` it means "no audit covers this task" -- an absence
+    that should propagate. ``fitted`` is tri-valued in a different way: ``None``
+    there means the arm fits nothing, so a column mixing classical and supervised
+    arms would come back all-``nan`` and the mean would say nothing rather than
+    saying "no arm fitted". `fit_status` is the reader for it.
+
     Args:
         records: Records by seed.
         seeds: The order to return them in.
@@ -1339,6 +1466,36 @@ def records_to_metric(
         value = getattr(record, metric)
         values.append(np.nan if value is None else float(value))
     return np.asarray(values, dtype=np.float64)
+
+
+def fit_status(records: Mapping[int, RunRecord], seeds: Sequence[int]) -> tuple[int, int]:
+    """How many of an arm's stored campaigns fit a model, and how many never did.
+
+    The counterpart to the ``exhausted`` count beside a mean: both are facts
+    about seeds that a column of averages cannot carry, and both change what the
+    row on that column *means* rather than what it says.
+
+    Exhausted records are **counted here**, unlike in `records_to_metric`, and
+    the difference is what each number is for. That drops them because it is
+    building a mean and they contribute no measurement. This is not building a
+    mean -- it is asking whether the arm ever got as far as its own model -- and
+    a campaign that exhausted in round one having never fitted is the sharpest
+    instance of exactly that, not a case to leave out.
+
+    Args:
+        records: Records by seed.
+        seeds: The seeds to look at.
+
+    Returns:
+        ``(reported, never)``: how many stored campaigns said anything about a
+        model fit at all, and how many of those said the model was never fitted.
+        ``reported`` at zero means this arm fits nothing -- or predates the field
+        -- and ``never`` is then meaningless rather than reassuring, which is why
+        the two are returned together and not as a bare count.
+    """
+    held = [record for seed in seeds if (record := records.get(seed)) is not None]
+    reported = [record for record in held if record.fitted is not None]
+    return len(reported), sum(1 for record in reported if not record.fitted)
 
 
 def _top_designs(result: CampaignResult, k: int = 10) -> list[list[int]]:

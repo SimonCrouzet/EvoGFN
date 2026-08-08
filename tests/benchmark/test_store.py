@@ -218,6 +218,44 @@ def test_a_record_without_a_fingerprint_is_treated_as_current(store):
     assert set(store.usable("t", "m")) == {0}
 
 
+class TestWhetherAModelWasFitted:
+    """``fitted`` is tri-valued, and the third value is the one doing the work.
+
+    ``True`` and ``False`` are measurements about an arm that fits something.
+    ``None`` says nobody measured -- either the arm has no model, or the record
+    predates the field. Collapsing ``None`` into ``False`` is what would let a
+    genetic algorithm be reported as a supervised method that never fitted, and
+    collapsing it the other way is what let a supervised arm that never fitted be
+    reported as one that fitted and lost.
+    """
+
+    def test_it_defaults_to_unmeasured_rather_than_to_a_verdict(self):
+        # `False` as the default would retroactively accuse every campaign
+        # already on disk of the failure this field was added to detect, and
+        # `True` would clear them all of it. Neither is something anyone
+        # measured.
+        assert RunRecord(**RECORD_FIELDS).fitted is None
+
+    def test_a_record_written_before_the_field_existed_still_loads(self, store):
+        # `load` builds by keyword from the stored payload and skips a line it
+        # cannot build a record from, so a required field would make every
+        # campaign already on disk vanish rather than fail loudly.
+        path = store.root / "t"
+        path.mkdir(parents=True)
+        (path / "m.jsonl").write_text(json.dumps(RECORD_FIELDS) + "\n")
+
+        assert store.load("t", "m")[0].fitted is None
+
+    @pytest.mark.parametrize("value", [True, False, None])
+    def test_every_state_survives_a_round_trip(self, store, value):
+        # `asdict` is what `append` serialises through and `RunRecord(**payload)`
+        # is what `load` rebuilds with. A `False` that came back as `None` would
+        # turn the finding into an absence on exactly the rows that carry it.
+        store.append(RunRecord(**RECORD_FIELDS, fitted=value))
+
+        assert store.load("t", "m")[0].fitted is value
+
+
 def test_cost_and_duplicate_fields_survive_a_round_trip(store):
     """Guards a cost column that reads back as zero for every arm.
 

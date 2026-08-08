@@ -128,6 +128,68 @@ errors can then sit within noise of each other and the ensemble can select a
 member with no ranking power at all. So the *variance* of running MLDE below its
 published training size is itself a cost, and it is a cost the budget note above
 is describing.
+
+The failure mode past the end of that: never fitting at all
+-----------------------------------------------------------
+
+There is a worse case than a weak fit, and it is not visible from the budget.
+`training_size` counts **usable** measurements, and
+[MLDE.observe][evogfn.algorithms.baselines.mlde.MLDE.observe] discards an
+infeasible assay -- there is no fitness to regress on -- while the campaign has
+already paid for the well. On a landscape with a transition constraint the
+screening plates therefore yield far fewer training examples than they cost: at a
+feasible share of 6%, 64 assays buy about four. Where that share is small enough
+the handover simply never happens, the campaign screens at random for its entire
+budget, and **the row in the results table is a random baseline reported under a
+supervised method's name**.
+
+Nothing about the spend says so. Such a campaign charges every oracle call its
+protocol allots, fills every plate, makes the same proposals, and reports a best
+value and a regret arithmetically indistinguishable from a fitted run's.
+[MLDE.is_fitted][evogfn.algorithms.baselines.mlde.MLDE.is_fitted] is the only
+thing that separates the two, which is why it is stored per campaign as
+[RunRecord.fitted][evogfn.benchmark.store.RunRecord.fitted] rather than left as
+state on an object the store never sees.
+
+Our adaptation: a training size a constrained screen can return
+---------------------------------------------------------------
+
+`ADAPTED_TRAINING_SIZE` and
+[MLDE.adapted][evogfn.algorithms.baselines.mlde.MLDE.adapted] are **ours**, and
+the distance between them and Wittmann et al. is the whole content of this
+section. Their protocol assumes an assay comes back with a number. Where 95% of
+wells come back with nothing to regress on, its supervised phase is not
+compressed and not handicapped but *unreachable at any budget a laboratory would
+run*: the training set grows at a twentieth of the rate the budget shrinks, so
+their 384 usable measurements would cost upwards of seven thousand assays.
+
+Lowering the training size is how the question *would MLDE be competitive here if
+it ever got to be MLDE?* can be asked at all. It is **not** a claim about what
+the published method does, and no row produced by this configuration may be
+labelled MLDE -- it exists to separate "loses because a constrained space suits
+it badly" from "loses because it never fitted", and only the first of those is a
+statement about MLDE. The benchmark arm is named for that: see ``mlde+earlyfit``
+in [evogfn.benchmark.methods][]'s ``BASELINES``.
+
+What it trades away is most of the method. At eight measurements the five-fold
+cross-validation that ranks the twelve members holds out one or two points a
+fold, so the ranking is very nearly arbitrary and the three members it averages
+are close to three drawn at random -- the variance the compression section above
+describes, at its limit. The fit itself is a kernel machine on eight points: it
+can express "resembles the good variants measured so far" and not much more. That
+is four times `_MIN_TRAINING`, where a ridge on one point is a constant ranking
+and a fit would be nominal -- reporting nothing in a second way -- but it is a
+twelfth of the 96 already called a compression above. So a favourable number from
+this arm is a *lower* bound on what a trained MLDE would do here, and an
+unfavourable one is evidence about the setting rather than about the method.
+
+One thing it deliberately is not: adaptive. The training size is a single stated
+number, not one derived per task from that task's own measured feasibility. A
+configuration that reads the landscape it is scored on is not one configuration
+but a family, tuned on its own test set, and such a family beats any fixed member
+of itself by construction. The cost of fixing it is that the number is right for
+the feasibility the suite measured and merely defensible elsewhere, which is the
+right way round.
 """
 
 from __future__ import annotations
@@ -172,6 +234,44 @@ DEFAULT_TRAINING_SIZE = 96
 #: Fewest measurements worth fitting. A ridge on one point predicts that point's
 #: value everywhere, which is a constant ranking and no ranking at all.
 _MIN_TRAINING = 2
+
+#: Share of a random screen's wells that return a number on the suite's
+#: ``feasibility`` task, over 100 stored seeds. Recorded here because it is what
+#: makes `ADAPTED_TRAINING_SIZE` arithmetic rather than a guess: about one well
+#: in twenty carries a fitness, and everything about the handover follows.
+CONSTRAINED_FEASIBLE_FRACTION = 0.053
+
+#: Plates in this repository's campaign budget, at `PUBLISHED_BATCH_SIZE` each.
+#: Stated here rather than imported from the benchmark protocol: a sampler that
+#: imports the harness's shape cannot be run outside it, and this number is here
+#: to derive a constant with, not to configure a campaign against.
+CAMPAIGN_PLATES = 4
+
+#: Training sample of **our** adapted arm, and not a compression of Wittmann et
+#: al.'s protocol but a departure from it -- see the module docstring for what it
+#: is for and what it gives up. The arithmetic that fixes it at 8:
+#:
+#: * The handover is tested when a plate is proposed, so it can only happen at a
+#:   round boundary. Leaving one full designed plate means reaching the training
+#:   size inside the first three, which is 288 screened wells.
+#: * At `CONSTRAINED_FEASIBLE_FRACTION` those 288 wells return 15.3 usable
+#:   measurements on average, with a standard deviation of 3.8. The count is
+#:   binomial and a campaign draws one sample from it, never the mean.
+#: * So 15 -- the mean, and the round-looking answer -- is a coin flip: half the
+#:   seeds land under it, end unfitted, and the arm reports one row that is two
+#:   methods. Two standard deviations below the mean is 7.7, and 8 is the integer
+#:   beside it. Exactly, rather than by that normal approximation: three plates
+#:   return 8 usable measurements on 98.7% of seeds against 97.1% for 9 and 56.5%
+#:   for 15, so 8 is also the largest training size reached at two-sigma
+#:   reliability. On 80% of seeds it is reached inside *two* plates, leaving two
+#:   designed plates rather than the one the derivation guarantees.
+#:
+#: The trade runs one way at each end. Above 8 the reliability falls off a cliff
+#: -- 15 is a coin flip -- and below it there is almost nothing left to buy: 6
+#: fits on 99.8% of seeds against 8's 98.7%, so a step down purchases one point
+#: of reliability with a quarter of the training set. Keep going and the floor is
+#: `_MIN_TRAINING`, where the fit is nominal and reports nothing in a second way.
+ADAPTED_TRAINING_SIZE = 8
 
 #: Rows of the candidate pool compared against the training set at a time. The
 #: kernel is an agreement count over positions, so the intermediate is
@@ -380,6 +480,16 @@ class MLDE(Sampler):
         # rather than a second copy of the same sampling code.
         self._explorer = RandomMutagenesis(env, feasible_only=feasible_only, seed=seed)
 
+        # Whether this object is the adapted arm, which
+        # [adapted][evogfn.algorithms.baselines.mlde.MLDE.adapted] sets and
+        # nothing else does. It labels rather than acts: `name` reaches the
+        # campaign's provenance record and `budget_note` reaches a results
+        # table, and on both the string "MLDE" beside a training size we chose
+        # would be somebody else's method's name on a configuration of ours. A
+        # caller who passes `training_size=ADAPTED_TRAINING_SIZE` by hand has
+        # built a small MLDE and correctly does not get the label.
+        self._is_adaptation = False
+
         self._sequences: list[Tokens] = []
         self._values: list[float] = []
         self._measured: set[bytes] = set()
@@ -427,10 +537,75 @@ class MLDE(Sampler):
             seed=seed,
         )
 
+    @classmethod
+    def adapted(
+        cls,
+        env: MutationEnvironment,
+        *,
+        feasible_only: bool = False,
+        seed: int = 0,
+    ) -> MLDE:
+        """Build **our** adaptation: a training size a constrained screen returns.
+
+        This is not Wittmann et al.'s protocol and it is not
+        [as_published][evogfn.algorithms.baselines.mlde.MLDE.as_published] at a
+        smaller budget. Their method assumes an assay returns a number; where
+        95% of wells return nothing to regress on, its supervised phase cannot be
+        reached at any budget a laboratory would run, and both the arms that do
+        run it -- the compressed default and the over-budget one -- screen at
+        random for the whole campaign and report a random baseline under a
+        supervised method's name. `ADAPTED_TRAINING_SIZE` is chosen so the
+        handover happens, which is the only way to ask what the ensemble would
+        have done with the wells it did get.
+
+        The consequence for a caller: a row from this configuration answers a
+        question about the *setting* and must be labelled as ours. The module
+        docstring says what the small sample costs -- the member selection is
+        close to arbitrary at eight points -- and `budget_note` will correctly
+        report the sample as 2% of the published one.
+
+        Args:
+            env: Supplies the parent, alphabet, mutation budget and feasibility.
+            feasible_only: Draw only constructible candidates.
+            seed: Seeds the random training sample and the candidate pool.
+
+        Returns:
+            An [MLDE][evogfn.algorithms.baselines.mlde.MLDE] trained on
+            `ADAPTED_TRAINING_SIZE` measurements, and labelled as ours.
+        """
+        sampler = cls(
+            env,
+            training_size=ADAPTED_TRAINING_SIZE,
+            feasible_only=feasible_only,
+            seed=seed,
+        )
+        # Set here rather than taken as a constructor argument: the only way to
+        # acquire the label is to build the arm this classmethod builds, and a
+        # flag a caller can pass is a flag a caller can pass wrongly -- in the
+        # direction that puts our configuration into a table under Wittmann et
+        # al.'s name, which is the one direction that matters.
+        sampler._is_adaptation = True
+        return sampler
+
     @property
     def name(self) -> str:
-        """Short label, marking whether feasibility is enforced."""
-        return "MLDE" + (" (feasible)" if self._feasible_only else "")
+        """Short label, marking our adaptation and whether feasibility is enforced.
+
+        The adaptation is marked because this string is not internal:
+        [Campaign][evogfn.loop.campaign.Campaign] writes it into the run's
+        provenance as the sampler that produced the designs. An unmarked "MLDE"
+        there, on a campaign trained on eight measurements because we chose
+        eight, is the published method's name on a configuration that is ours.
+        """
+        marks = [
+            mark
+            for mark, applies in (
+                ("adapted", self._is_adaptation),
+                ("feasible", self._feasible_only),
+            )
+            if applies
+        ]
+        return "MLDE" + (f" ({', '.join(marks)})" if marks else "")
 
     def reanchored(self, env: MutationEnvironment) -> MLDE:
         """Carry the whole method across the move. Nothing about it is anchored.
@@ -496,6 +671,10 @@ class MLDE(Sampler):
         # The roster carries the penalty sweep and kernel degrees the caller
         # chose, which the constructor above would otherwise reset to defaults.
         moved._roster = self._roster
+        # And the label carries too, or the arm would report itself as MLDE from
+        # the first moved anchor onward -- on a re-anchoring task that is most of
+        # the campaign, and the provenance record would name the published method.
+        moved._is_adaptation = self._is_adaptation
         moved._n_averaged = self._n_averaged
         moved._sequences = list(self._sequences)
         moved._values = list(self._values)
@@ -512,7 +691,26 @@ class MLDE(Sampler):
 
     @property
     def is_fitted(self) -> bool:
-        """Whether the ensemble has taken over from random screening."""
+        """Whether the ensemble has taken over from random screening.
+
+        **This is the only thing that distinguishes MLDE from random
+        mutagenesis in a finished campaign's numbers**, and it is read off the
+        sampler at the end of a run and stored as
+        [RunRecord.fitted][evogfn.benchmark.store.RunRecord.fitted] for exactly
+        that reason. A campaign whose handover never happened charges every
+        oracle call, fills every plate and reports a best value and a regret in
+        the same range as one whose handover did; nothing derivable from the
+        result says which it was.
+
+        ``False`` at the end of a campaign is therefore a finding rather than a
+        detail: it says the arm spent the whole budget in
+        [propose][evogfn.algorithms.baselines.mlde.MLDE.propose]'s screening
+        branch and the row it produced belongs to a random screen. See the
+        module docstring for how a feasibility constraint causes it.
+
+        Returns:
+            Whether a fit has been performed and not since discarded.
+        """
         return self._fitted is not None
 
     @property
@@ -566,12 +764,25 @@ class MLDE(Sampler):
             with the published one, so the compression is carried alongside the
             number rather than left in a docstring nobody reads.
         """
+        fraction = 100.0 * self._training_size / PUBLISHED_TRAINING_SIZE
+        if self._is_adaptation:
+            # A separate sentence rather than the compression one below, because
+            # "a handicapped MLDE" would be the wrong disclosure here: this arm
+            # is not their protocol run short of data, it is their pipeline at a
+            # training size we derived from the suite's own measured feasibility.
+            # A reader who took the row for MLDE would be reading eight
+            # measurements as the published method.
+            return (
+                f"trained on {self._training_size} variants, {fraction:.0f}% of Wittmann et al.'s "
+                f"{PUBLISHED_TRAINING_SIZE}; this is our adaptation and not their protocol -- the "
+                f"training size is ours, set so the handover can happen where most assays return "
+                f"nothing to regress on, and no row from it may be quoted as MLDE"
+            )
         if not self.runs_below_published_training_size:
             return (
                 f"trained on {self._training_size} variants, at or above Wittmann et al.'s "
                 f"{PUBLISHED_TRAINING_SIZE}; needs {self.required_budget} assays in total"
             )
-        fraction = 100.0 * self._training_size / PUBLISHED_TRAINING_SIZE
         return (
             f"trained on {self._training_size} variants, {fraction:.0f}% of Wittmann et al.'s "
             f"{PUBLISHED_TRAINING_SIZE}; the published protocol needs {PUBLISHED_BUDGET} assays "
@@ -631,6 +842,15 @@ class MLDE(Sampler):
 
     def observe(self, sequences: Tokens, values: Fitness) -> None:
         """Add measurements to the training set and mark the model out of date.
+
+        A non-finite value is **charged but not learned from**: the campaign has
+        already spent the well, and an infeasible or failed assay carries no
+        fitness to regress on. So on a constrained landscape the training set
+        grows far more slowly than the budget shrinks, and the handover this
+        gates can be delayed past the end of the campaign entirely -- see the
+        module docstring, and
+        [is_fitted][evogfn.algorithms.baselines.mlde.MLDE.is_fitted] for how a
+        finished run says which happened.
 
         Args:
             sequences: The evaluated candidates.
