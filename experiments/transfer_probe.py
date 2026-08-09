@@ -134,6 +134,66 @@ CAPACITY_CONTROL = "plain-wide-transferred"
 _MIN_PAIRED = 2
 
 
+def _measured(values: np.ndarray) -> np.ndarray:
+    """Which entries are a measurement rather than the absence of one.
+
+    A campaign whose every proposal was infeasible finishes normally: it spent
+    its plate, it was not `exhausted`, and it
+    measured nothing. `records_to_metric` keeps
+    it -- correctly, since it did not fail -- and its ``best`` is ``-inf`` and
+    its ``regret`` ``+inf``. One such seed takes the arm's mean to infinity, and
+    ``nanmean`` does not help because an infinity is not a ``nan``.
+
+    So the filtering happens here, in the caller that reports the mean, which is
+    where `records_to_metric` says it belongs.
+
+    Args:
+        values: One metric, in seed order.
+
+    Returns:
+        A boolean mask of the entries that carry a number.
+    """
+    return np.isfinite(values)
+
+
+def _unmeasured_note(values: np.ndarray) -> str:
+    """How many seeds an arm proposed nothing measurable on.
+
+    Printed beside the mean rather than folded into it. An arm that measured
+    nothing on a fifth of its seeds and holds a good mean on the rest is not the
+    same arm as one that measured everything, and a bare mean cannot say which
+    of the two is being read.
+
+    Args:
+        values: One metric, in seed order.
+
+    Returns:
+        A fragment, empty when every seed measured something.
+    """
+    missing = int((~_measured(values)).sum())
+    return f"  [{missing} measured nothing]" if missing else ""
+
+
+def _paired_finite(mine: np.ndarray, theirs: np.ndarray) -> tuple[np.ndarray, np.ndarray, int]:
+    """Restrict a pair of arrays to the seeds where both measured something.
+
+    Both, not either: dropping one side alone would compare an arm on its good
+    seeds against a reference on all of them, which flatters whichever arm
+    failed more often. Dropping the pair keeps the comparison paired, and the
+    count comes back so the caller can say what it cost.
+
+    Args:
+        mine: One arm's metric, in seed order.
+        theirs: The reference's, over the same seeds.
+
+    Returns:
+        The two arrays restricted to shared measured seeds, and how many pairs
+        that dropped.
+    """
+    keep = _measured(mine) & _measured(theirs)
+    return mine[keep], theirs[keep], int((~keep).sum())
+
+
 def report(store: ResultStore, seeds: list[int], reference: str = REFERENCE_ARM) -> str:
     """Read the store and pair every arm against one, at each distance.
 
@@ -169,11 +229,16 @@ def report(store: ResultStore, seeds: list[int], reference: str = REFERENCE_ARM)
             regret = records_to_metric(records, seeds, "regret")
             best = records_to_metric(records, seeds, "best")
             spread = records_to_metric(records, seeds, "diversity")
-            error = regret.std(ddof=1) / len(regret) ** 0.5 if len(regret) > 1 else 0.0
+            held_regret = regret[_measured(regret)]
+            error = (
+                held_regret.std(ddof=1) / len(held_regret) ** 0.5 if len(held_regret) > 1 else 0.0
+            )
+            mean = np.nanmean(held_regret) if len(held_regret) else float("nan")
             lines.append(
-                f"  {name:<24} regret {np.nanmean(regret):>7.4f} +/- {error:<7.4f} "
-                f"best {np.nanmean(best):>7.4f}  div {np.nanmean(spread):>5.2f}  "
-                f"n={len(regret)}"
+                f"  {name:<24} regret {mean:>7.4f} +/- {error:<7.4f} "
+                f"best {np.nanmean(best[_measured(best)]):>7.4f}  "
+                f"div {np.nanmean(spread):>5.2f}  "
+                f"n={len(held_regret)}{_unmeasured_note(regret)}"
             )
 
         base = held.get(reference)
@@ -188,10 +253,15 @@ def report(store: ResultStore, seeds: list[int], reference: str = REFERENCE_ARM)
                 continue
             mine = records_to_metric(held[name], shared, "regret")
             theirs = records_to_metric(base, shared, "regret")
-            if len(mine) != len(theirs) or len(mine) < _MIN_PAIRED:
+            if len(mine) != len(theirs):
+                continue
+            mine, theirs, dropped = _paired_finite(mine, theirs)
+            if len(mine) < _MIN_PAIRED:
+                lines.append(f"    {name}: no paired seed where both measured something")
                 continue
             outcome = compare(name, mine, theirs, higher_is_better=False)
-            lines.append(f"    {outcome!r}")
+            cost = f"  ({dropped} pairs dropped: one side measured nothing)" if dropped else ""
+            lines.append(f"    {outcome!r}{cost}")
             if not outcome.significant and (needed := seeds_needed(outcome)):
                 lines.append(f"        inconclusive; ~{needed} seeds would resolve this")
     lines.append(_interaction(store, seeds))
@@ -316,9 +386,11 @@ def _interaction(store: ResultStore, seeds: list[int]) -> str:
         shared = [s for s in seeds if s in mine and s in theirs]
         if len(shared) < _MIN_PAIRED:
             return f"\ninteraction: too few paired seeds at {level} to compute it"
-        advantage[level] = records_to_metric(theirs, shared, "regret") - records_to_metric(
-            mine, shared, "regret"
+        reference, policy_regret, _ = _paired_finite(
+            records_to_metric(theirs, shared, "regret"),
+            records_to_metric(mine, shared, "regret"),
         )
+        advantage[level] = reference - policy_regret
     if len(advantage["near"]) != len(advantage["far"]):
         return "\ninteraction: the two levels do not share a seed set, so nothing is paired"
     outcome = compare(
