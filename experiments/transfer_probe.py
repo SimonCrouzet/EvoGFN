@@ -104,7 +104,7 @@ from evogfn.benchmark.transfer import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
+    from collections.abc import Mapping, Sequence
 
     from evogfn.benchmark.store import RunRecord
 
@@ -134,64 +134,117 @@ CAPACITY_CONTROL = "plain-wide-transferred"
 _MIN_PAIRED = 2
 
 
-def _measured(values: np.ndarray) -> np.ndarray:
-    """Which entries are a measurement rather than the absence of one.
+#: What a campaign that measured nothing scores, in the landscape's own units.
+#:
+#: An Ehrlich fitness is a product of per-motif terms in ``[0, 1]`` and is zero
+#: when a motif is absent, so zero is the worst *finite* fitness the landscape
+#: defines. It is read off the landscape rather than chosen for the table, which
+#: is the whole reason this convention can be stated in one line of a caption.
+_WORST_FITNESS = 0.0
+
+#: Stated in the report itself, because a mean computed under a convention and a
+#: mean computed without one are different numbers that print identically.
+_SCORING_RULE = (
+    "  scoring: a campaign that proposed nothing feasible finished and measured "
+    f"nothing; it is scored at the landscape's worst fitness ({_WORST_FITNESS:.1f}), "
+    "not dropped"
+)
+
+
+def _worst_case(record: RunRecord, metric: str) -> float | None:
+    """What one metric reads when a campaign measured nothing.
+
+    ``regret`` is stored as ``attainable_lower - best``, so the worst case is
+    the audited attainable optimum less the landscape's worst fitness -- a
+    per-seed quantity, since attainability is audited per anchor and a single
+    constant across seeds would be a different and wrong number.
+
+    Args:
+        record: The campaign that measured nothing.
+        metric: Field being scored.
+
+    Returns:
+        The score, or ``None`` when this metric has no worst case to give --
+        diversity over an empty plate is undefined rather than bad.
+    """
+    if metric == "best":
+        return _WORST_FITNESS
+    if metric != "regret":
+        return None
+    lower = record.parameters.get("attainable_lower")
+    return None if lower is None else float(lower) - _WORST_FITNESS
+
+
+def _scored(
+    records: Mapping[int, RunRecord], seeds: Sequence[int], metric: str
+) -> tuple[np.ndarray, int, int]:
+    """One metric per seed, with unmeasured seeds scored rather than dropped.
 
     A campaign whose every proposal was infeasible finishes normally: it spent
     its plate, it was not `exhausted`, and it
-    measured nothing. `records_to_metric` keeps
-    it -- correctly, since it did not fail -- and its ``best`` is ``-inf`` and
-    its ``regret`` ``+inf``. One such seed takes the arm's mean to infinity, and
-    ``nanmean`` does not help because an infinity is not a ``nan``.
+    measured nothing, so its ``best`` is ``-inf`` and its ``regret`` ``+inf``.
+    One such seed takes the arm's mean to infinity, and ``nanmean`` does not
+    help because an infinity is not a ``nan``.
 
-    So the filtering happens here, in the caller that reports the mean, which is
-    where `records_to_metric` says it belongs.
+    Dropping those seeds would report the arm's mean over the seeds it happened
+    to succeed on, which flatters whichever arm failed most often. Scoring them
+    at the landscape's worst fitness keeps every seed in every arm, so the seed
+    sets stay identical and the comparison stays paired. What it costs is that
+    the mean is then part measurement and part convention -- hence the count
+    returned beside it, and `_SCORING_RULE` printed above the table.
+
+    Ordering mirrors `records_to_metric`
+    exactly -- seeds in the given order, absent and exhausted seeds skipped --
+    because the two are read side by side.
 
     Args:
-        values: One metric, in seed order.
+        records: Records by seed.
+        seeds: The order to return them in.
+        metric: Field name.
 
     Returns:
-        A boolean mask of the entries that carry a number.
+        ``(values, scored, unscorable)``: the metric, how many entries were
+        scored rather than measured, and how many measured nothing *and* had no
+        worst case to score them at.
     """
-    return np.isfinite(values)
+    values: list[float] = []
+    scored = 0
+    unscorable = 0
+    for seed in seeds:
+        record = records.get(seed)
+        if record is None or record.exhausted:
+            continue
+        raw = getattr(record, metric)
+        value = float("nan") if raw is None else float(raw)
+        if np.isfinite(value):
+            values.append(value)
+            continue
+        floor = _worst_case(record, metric)
+        if floor is None:
+            unscorable += 1
+            values.append(float("nan"))
+            continue
+        scored += 1
+        values.append(floor)
+    return np.asarray(values, dtype=np.float64), scored, unscorable
 
 
-def _unmeasured_note(values: np.ndarray) -> str:
-    """How many seeds an arm proposed nothing measurable on.
-
-    Printed beside the mean rather than folded into it. An arm that measured
-    nothing on a fifth of its seeds and holds a good mean on the rest is not the
-    same arm as one that measured everything, and a bare mean cannot say which
-    of the two is being read.
+def _scored_note(scored: int, unscorable: int) -> str:
+    """How much of a mean is convention rather than measurement.
 
     Args:
-        values: One metric, in seed order.
+        scored: Seeds scored at the worst case.
+        unscorable: Seeds that measured nothing and could not be scored.
 
     Returns:
         A fragment, empty when every seed measured something.
     """
-    missing = int((~_measured(values)).sum())
-    return f"  [{missing} measured nothing]" if missing else ""
-
-
-def _paired_finite(mine: np.ndarray, theirs: np.ndarray) -> tuple[np.ndarray, np.ndarray, int]:
-    """Restrict a pair of arrays to the seeds where both measured something.
-
-    Both, not either: dropping one side alone would compare an arm on its good
-    seeds against a reference on all of them, which flatters whichever arm
-    failed more often. Dropping the pair keeps the comparison paired, and the
-    count comes back so the caller can say what it cost.
-
-    Args:
-        mine: One arm's metric, in seed order.
-        theirs: The reference's, over the same seeds.
-
-    Returns:
-        The two arrays restricted to shared measured seeds, and how many pairs
-        that dropped.
-    """
-    keep = _measured(mine) & _measured(theirs)
-    return mine[keep], theirs[keep], int((~keep).sum())
+    parts = []
+    if scored:
+        parts.append(f"{scored} scored at worst")
+    if unscorable:
+        parts.append(f"{unscorable} unscorable")
+    return f"  [{', '.join(parts)}]" if parts else ""
 
 
 def report(store: ResultStore, seeds: list[int], reference: str = REFERENCE_ARM) -> str:
@@ -212,7 +265,10 @@ def report(store: ResultStore, seeds: list[int], reference: str = REFERENCE_ARM)
     Returns:
         A multi-line report.
     """
-    lines = ["\n=== transfer probe -- diagnostic; licenses no method ranking"]
+    lines = [
+        "\n=== transfer probe -- diagnostic; licenses no method ranking",
+        _SCORING_RULE,
+    ]
     for level in LEVELS:
         task = task_name(level)
         held = {name: store.usable(task, name) for name in ARM_NAMES}
@@ -226,19 +282,17 @@ def report(store: ResultStore, seeds: list[int], reference: str = REFERENCE_ARM)
             records = held[name]
             if not records:
                 continue
-            regret = records_to_metric(records, seeds, "regret")
-            best = records_to_metric(records, seeds, "best")
+            regret, scored, unscorable = _scored(records, seeds, "regret")
+            best, _, _ = _scored(records, seeds, "best")
             spread = records_to_metric(records, seeds, "diversity")
-            held_regret = regret[_measured(regret)]
-            error = (
-                held_regret.std(ddof=1) / len(held_regret) ** 0.5 if len(held_regret) > 1 else 0.0
-            )
-            mean = np.nanmean(held_regret) if len(held_regret) else float("nan")
+            usable = regret[np.isfinite(regret)]
+            error = usable.std(ddof=1) / len(usable) ** 0.5 if len(usable) > 1 else 0.0
+            mean = np.nanmean(usable) if len(usable) else float("nan")
             lines.append(
                 f"  {name:<24} regret {mean:>7.4f} +/- {error:<7.4f} "
-                f"best {np.nanmean(best[_measured(best)]):>7.4f}  "
-                f"div {np.nanmean(spread):>5.2f}  "
-                f"n={len(held_regret)}{_unmeasured_note(regret)}"
+                f"best {np.nanmean(best[np.isfinite(best)]):>7.4f}  "
+                f"div {np.nanmean(spread[np.isfinite(spread)]):>5.2f}  "
+                f"n={len(regret)}{_scored_note(scored, unscorable)}"
             )
 
         base = held.get(reference)
@@ -251,16 +305,17 @@ def report(store: ResultStore, seeds: list[int], reference: str = REFERENCE_ARM)
         for name in ARM_NAMES:
             if name == reference or not held[name]:
                 continue
-            mine = records_to_metric(held[name], shared, "regret")
-            theirs = records_to_metric(base, shared, "regret")
+            mine, scored, _ = _scored(held[name], shared, "regret")
+            theirs, _, _ = _scored(base, shared, "regret")
             if len(mine) != len(theirs):
                 continue
-            mine, theirs, dropped = _paired_finite(mine, theirs)
+            keep = np.isfinite(mine) & np.isfinite(theirs)
+            mine, theirs = mine[keep], theirs[keep]
             if len(mine) < _MIN_PAIRED:
-                lines.append(f"    {name}: no paired seed where both measured something")
+                lines.append(f"    {name}: no paired seed where both could be scored")
                 continue
             outcome = compare(name, mine, theirs, higher_is_better=False)
-            cost = f"  ({dropped} pairs dropped: one side measured nothing)" if dropped else ""
+            cost = f"  ({scored} of its seeds scored at worst)" if scored else ""
             lines.append(f"    {outcome!r}{cost}")
             if not outcome.significant and (needed := seeds_needed(outcome)):
                 lines.append(f"        inconclusive; ~{needed} seeds would resolve this")
@@ -386,11 +441,10 @@ def _interaction(store: ResultStore, seeds: list[int]) -> str:
         shared = [s for s in seeds if s in mine and s in theirs]
         if len(shared) < _MIN_PAIRED:
             return f"\ninteraction: too few paired seeds at {level} to compute it"
-        reference, policy_regret, _ = _paired_finite(
-            records_to_metric(theirs, shared, "regret"),
-            records_to_metric(mine, shared, "regret"),
-        )
-        advantage[level] = reference - policy_regret
+        reference, _, _ = _scored(theirs, shared, "regret")
+        policy_regret, _, _ = _scored(mine, shared, "regret")
+        keep = np.isfinite(reference) & np.isfinite(policy_regret)
+        advantage[level] = reference[keep] - policy_regret[keep]
     if len(advantage["near"]) != len(advantage["far"]):
         return "\ninteraction: the two levels do not share a seed set, so nothing is paired"
     outcome = compare(
