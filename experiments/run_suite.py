@@ -502,7 +502,35 @@ def mechanism_ablations() -> dict[str, str]:
         Arm name to the shipped arm it decomposes.
     """
     base = shipped_base().name
-    return {name: base for name in variant_arms() if name != base}
+    return {name: base for name in (*variant_arms(), *_reinit_rung()) if name != base}
+
+
+#: The rung that switches amortisation off, and the one rung `variant_arms` does
+#: not build.
+#:
+#: ``carry_policy`` off discards the trained weights at every anchor move and
+#: rebuilds from the campaign's own stream -- at identical gradient steps, an
+#: identical proxy spend and, at the opening anchor, identical weights. The arm
+#: therefore differs from the shipped one in exactly one thing: whether what was
+#: learned at the previous parent survives the move.
+#:
+#: It is built here rather than in
+#: [variant_arms][evogfn.benchmark.methods.variant_arms] because it is not a
+#: mechanism added on top of the shipped arm; it is the shipped arm's own
+#: mechanism switched off. The flag has existed in
+#: [gflownet][evogfn.benchmark.methods.gflownet] since the method was written,
+#: is named there as "what *amortisation* means here", and has never been run.
+REINIT_RUNG = "+reinit"
+
+
+def _reinit_rung() -> dict[str, object]:
+    """The shipped arm with amortisation removed.
+
+    Returns:
+        One arm, by name.
+    """
+    base = shipped_base()
+    return {f"{base.name}{REINIT_RUNG}": base.rung(carry_policy=False)}
 
 
 def _reproduced_on(task: Task) -> dict[str, str]:
@@ -523,7 +551,16 @@ def _reproduced_on(task: Task) -> dict[str, str]:
         [reproduced_rungs][evogfn.benchmark.methods.reproduced_rungs], so a task
         that gains a transition matrix starts being measured with no edit here.
     """
-    return reproduced_rungs(task=task)
+    reproduced = dict(reproduced_rungs(task=task))
+    if not task.reanchor:
+        # Nothing can survive a move the task never makes. With a fixed anchor
+        # the policy is built once and `carry_policy` never fires, so this rung
+        # is the base arm under a second name -- the same relation `+terminal`
+        # has to the base where nothing constrains construction, and it gets the
+        # same treatment: reproduced at report time, never stored.
+        base = shipped_base().name
+        reproduced[f"{base}{REINIT_RUNG}"] = base
+    return reproduced
 
 
 def _reproduce(
@@ -569,13 +606,19 @@ def _reproduce(
     for rung, source in sorted(copies.items()):
         stored = store.usable(task.name, rung)
         if stored:
+            why = (
+                "this task never moves its anchor, so there is no move for a carried "
+                "policy to survive and the two arms are one campaign"
+                if rung.endswith(REINIT_RUNG)
+                else "nothing on this task constrains construction, so the two arms "
+                "build the identical graph"
+            )
             raise ValueError(
                 f"{task.name}/{rung}: the store holds {len(stored)} campaigns for a row this "
-                f"suite reproduces from {source}, because nothing on this task constrains "
-                f"construction and the two arms build the identical graph. Both claims cannot "
-                f"hold: either the task now has a transition matrix, and the rung must be run "
-                f"and this reproduction dropped, or those records describe a task that no "
-                f"longer exists and must be deleted"
+                f"suite reproduces from {source}, because {why}. Both claims cannot hold: "
+                f"either the task changed and the rung is now measurable, in which case it "
+                f"must be run and this reproduction dropped, or those records describe a task "
+                f"that no longer exists and must be deleted"
             )
         if held.get(source):
             held[rung] = held[source]
@@ -610,7 +653,10 @@ def _mechanism_rungs(arms: Mapping[str, object]) -> dict[str, object]:
             f"what this project ships, and reporting both would put two configurations "
             f"of one method in the headline table"
         )
-    return {name: arm for name, arm in variant_arms().items() if name != base}
+    return {
+        **{name: arm for name, arm in variant_arms().items() if name != base},
+        **_reinit_rung(),
+    }
 
 
 #: Arms held back from every tier while a defect in them is being diagnosed.
