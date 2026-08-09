@@ -9,12 +9,13 @@ and a second invocation runs only what is missing.
     uv run python experiments/run_multi_objective.py --seeds 50      # raise the count
     uv run python experiments/run_multi_objective.py --report        # no runs, just read
 
-Results land under ``results-mo/`` -- a different root from the single-objective
-suite on purpose. The two score different columns: there ``best`` is a fitness
-and ``regret`` is a distance to an audited optimum, here ``best`` is a
-hypervolume and ``regret`` is IGD+. Sharing a directory would let one table be
-built across both, and nothing in a record would say the columns meant different
-things.
+Results land in ``results/``, under this suite's own task names. The columns do
+mean something different from the single-objective suite's -- there ``best`` is a
+fitness and ``regret`` a distance to an audited optimum, here ``best`` is a
+hypervolume and ``regret`` is IGD+ -- but the **task name** is what carries that,
+not the directory. The store keys by ``(task, method, seed)`` and every reader
+names the tasks it wants, so a separate root only added a second place to look
+for results.
 
 The tiers differ in role, not just in seed count
 ------------------------------------------------
@@ -90,8 +91,9 @@ MAIN_SEEDS = 50
 #: Seeds for the explanatory sweeps and the preference diagnostic.
 EXPLANATORY_SEEDS = 30
 
-#: Where results go. Deliberately not ``results/``: see the module docstring.
-DEFAULT_RESULTS = "results-mo"
+#: Where results go. One root for every suite; the task name is what says what
+#: this suite's indicators mean -- see the module docstring.
+DEFAULT_RESULTS = "results"
 
 #: The arm every other one is compared against: a weighted-sum genetic algorithm,
 #: bare, which is the pipeline a lab already runs and therefore the only thing a

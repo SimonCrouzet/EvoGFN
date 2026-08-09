@@ -21,12 +21,14 @@ again, because a trained policy cannot be reconstructed from a stored number --
 so the cheapest way to add arms is to add them before running, and the cheapest
 way to add seeds is simply to raise the count.
 
-Results land under ``results-transfer/`` -- a different root from both other
-suites, on purpose. ``best`` here is the best value in **one frozen plate at a
-moved anchor**, not the best of a four-round campaign, and ``regret`` is taken
-against *that anchor's* audited optimum rather than a task's. Sharing a directory
-would let one table be built across both and nothing in a record would say the
-columns meant different things.
+Results land in ``results/``, under the task names ``transfer-probe-near`` and
+``transfer-probe-far``. The columns here do mean something different -- ``best``
+is the best value in **one frozen plate at a moved anchor**, not the best of a
+four-round campaign, and ``regret`` is taken against *that anchor's* audited
+optimum rather than a task's -- but the **task name** is what carries that, not
+the directory. The store keys by ``(task, method, seed)`` and every reader names
+the tasks it wants, so a separate root only added a second place to look for
+results.
 
 ## The screening deviation, stated where the numbers are read
 
@@ -112,9 +114,9 @@ if TYPE_CHECKING:
 #: pair and the same screening surrogate across every arm within a seed.
 DEFAULT_SEEDS = 100
 
-#: Where results go. Deliberately not ``results/`` or ``results-mo/``: see the
-#: module docstring on what ``best`` and ``regret`` mean here.
-DEFAULT_RESULTS = "results-transfer"
+#: Where results go. One root for every suite; the task name is what says what
+#: ``best`` and ``regret`` mean here -- see the module docstring.
+DEFAULT_RESULTS = "results"
 
 #: What criterion 1 is measured against -- the floor for "did anything transfer".
 #: Named here because `report` pairs everything against it, and because reading a
