@@ -613,6 +613,27 @@ def _mechanism_rungs(arms: Mapping[str, object]) -> dict[str, object]:
     return {name: arm for name, arm in variant_arms().items() if name != base}
 
 
+#: Arms held back from every tier while a defect in them is being diagnosed.
+#:
+#: On `protocol-alde`, which has a live transition matrix, both terminal rungs
+#: returned regret 0.8750 with a standard error of exactly zero over 31 seeds,
+#: and returned it *identically to each other* -- which cannot be right, since
+#: they differ by anchor conditioning and both mechanisms are active there. A
+#: constant with no variance is what a sampler that never searches produces, so
+#: the number is treated as a defect until something says otherwise rather than
+#: as evidence that the mechanism fails.
+#:
+#: Suspending here rather than deleting the arms keeps the ladder's shape and
+#: the stored campaigns intact, so the moment the diagnosis lands this is one
+#: line to revert and the tier resumes where it stopped.
+SUSPENDED_ARMS = frozenset(
+    {
+        "gfn-subtb@b0.1-s300-l0.9-h64+terminal",
+        "gfn-subtb@b0.1-s300-l0.9-h64+terminal+anchor",
+    }
+)
+
+
 def methods_for(tier: Tier) -> dict[str, object]:
     """Which methodologies a tier runs.
 
@@ -695,6 +716,11 @@ def methods_for(tier: Tier) -> dict[str, object]:
         # budget cannot hold constant. See `BUDGET_AXIS_TIERS`.
         for name in OVER_BUDGET_ARMS:
             arms.pop(name, None)
+    # Applied last, and to every tier: a suspended arm is one whose stored
+    # numbers are not believed, so it must not reach a table by any route while
+    # that is true. See `SUSPENDED_ARMS`.
+    for name in SUSPENDED_ARMS:
+        arms.pop(name, None)
     return arms
 
 
