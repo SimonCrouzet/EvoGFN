@@ -8,35 +8,21 @@ every combination of the **16 somatic mutations** that separate the mature antib
 from its inferred unmutated common ancestor. That is $2^{16} = 65{,}536$ variants,
 of which **62,926 (96%) cleared quality control on all three antigens**.
 
-## Why this landscape is here
-
-It is the first landscape in this package that is genuinely multi-objective.
-[GB1Landscape][evogfn.landscapes.gb1.GB1Landscape] and
-[TrpBLandscape][evogfn.landscapes.trpb.TrpBLandscape] each return one number, so
-every multi-objective component in this package -- the scalarisations, the Pareto
-indicators, the preference-conditioned reward -- was unreachable from a real
-dataset and testable only against synthetic vectors. A scalarisation that is only
-ever exercised on made-up numbers is not evidence of anything.
-
-The trade-off here is also real rather than constructed. Affinity maturation
-towards one antigen costs affinity towards another: the three objectives are the
-same antibody assayed against a 1990 strain, an escape mutant of it, and a 2006
-strain, and the paper's subject is precisely that breadth and potency pull in
-different directions. There is no scalar ordering of the three that the biology
-hands over.
+It is the only genuinely multi-objective landscape in this package, and the
+trade-off is the paper's own subject: the three objectives are the same antibody
+assayed against a 1990 strain, an escape mutant of it, and a 2006 strain, and
+affinity maturation towards one costs affinity towards another.
 
 ## The space is a Boolean subset lattice
 
-Every one of the 16 sites is **binary**: germline residue or mature residue,
-nothing else. The alphabet therefore has size 2, and a variant is a *subset* of
-applied somatic mutations.
+Every one of the 16 sites is **binary**: germline residue or mature residue. The
+alphabet has size 2, and a variant is a *subset* of applied somatic mutations.
 
 That is exactly the graph
 [MutationEnvironment][evogfn.env.mutation.MutationEnvironment] already models. In
 that environment a position may be mutated at most once, which on a binary
 alphabet means the reachable set from the germline is the full subset lattice and
-nothing is masked away artificially. The equality is worth stating because on GB1
-and TrpB the environment's one-mutation-per-position rule is a modelling
+nothing is masked away artificially. On GB1 and TrpB the same rule is a modelling
 restriction imposed on a 20-letter space; here it is the assay's own structure.
 
 The 16 mutations, in the order the authors index them, are six in the light chain
@@ -60,9 +46,9 @@ Each value is the replicate mean of
 
 $$f_a(x) = -\log_{10} K_D(x, a)$$
 
-with $K_D$ in molar, so **higher is better** and the whole package's maximisation
-convention holds without a sign flip. Values run from 6.0 to 10.53, which is 4
-orders of magnitude in affinity.
+with $K_D$ in molar, so **higher is better** and the package's maximisation
+convention holds without a sign flip. Values run from 6.0 to 10.53, four orders
+of magnitude in affinity.
 
 ## Left-censoring, stated per objective
 
@@ -70,7 +56,7 @@ Tite-Seq has a detection floor. A variant whose affinity is weaker than
 $K_D = 10^{-6}\,\mathrm{M}$ produces no titration curve to fit, and the authors
 pin it to the boundary at exactly `6.0`. **That number is a bound, not a
 measurement**: two variants both reported at 6.0 may differ by any amount below
-the floor, and nothing in the value says so.
+the floor.
 
 Of the 62,926 retained variants, the fraction reported at the floor is:
 
@@ -80,65 +66,58 @@ Of the 62,926 retained variants, the fraction reported at the floor is:
 | `affinity_MA90_G189E` | 9,451 | **15.02%** |
 | `affinity_SI06` | 29,847 | **47.43%** |
 
-This class does **not** impute, drop or otherwise repair those values. It reports
-them as the authors published them and exposes
+This class does **not** impute, drop or repair those values. It reports them as
+published and exposes
 [CH65Landscape.is_censored][evogfn.landscapes.ch65.CH65Landscape.is_censored],
-which answers per variant *and per objective*, so an analysis can exclude them, fit
-a censored likelihood, or knowingly ignore the issue -- but cannot do the last one
-by accident.
+which answers per variant *and per objective*, so an analysis can exclude them,
+fit a censored likelihood, or knowingly ignore the issue -- but cannot do the
+last by accident.
 
-The per-objective breakdown is the whole point. The sibling CR9114 library from the
-same lab is unusable for multi-objective work precisely because its second and
-third objectives are ~97% censored, which makes them constant rather than
-informative; a single pooled censoring figure would have hidden that. Here the
-asymmetry is large but survivable: MA90 is uncensored, SI06 is censored for nearly
-half the library, and any conclusion that rests on SI06 ordering within the
-censored half is an artefact.
+The per-objective breakdown matters. The sibling CR9114 library from the same lab
+is unusable for multi-objective work because its second and third objectives are
+~97% censored, which makes them constant rather than informative; a single pooled
+figure would hide that. Here MA90 is uncensored and SI06 is censored for nearly
+half the library, so any conclusion resting on SI06 ordering within the censored
+half is an artefact.
 
-There is no right-censoring. The strongest measured affinities are isolated points
-(10.53, 10.33, 9.76 on the three antigens) with no pile-up at a ceiling.
+There is no right-censoring: the strongest measured affinities are isolated points
+(10.53, 10.33, 9.76) with no pile-up at a ceiling.
 
-## What "wild type" means here, and why the ancestor is the parent
+## The wild type is the germline ancestor
 
 [CH65Landscape.wild_type][evogfn.landscapes.ch65.CH65Landscape.wild_type] is the
 **germline** ancestor, all 16 sites unmutated, not the mature antibody. It is the
-sequence evolution actually started from, and it is the parent a directed-evolution
-campaign should be given: starting at the mature antibody would make every action
-in the environment a reversion, which is a different experiment.
+sequence evolution started from; starting at the mature antibody would make every
+action in the environment a reversion, which is a different experiment.
 
 The germline binds MA90 at 8.55 and is **at the detection floor on both other
-antigens** -- it has no measurable breadth at all. The mature antibody reaches
-(10.10, 9.75, 9.35). The library therefore spans the entire acquisition of breadth,
-which is why an unusually large share of it is informative.
+antigens**. The mature antibody reaches (10.10, 9.75, 9.35), so the library spans
+the entire acquisition of breadth.
 
 The mature antibody is available as
 [CH65Landscape.mature][evogfn.landscapes.ch65.CH65Landscape.mature], and it is
 **not Pareto-optimal**: 20 library variants form the non-dominated set and CH65
-itself is dominated by several of them. Natural selection optimised something other
-than the vector of these three affinities, which is a useful reminder of what a
-"known optimum" is worth.
+itself is dominated by several of them.
 
 ## The optimum here is an ideal point, not a front
 
 [CH65Landscape.optimum][evogfn.landscapes.ch65.CH65Landscape.optimum] returns the
 per-objective maxima, `(10.526, 10.331, 9.762)`. **No variant attains it** -- the
-three maxima belong to three different sequences. It is the *ideal point* in the
-sense of Miettinen (1999) §2.2, useful as a normaliser and as a reference for
+three maxima belong to three different sequences. It is the *ideal point* of
+Miettinen (1999) §2.2, useful as a normaliser and as a reference for
 [Tchebycheff][evogfn.rewards.scalarization.Tchebycheff], and meaningless as a
-target to regret against. Anything that wants "how close did this run get" on this
-landscape needs the indicators in [evogfn.metrics.pareto][]
--- hypervolume against a fixed reference, or IGD+ against the 20-point front --
-rather than a scalar gap.
+target to regret against. "How close did this run get" needs the indicators in
+[evogfn.metrics.pareto][] -- hypervolume against a fixed reference, or IGD+
+against the 20-point front.
 
 ## What this loader deliberately does not provide
 
 The per-variant standard errors, the individual replicate values, the expression
 measurements and the inferred epistatic coefficients are all in the deposit and
-none are loaded here. The two that would change an analysis are the standard errors
-(which say how much of the variation between neighbouring variants is measurement
-noise) and the replicate values (from which a partially censored variant -- one
-replicate at the floor, one above it -- could be identified). See
-``notes/review/08-ch65-provenance.md``.
+none are loaded here. The two that would change an analysis are the standard
+errors (how much variation between neighbouring variants is measurement noise)
+and the replicate values (from which a partially censored variant could be
+identified). See ``notes/review/08-ch65-provenance.md``.
 """
 
 from __future__ import annotations

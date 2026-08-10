@@ -1,25 +1,18 @@
 r"""Several Ehrlich functions at once, with objective conflict as a dial.
 
-[EhrlichLandscape][evogfn.landscapes.ehrlich.EhrlichLandscape] is the tunable
-diagnostic behind the real single-objective anchors: it evaluates in
-microseconds, its optimum is known by construction, and its parameters let a
-sweep isolate one difficulty at a time. Multi-objective work in this package had
-no such thing --
-[CH65Landscape][evogfn.landscapes.ch65.CH65Landscape] is a real anchor with 62,926
-variants and three antibody affinities, and it is the *only* multi-objective
-landscape here. One real dataset cannot answer "at what degree of objective
-conflict does this method stop helping", because a dataset has exactly one degree
-of conflict and does not say what it is.
-
-This landscape supplies the missing dial.
+[CH65Landscape][evogfn.landscapes.ch65.CH65Landscape] is the only real
+multi-objective landscape here, and a dataset has exactly one degree of objective
+conflict and does not say what it is. This landscape supplies the dial, the way
+[EhrlichLandscape][evogfn.landscapes.ehrlich.EhrlichLandscape] does for the
+single-objective anchors.
 
 ## The mechanism: how far the objectives' optima are allowed to disagree
 
 Every objective is its own Ehrlich function, and an Ehrlich function is defined by
-the motifs carved out of a **planted optimum** -- a feasible sequence that
-satisfies all of its motifs simultaneously, by construction. So the question
-"how much do two Ehrlich objectives conflict" is really "how much do their planted
-optima disagree, and can one sequence satisfy both sets of motifs at once".
+the motifs carved out of a **planted optimum** -- a feasible sequence satisfying
+all of its motifs simultaneously, by construction. So "how much do two Ehrlich
+objectives conflict" is "how much do their planted optima disagree, and can one
+sequence satisfy both sets of motifs at once".
 
 `conflict` controls exactly that. All objectives are drawn from one shared
 feasible base sequence $b$, and objective $j$'s planted optimum agrees with $b$
@@ -32,56 +25,45 @@ x^*_j = \underbrace{b_{1..m}}_{\text{shared}} \;\Vert\;
 \qquad m = \operatorname{round}\big((1 - \text{conflict}) \cdot L\big)
 $$
 
-Motifs are carved from $x^*_j$ one per block, as in the single-objective case.
-The consequence is direct:
+Motifs are carved from $x^*_j$ one per block, as in the single-objective case:
 
 * **`conflict = 0`** -- $m = L$, every $x^*_j$ *is* $b$, so every objective's
   motifs are read off the same sequence and $b$ scores 1.0 on all of them. The
-  objectives are jointly maximisable and the exact Pareto front is a **single
-  point**. This is the aligned regime, and the collapse is not approximate:
-  the front has exactly one member.
+  exact Pareto front is a **single point**, exactly rather than approximately.
 * **`conflict = 1`** -- $m = 0$, the planted optima are independent walks, and
   the objectives' motifs are unrelated patterns competing for the same short
   sequence. Satisfying one costs the other and the front **spreads**.
 * **in between** -- motifs falling in the shared prefix carry identical
   requirements across objectives and pull together; motifs in the divergent
-  suffix pull apart. Genuine tension, tunable by how much of the sequence is
-  contested.
+  suffix pull apart.
 
-The dial is over *positions* in the sense the mechanism actually supports:
-positions where the objectives agree on what token is wanted are aligned,
-positions where they were drawn independently are contested. Note that it runs
-the opposite way to the naive intuition that "motifs at shared positions must
-conflict" -- shared positions carrying the *same* requirement are the aligned
-case; it is independent draws that fight.
+Note the dial runs opposite to the naive intuition that "motifs at shared
+positions must conflict": shared positions carrying the *same* requirement are
+the aligned case, and it is independent draws that fight.
 
 ## Feasibility must be one thing, not one thing per objective
 
 The constituent landscapes are required to share a single transition matrix, and
-the constructor **checks it rather than assuming it**. Without that the
-construction is incoherent: `is_feasible` would have to pick an objective to
-believe, a sequence could be constructible for objective 1 and not for objective
-2, and the environment -- which masks against exactly one transition matrix --
-would be generating designs that one objective refuses to score. Every downstream
-number, the hypervolume above all, would then be computed over a set whose
-membership nobody agrees on.
+the constructor **checks it rather than assuming it**. Without that `is_feasible`
+would have to pick an objective to believe, a sequence could be constructible for
+objective 1 and not for objective 2, and the environment -- which masks against
+exactly one transition matrix -- would generate designs that one objective
+refuses to score. Every downstream number, the hypervolume above all, would be
+computed over a set whose membership nobody agrees on.
 
 Sharing is arranged by construction: the constituents are built with the same
 seed, alphabet size and transition density, and
 [EhrlichLandscape][evogfn.landscapes.ehrlich.EhrlichLandscape] draws its
-transition matrix before anything else, so the matrices are identical bit for bit.
-The check is still run, because "arranged by construction" is a claim about code
-that can change.
+transition matrix before anything else, so the matrices are identical bit for
+bit. The check is still run, because "arranged by construction" is a claim about
+code that can change.
 
 ## The exact Pareto front
 
-On a small enough instance the whole space can be enumerated, and then the true
-Pareto front is *known* rather than approximated by whatever the methods being
-compared happened to find. That is the same reason
-[EhrlichLandscape][evogfn.landscapes.ehrlich.EhrlichLandscape] is worth having in
-single objective: hypervolume regret against a known front is a number, while
-hypervolume against a union-of-methods reference front is a ranking that moves
-when a method is added.
+On a small enough instance the whole space can be enumerated, so the true Pareto
+front is *known* rather than approximated by whatever the compared methods
+happened to find -- hypervolume against a union-of-methods reference front is a
+ranking that moves when a method is added.
 [exact_pareto_front][evogfn.landscapes.multi_ehrlich.MultiEhrlichLandscape.exact_pareto_front]
 provides it, guarded on
 [MAX_ENUMERABLE_SIZE][evogfn.landscapes.base.MAX_ENUMERABLE_SIZE] as the other
@@ -90,16 +72,13 @@ landscapes guard enumeration.
 ## Precedent
 
 arXiv:2510.21052, Steinberg et al., *Amortized Active Generation of Pareto Sets*
-(A-GPS), was checked directly rather than cited from memory. It **does** use
-Ehrlich in a multi-objective benchmark, but not in the form built here: its
+(A-GPS), uses Ehrlich in a multi-objective benchmark but not in this form: its
 "Ehrlich vs. naturalness" task pairs a *single* Ehrlich function with a ProtBert
 pseudo-likelihood, $f_1(x) = \text{Ehrlich}(x)$ and
 $f_2(x) = e^{-L_{\text{ProtBert}}(x)}$, at $L \in \{15, 32, 64\}$ over the
-20-letter alphabet. It does not compose several Ehrlich functions and it has no
-conflict parameter -- the trade-off there comes from the second objective being a
-language model, so its degree of conflict is whatever it happens to be and cannot
-be swept. Their configurations, for reference: $L = 15$ with $k = 3, c = 2,
-q = 3$; $L = 32$ with $k = 4, c = 3, q = 4$; $L = 64$ with $k = 4, c = 4, q = 4$.
+20-letter alphabet. It does not compose several Ehrlich functions and has no
+conflict parameter. Their configurations: $L = 15$ with $k = 3, c = 2, q = 3$;
+$L = 32$ with $k = 4, c = 3, q = 4$; $L = 64$ with $k = 4, c = 4, q = 4$.
 """
 
 from __future__ import annotations
