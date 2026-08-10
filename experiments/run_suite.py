@@ -11,159 +11,59 @@ tier's seed count from 30 to 50 costs twenty campaigns per arm, not fifty.
 
 Results land under ``results/`` as one JSONL file per task and method.
 
-What the regret column is, and what it is not
----------------------------------------------
+How to read the report
+----------------------
 
-Regret here is against the **attainable** optimum -- what
-[evogfn.benchmark.attainable][] audited a task's search space to contain --
-rather than against the landscape's own. Regret against the landscape's optimum
-carries a floor no method can clear, because the optimum need not sit inside the
-space the protocol lets a method search. That floor is constant across arms, so
-it contributes nothing a comparison can read and everything a reader can
-misread.
+**Regret** is against the **attainable** optimum -- what
+[evogfn.benchmark.attainable][] audited a task's search space to contain -- not
+against the landscape's own, which carries a floor no method can clear. Where
+the audit could not close the bracket, the interval is printed and the regret is
+against its conservative end, so a regret at or below zero means the arm matched
+everything the audit could construct rather than that it was perfect. Those arms
+are marked **solved** and comparisons drawn on them are marked vacuous.
 
-Where the audit could not close the bracket, the interval is printed and the
-regret is against its conservative end. A regret at or below zero therefore does
-not mean an arm was perfect; it means the arm matched everything the audit could
-construct, and the task has no demonstrated headroom left to separate it from a
-better method with. Those arms are named as **solved**, and comparisons drawn on
-them are marked vacuous rather than quietly reported -- a p-value against an arm
-sitting on the ceiling is a statement about the ceiling.
+**The reference is `genetic`**, the Ehrlich paper's own algorithm at its own
+hyperparameters; methods are compared as published. `genetic+search`,
+`random+screen`, `genetic+screen` and `genetic+distinct` are decomposition rows
+rather than baselines, and carry `[ablation of ...]` wherever they appear.
 
-What every arm is compared against
-----------------------------------
+**Proxy calls** are read off the record rather than derived from the
+configuration: the closed form ``steps x batch_size`` is wrong for an arm that
+breeds, since a genetic teacher's proposals are themselves proxy evaluations
+(``genetic-gfn`` records about 22% more than the formula predicts at the same
+steps, width and round count). One caveat from [evogfn.benchmark.methods][]: a
+sampler rebuilt at an anchor move restarts its own accounting, so on a
+re-anchoring task the stored count covers the last anchor's rounds and reads as
+a floor.
 
-The reference is `genetic`: the Ehrlich paper's own algorithm at its own
-hyperparameters. Methods are compared **as published**, because a published
-pipeline is what a lab actually chooses between. Pairing against
-`genetic+search` instead -- a genetic algorithm handed the campaign's surrogate
--- would pair every headline number against something nobody proposed and no lab
-runs.
+**`unfit=n` and `NEVER FITTED`** mark an arm that never reached its supervised
+stage. [MLDE.observe][evogfn.algorithms.baselines.mlde.MLDE.observe] discards an
+infeasible assay, having no fitness to regress on, so under a transition
+constraint the screening plates can buy too few training examples for the
+handover to happen at all. Such a campaign still spends its budget and reports a
+regret indistinguishable from a fitted one's, so it is a random screen under a
+supervised method's name.
 
-`genetic+search` and `random+screen` stay in the table as **ablations** -- they
-are the only thing separating "the surrogate won" from "the constructive sampler
-won" -- but they are decomposition rows, not controls, and they are labelled as
-such on every line they appear on. A reader who takes one for the yardstick is
-reading exactly the comparison the reference change was made to stop.
+**The replication tier is read one draw at a time.** Instance x seed pairs are
+not independent observations, so `pooled_metric` **raises** on a task set holding
+two draws of one shape rather than returning a mean. The report gives each arm's
+per-draw effect, an interval at ``n = draws``, a sign test, and the factor by
+which pooling would have understated the error. Three draws cannot reach
+significance under a sign test at any seed count.
 
-Why proxy spend is printed beside the win
------------------------------------------
+**The five mechanism rungs run in `main` and nothing is selected from them** --
+the shipped arm as the base, plus ``+terminal``, ``+anchor``,
+``+terminal+anchor`` and ``+wide``
+([variant_arms][evogfn.benchmark.methods.variant_arms]). They are paired against
+the shipped base in a section of their own.
 
-Proxy calls are a *chosen* budget, not a constant of an architecture: the
-GFlowNet's is ``steps x batch_size`` per round, the `genetic+search` ablation's is
-``generations x population``. That closed form describes an arm which only samples
-from its own policy, and it is **wrong for an arm that breeds**: a genetic
-teacher's proposals are themselves proxy evaluations, which the formula does not
-count -- ``gfn-subtb@b0.1-s300-l0.9-h64`` records exactly ``3 x 300 x 64 =
-57,600`` while ``genetic-gfn@b0.5-s300-m0.25-h64`` at the same steps, width and
-round count records 70,350, about 22% more. So the column is **read off the
-record** rather than derived from a configuration file; reconstructing it from
-the settings gets those arms wrong by more than the arms differ.
-Let those budgets differ by an order of magnitude and the
-regret column is measuring compute rather than method. So the cost is printed
-next to the win: a GFlowNet needing 10x the proxy calls is a real and publishable
-cost of the method, and the column is where a reader finds it rather than
-something to be inferred from a configuration file. One caveat, from
-[evogfn.benchmark.methods][]: a sampler rebuilt at an anchor move restarts its own
-accounting, so on a re-anchoring task the stored count covers the last anchor's
-rounds rather than the campaign's, and reads as a floor.
-
-Why a supervised row can say it never fitted
---------------------------------------------
-
-A method that trains on its own measurements is only that method once the
-training has happened. MLDE screens at random until it holds enough usable
-assays, and
-[MLDE.observe][evogfn.algorithms.baselines.mlde.MLDE.observe] discards an
-infeasible one -- there is no fitness to regress on -- so on a landscape with a
-transition constraint the screening plates buy far fewer training examples than
-they cost, and where the infeasible share is large the handover never happens at
-all. Such a campaign spends its whole budget, fills every plate and reports a
-regret that is arithmetically indistinguishable from a fitted one's.
-
-So the report says it outright. `RunRecord.fitted` is stored per seed, the arm's
-row carries `unfit=n`, an arm that never fitted gets a `NEVER FITTED` line of its
-own, and every paired comparison naming one is marked as a difference against a
-random screen rather than against a supervised baseline. Reading such a row as a
-tuned method that lost fairly is the one conclusion the column exists to prevent.
-
-Why the replicated tasks are read one instance at a time, and refuse otherwise
--------------------------------------------------------------------------------
-
-The replication tier runs the same protocol shape on several draws from the
-instance generator. Its per-task tables are already per instance; what a reader
-does with them is the risk. Averaging six tasks x 100 seeds into one figure of
-600 does not look like a mistake -- it looks like *more* evidence, at a standard
-error several times narrower than the design supports, because instance x seed
-pairs are not independent observations. A seed varies the wild type and the
-surrogate's initialisation *within* a draw; nothing in that pooled array varies
-the draw.
-
-So the report adds a section that takes the **draw** as the unit -- each arm's
-per-draw effect, the interval across draws at ``n = draws``, and a sign test on
-how many draws agreed -- and `pooled_metric` **raises** on any task set holding
-two draws of one shape rather than being merely absent. Absent is a convention,
-and a convention is what the next person needing a single number breaks. The
-measured factor by which pooling would have understated the error is printed on
-every arm's line, so the refusal comes with its own arithmetic.
-
-How many draws that section should have is not settled here. It is measured by
-``experiments/variance_pilot.py``, whose rule is fixed before its numbers; what
-this report can already say without any measurement is that three draws cannot
-reach significance under a sign test at any seed count, and it says so.
-
-Why the mechanism rungs are reported and nothing is picked from them
----------------------------------------------------------------------
-
-`main` runs the five rungs of
-[variant_arms][evogfn.benchmark.methods.variant_arms] beside the baselines: the
-shipped arm as the base, and ``+terminal``, ``+anchor``, ``+terminal+anchor`` and
-``+wide`` as decomposition rows. **No rung is selected.** The table reports what
-each mechanism does on the tasks that carry the claim, and stops there.
-
-That is a change from what this file used to do, and the reasoning is worth
-keeping. The rungs used to live in a `variant-ladder` tier on the diagnostic
-landscape under `Purpose.SELECTION`, reaching `main` only through an explicit
-``--promote`` step -- the ordering that keeps a configuration from being chosen
-on the tasks that carry the claims. That ordering is the right one *when a choice
-is being made*. It buys nothing when none is, and it costs the thing the study is
-for: deciding a mechanism on a diagnostic instance and inferring to the headline
-tasks is exactly the inference this project has already been burned by, since the
-reward-exponent curve reversed direction between trajectory balance and
-sub-trajectory balance. Measuring each mechanism where the claim lives answers
-the question directly, and because nothing is selected there is no
-tuning-on-the-test-set to guard against -- the guard and the thing it guarded
-were removed together, rather than one being left behind to imply the other.
-
-What the rows still owe a reader is the marking, and they owe it more than
-before: four of the five decompose the arm beside them and none of them is a
-pipeline anybody published. They carry `[ablation of ...]` on the row and an
-attribution line beside every p-value, exactly where `genetic+search` does, and
-they are paired against the **shipped base** in a section of their own -- a rung's
-p-value against `genetic` would be a method comparison wearing an attribution
-sentence, which is a row explaining itself wrongly.
-
-Four of the twenty rungs are reproduced rather than run
--------------------------------------------------------
-
-`+terminal` defers the feasibility rule from every construction step to the stop
-action, and `gb1-anchor` and `trpb-anchor` have no transition matrix to defer.
-There the two environments describe the identical graph, so `+terminal` *is* the
-base arm's campaign and `+terminal+anchor` is `+anchor`'s -- 400 campaigns, some
-28 core-hours, spent recomputing numbers the table already holds, and two pairs of
-identical rows a reader could quote as "we tested the mechanism here and it made
-no difference". That is a different and false claim from "there was nothing here
-to test".
-
-So those rows are reproduced at report time and **nothing is stored for them**. A
-stored copy is indistinguishable from a measurement the moment it is written, and
-every reader of the store -- the instance analysis, a script written next year --
-would count it as an independent campaign; a marker would only move the problem to
-whichever reader forgets to honour it. Reproduced in the report, the copy sits
-where the claim is made: in italic, with a legend naming the arm it repeats.
-Which rows those are is derived from the environment rather than from a list of
-task names, so a task that gains a transition matrix is measured instead, with no
-edit anywhere.
+Four of those rungs are **reproduced at report time and nothing is stored for
+them**: ``+terminal`` defers the feasibility rule to the stop action, and
+`gb1-anchor` and `trpb-anchor` have no transition matrix to defer, so the two
+environments describe the identical graph there. Reproduced rows print in italic
+with a legend naming the arm they repeat. Which rows those are is derived from
+the environment, so a task that gains a transition matrix is measured instead
+with no edit anywhere.
 """
 
 from __future__ import annotations
@@ -1121,7 +1021,7 @@ class InstanceEffects:
         )
 
 
-def instance_effects(  # noqa: PLR0913, PLR0917 - a per-instance effect names both arms and every draw
+def instance_effects(  # noqa: PLR0913 - a per-instance effect names both arms and every draw
     store: ResultStore,
     tasks: Sequence[Task],
     shape: str,
