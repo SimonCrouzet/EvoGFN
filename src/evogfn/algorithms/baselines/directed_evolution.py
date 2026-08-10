@@ -1,35 +1,30 @@
 """Traditional directed evolution: the two site-saturation arms of the MLDE line.
 
 Site-saturation mutagenesis is one move: pick a residue, make every substitution
-at it, measure them all. What a campaign does with those measurements is what
-separates the arms, and the wet-lab literature runs several. Two of them are
-here, under the names Li et al. use:
+at it, measure them all. What a campaign does with those measurements separates
+the arms. Two are here, under the names Li et al. use:
 
 * [SingleStepWalk][evogfn.algorithms.baselines.directed_evolution.SingleStepWalk]
   -- ``single-step``. Saturate one site, **fix** the best residue, move to the
-  next site and saturate it *on that background*, never returning to a site
-  already fixed. Deterministic given the site order, and path-dependent because
-  every later site is measured against the residues the earlier ones fixed.
+  next site and saturate it *on that background*, never returning to a fixed
+  site. Deterministic given the site order, and path-dependent.
 * [Recombination][evogfn.algorithms.baselines.directed_evolution.Recombination]
-  -- ``recomb``. Saturate every site *independently*, on one fixed background,
+  -- ``recomb``. Saturate every site *independently* on one fixed background,
   then build a single design carrying the winner from each. No site is ever
   measured against another site's winner, so the arm assumes the sites combine
   additively and spends one assay finding out.
 
 Neither is [HillClimbing][evogfn.algorithms.baselines.mutagenesis.HillClimbing],
-and the distinction is not cosmetic. A hill climber draws a *random* single
-substitution anywhere in the sequence, accepts it if it scores better, and may
-return to a position it has already changed. These arms exhaust one position
-before committing to it and then never touch it again. The two are the two
-different objects the field calls "directed evolution", and a table that ran only
-the random-neighbour one would carry no comparator from the MLDE literature at
-all.
+which draws a *random* single substitution anywhere and may return to a position
+it has already changed. These arms exhaust one position before committing to it
+and then never touch it again. The two are the different objects the field calls
+"directed evolution".
 
-What the sample counts are, and what they say about the method
----------------------------------------------------------------
+Sample counts, and what they fix
+---------------------------------
 
 Li et al. state each arm's cost and itemise it, which settles two questions the
-implementation would otherwise have to guess at. Verbatim:
+implementation would otherwise guess at. Verbatim:
 
     "The DE strategies are summarized as "recomb", a recombination of the best
     SSM variant at each site (19 x n_site + 2 samples, including the initial and
@@ -37,120 +32,82 @@ implementation would otherwise have to guess at. Verbatim:
     with subsequent variants built on the best variant found (19 x n_site + 1
     samples, including the initial variant); and "top96 recomb" ..."
 
-**The background is measured, once.** Both arms carry an ``initial variant`` in
-their count, and ``single-step``'s extra is exactly that one sample -- no final
-variant, because the design it ends on is one of the per-site scans it already
-paid for. So the background is assayed at the start and its value carried, not
-re-measured at every site.
+**The background is measured once.** Both arms carry an ``initial variant``, and
+``single-step``'s extra is exactly that one sample -- no final variant, because
+the design it ends on is one of the per-site scans already paid for.
 
-**The residue already there is a competitor, not a bystander.** The count is
-``19`` per site rather than ``20``, and the reference implementation scans all
-twenty amino acids at each position -- the incumbent's own residue among them,
-as a re-lookup that costs no new sample. A site therefore keeps the residue it
-has unless one of the nineteen substitutions *beats the background's measured
-value*, which is what makes the walk monotone rather than something that can
-ratchet downhill through a dead site, and it is the only thing that initial
-measurement is for.
+**The residue already there is a competitor.** The count is ``19`` per site
+rather than ``20``, and the reference implementation scans all twenty amino acids
+at each position -- the incumbent's own among them, as a re-lookup costing no new
+sample. A site keeps the residue it has unless one of the nineteen substitutions
+beats the background's measured value, which is what makes the walk monotone and
+is the only thing that initial measurement is for.
 
-**The stated consequence, which is a result and not a defect.** On a landscape
-where no single substitution improves on the background, ``recomb`` nominates
-the background itself -- a design already measured -- and that replicate has
-nothing left to propose. That is a true fact about recombination-based directed
-evolution on a flat or sign-epistatic landscape, and forcing a harmful
-substitution into the recombinant to avoid it would be us designing a better arm
+**A consequence to expect:** on a landscape where no single substitution improves
+on the background, ``recomb`` nominates the background itself -- a design already
+measured -- and that replicate has nothing left to propose. That is a true fact
+about recombination-based directed evolution on a flat or sign-epistatic
+landscape; forcing a harmful substitution in to avoid it would be a better arm
 than the one published.
 
 Which sites, and in which order
 -------------------------------
 
-The published protocols take the site set from the library: a four-site
-combinatorial library saturates those four residues and nothing else. Nothing
-here has a library, so the site set is the sequence itself and the order is a
-uniformly random permutation of its positions drawn from the campaign's seed.
+The published protocols take the site set from the library. Nothing here has a
+library, so the site set is the sequence itself and the order is a uniformly
+random permutation drawn from the campaign's seed.
 
-That is the closest available reading of how the sources treat it. The walk is
-path-dependent -- Li et al. note that a four-site library has *"a total of 24
-(4!) possible orders of sampling"* -- and both their simulation and ALDE's
-enumerate every order rather than fixing one, then report an average over them
-and over starting variants. A seeded permutation makes each campaign one order
-and the seed average their average, which is the same quantity reached through
-the mechanism this harness already has. A single fixed order would report one
-draw from a distribution and call it the method.
+The walk is path-dependent -- Li et al. note a four-site library has *"a total of
+24 (4!) possible orders of sampling"* -- and both their simulation and ALDE's
+enumerate every order and average over them. A seeded permutation makes each
+campaign one order and the seed average their average.
 
 What bounds the walk, and what does not
 ---------------------------------------
 
-**The mutation budget bounds it, by itself.** Every substitution is checked
-against the environment's Hamming ball before it is proposed, so a site whose
-substitutions would carry the design outside it contributes nothing and the walk
-moves on. No separate site count is maintained, and none could be right: a site
-whose winner is the incumbent's own residue costs no budget at all, so how many
-sites a fixed anchor admits is not known until the walk has run.
+**The mutation budget bounds it.** Every substitution is checked against the
+environment's Hamming ball before it is proposed, so a site whose substitutions
+would carry the design outside it contributes nothing and the walk moves on. No
+separate site count is maintained, and none could be right: a site whose winner
+is the incumbent's own residue costs no budget, so how many sites a fixed anchor
+admits is not known until the walk has run. Under a moved anchor the ball follows
+the incumbent and the budget is restored every round.
 
-Under a moved anchor the ball follows the incumbent, so the budget is restored
-every round and the walk continues down the permutation. Under a fixed anchor it
-stops when the ball runs out, which is the honest translation of a library with a
-finite number of sites.
-
-**The feasibility constraint does not bound it**, and that is deliberate. These
-are unmasked classical arms, on exactly the footing of the genetic algorithm,
-CMA-ES and random mutagenesis: they propose what their protocol names, an
-adjacency-violating design reaches the assay and scores minus infinity, and the
-well it cost is the finding. Site saturation makes *all* substitutions at a
-residue -- that is what the technique is -- so filtering the infeasible ones out
-would quietly give these arms the feasibility-by-construction the masked policy
-is claiming as an advantage, on the one task built to measure it. It would also
-leave a recombinant whose sites are individually feasible and jointly not with
-nowhere to go, when "the additive assumption fails" is precisely what that arm is
-there to expose.
+**The feasibility constraint does not bound it**, deliberately. These are
+unmasked classical arms, on the footing of the genetic algorithm, CMA-ES and
+random mutagenesis: an adjacency-violating design reaches the assay, scores minus
+infinity, and the well it cost is the finding. Site saturation makes *all*
+substitutions at a residue, so filtering the infeasible ones would quietly give
+these arms the feasibility-by-construction the masked policy claims as an
+advantage, on the one task built to measure it.
 
 The surplus budget is spent on replicates, and that choice is ours
 ------------------------------------------------------------------
 
-A four-site protocol costs on the order of a single plate, while a campaign here
-runs four. **The papers do not say what to do with the difference**, because in
-their setting there is no difference: they report each directed-evolution arm at
-its own fixed cost and compare a machine-learning arm against it across budgets.
-This harness cannot do that -- every round charges a full plate, and every claim
-is indexed by the total -- so something has to fill the surplus, and whatever
-that is, it is ours.
+A four-site protocol costs about one plate, while a campaign here runs four. The
+papers do not say what to do with the difference, because in their setting there
+is none -- they report each arm at its own fixed cost. Here every round charges a
+full plate, so something has to fill the surplus.
 
 `ReplicatedProtocol` is that choice: run several copies of the protocol
 concurrently, each with **its own site order**, pool what they ask for into each
-plate, and start a further copy if they all finish while budget remains. The
-reasoning:
+plate, and start a further copy if they all finish while budget remains. A
+replicate is the same walk at another order, which is what both reference
+implementations do; the alternative -- re-proposing designs the protocol had
+already named -- charges several wells per measurement and handicaps the arm by
+most of its budget. Nothing selects a winning replicate: every design measured
+goes into the ledger and the reported best-so-far is over all of them, which is
+how Li et al. score these arms too.
 
-* **A replicate is the protocol, not a new mechanism.** It is the same walk at
-  another order, and running many orders is what both reference implementations
-  do -- Li et al.'s enumerates every permutation of the sites and every starting
-  variant, precisely because order is what a directed-evolution outcome is most
-  sensitive to. Fixing one order and spending the rest of the budget elsewhere
-  would be the deviation, not this.
-* **The alternative was repetition.** Filling the plate by re-proposing designs
-  the protocol had already named charges several wells for every measurement it
-  wanted, which no lab holding four plates and a one-plate protocol would do,
-  and which handicaps the arm by most of its budget. Where a forced deviation
-  has a direction, it should run in the one that *helps* the baseline; this one
-  does.
-* **Nothing here selects a winning replicate.** Every design measured goes into
-  the campaign's ledger and the reported best-so-far is taken over all of them.
-  That is not even a departure: Li et al. score these arms the same way, taking
-  the maximum over the starting variant, every single substitution scanned, and
-  the recombinant. The arm spends its budget on search; what the shared metric
-  does with the measurements is not this module's decision.
+Two things to keep in view. Such a row is a *best over site orders at the
+campaign's budget* where the source reports an *average over site orders at one
+walk's cost*, and a comparison against a published DE number has to say which it
+is. And where a replicate's site set cannot differ from another's, the replicates
+name identical designs, the pooled request deduplicates them, and the arm spends
+exactly the protocol's cost with the surplus showing up as duplicate wells.
 
-Two things to keep in view when reading such a row. It is a *best over site
-orders at the campaign's budget*, where the source reports an *average over site
-orders at one walk's cost*; the two are different estimators and a comparison
-against a published DE number has to say which it is. And where a replicate's
-site set cannot differ from another's -- a library whose sites are the whole
-sequence -- the replicates name identical designs, the pooled request
-deduplicates them, and the arm is back to spending exactly the protocol's cost,
-with the surplus showing up as duplicate wells. That is the honest answer there
-rather than a gap: on such a library there is nothing else the protocol can do.
-
-`requested` reports the distinct designs an arm has named, which is the number
-to quote beside an oracle-call column that counts wells.
+`requested` reports the distinct designs an arm has named, which is the number to
+quote beside an oracle-call column that counts wells.
 """
 
 from __future__ import annotations

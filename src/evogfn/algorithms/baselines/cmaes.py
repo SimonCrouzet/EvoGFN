@@ -3,142 +3,118 @@
 Every other baseline here carries points -- a population, a current design, a
 training set. CMA-ES (Hansen & Ostermeier, *Evol. Comput.* 2001) carries a
 probability distribution and updates its shape from the ranking of what it drew.
-That makes it the closest thing in classical optimisation to what a GFlowNet
-does, and therefore the baseline that tests the part of the claim the others
-cannot reach: adapting a distribution over sequences is not itself novel, and a
-method whose advantage is "it learns a sampler" has to beat the fifty-year-old
-method that also learns a sampler.
 
-What it does not do is sample proportionally to reward. CMA-ES contracts onto a
-single optimum by construction -- that is the point of the step-size control --
-so it should win on best-found and lose badly on diversity and on distributional
-distance. If it does not lose on those, the sampling claim is in trouble.
+It does not sample proportionally to reward: it contracts onto a single optimum
+by construction, which is what the step-size control is for, so it should win on
+best-found and lose on diversity and distributional distance.
 
 Discrete sequences via a continuous relaxation
 ----------------------------------------------
 
 CMA-ES optimises in ``R^d``. The standard adaptation to categorical variables is
 to relax: carry a real matrix of shape ``(length, vocabulary)``, treat it as
-per-position logits, and read a sequence off it by taking the argmax at each
-position. The Gaussian that CMA-ES maintains supplies the exploration, so no
-extra sampling temperature is needed -- a position whose logits are close
-together flips between tokens under the noise, and one whose logits have
-separated stops flipping. The relaxation is where the method's assumptions are
-weakest and is worth stating plainly: rank information is fed back into a
-Gaussian over logits, and a Gaussian over logits is not a natural model of an
-epistatic landscape.
+per-position logits, and read a sequence off it by argmax at each position. The
+Gaussian supplies the exploration, so no sampling temperature is needed -- a
+position whose logits are close together flips between tokens under the noise,
+and one whose logits have separated stops flipping. Rank information is fed back
+into a Gaussian over logits, which is not a natural model of an epistatic
+landscape.
 
-What the relaxation cannot express, and where that has to be fixed
--------------------------------------------------------------------
+What the relaxation cannot express
+-----------------------------------
 
 A separable Gaussian over per-position logits is a **product** distribution, and
 per-position argmax is a **product** map: the token at position ``i`` is a
-function of the logit block at position ``i`` and of nothing else. A transition
-constraint is not a product set -- it couples adjacent positions, and which
-tokens position ``i`` may take depends on what position ``i - 1`` took. No mean
-and no diagonal covariance can therefore make the image of that decoder land
-inside the feasible set, except in the degenerate case where the constraint
-happens to factorise. This is a property of the relaxation, not an oversight in
-its implementation, and it is the honest limit of the method on a constrained
-space: **the search distribution cannot represent feasibility.**
+function of the logit block at position ``i`` and nothing else. A transition
+constraint is not a product set -- it couples adjacent positions. No mean and no
+diagonal covariance can therefore make the image of that decoder land inside the
+feasible set, except where the constraint happens to factorise. **The search
+distribution cannot represent feasibility**, and that is a property of the
+relaxation rather than of its implementation.
 
-The decoder is a different matter, and it is where the baseline can be left for
-dead. Decoding is already a *projection* -- the argmax is followed by a
-projection onto the mutation budget -- and a decoder that stops there does not
-project onto the other constraint at all. On a sparse instance the consequence
-is total rather than merely lossy: the zero mean makes the initial argmax
-uniform over the alphabet, a uniform sequence satisfies a long adjacency chain
-with vanishing probability, and every design the arm emits is infeasible.
-Rejection is no remedy at that density; it is not expensive, it is impossible.
+The decoder is a different matter. Decoding is already a *projection* -- the
+argmax is followed by a projection onto the mutation budget -- and one that stops
+there does not project onto the other constraint at all. On a sparse instance the
+consequence is total: the zero mean makes the initial argmax uniform over the
+alphabet, a uniform sequence satisfies a long adjacency chain with vanishing
+probability, and every design the arm emits is infeasible. Rejection is not
+expensive at that density, it is impossible.
 
-So the projection is completed rather than the method abandoned. Three
-constraints have to hold at once and each is local: the adjacency rule is a
-**first-order chain** condition on a token pair, the mutation budget is a
-cardinality condition, and *constructibility* -- that some ordering of the
-substitutions keeps every intermediate feasible -- reduces, by the argument in
+So the projection is completed. Three constraints have to hold at once and each
+is local: the adjacency rule is a **first-order chain** condition on a token
+pair, the mutation budget is a cardinality condition, and *constructibility* --
+that some ordering of the substitutions keeps every intermediate feasible --
+reduces, by the argument in
 [is_constructible][evogfn.env.mutation.MutationEnvironment.is_constructible], to
-one further condition per adjacent pair. So the highest-scoring sequence subject
-to all three is the Viterbi path of a dynamic program over
+one further condition per adjacent pair. The highest-scoring sequence subject to
+all three is therefore the Viterbi path of a dynamic program over
 ``(position, token, counter)``, computed exactly in ``O(n * L * V^2 * K)`` by
-``_project_onto_constructible``. It always succeeds, because the anchor itself is
-a feasible sequence at zero substitutions and so constrains no ordering, which
-makes the set the projection searches non-empty by construction. The cost is wall
-clock rather than oracle calls or proposals -- ``proposals_made`` stays at one
-per design -- and
+``_project_onto_constructible``. It always succeeds, because the anchor is
+feasible at zero substitutions and so constrains no ordering, which makes the set
+non-empty by construction. The cost is wall clock rather than oracle calls or
+proposals -- ``proposals_made`` stays at one per design -- and
 [repaired_fraction][evogfn.algorithms.baselines.cmaes.CMAES.repaired_fraction]
-reports how often the raw argmax was unbuildable, which is the number that says
-how much of the arm's behaviour is the relaxation's and how much the
-projection's.
+reports how often the raw argmax was unbuildable.
 
 Which set the projection targets is the whole of the comparison
 ---------------------------------------------------------------
 
-The set has to be the environment's own, and the two candidate answers differ.
 [is_reachable][evogfn.env.mutation.MutationEnvironment.is_reachable] is budget
 plus endpoint feasibility; the environment's masks additionally require a legal
 construction order, which is what
 [reachable_terminal_states][evogfn.env.mutation.MutationEnvironment.reachable_terminal_states]
-enumerates. **Projecting onto the looser set is not a milder version of the
-constraint, it is a different search space**: every masked arm is confined to the
-construction graph, so an arm projected onto the endpoint condition alone selects
-over designs the others are forbidden to propose, and its regret against an
-attainable optimum derived from the construction graph has no floor at zero. A
-regret below that floor is a symptom of an arm outside the space, never a result.
+enumerates. **Projecting onto the looser set is not a milder constraint, it is a
+different search space**: every masked arm is confined to the construction graph,
+so an arm projected onto the endpoint condition alone selects over designs the
+others are forbidden to propose, and its regret against an attainable optimum
+derived from the construction graph has no floor at zero. A regret below that
+floor is a symptom of an arm outside the space, never a result.
+
 The projection therefore reads
 [constrains_intermediates][evogfn.env.mutation.MutationEnvironment.constrains_intermediates]
 off the environment and enforces the ordering condition exactly where the
-environment does, so the arm is confined to the same graph as every other and no
-comparison is being drawn across two spaces.
+environment does.
 
-What this still does *not* claim: the distribution spends its mass on infeasible
+What this still does not claim: the distribution spends its mass on infeasible
 logit configurations and only ever sees the landscape through the projection, so
 what it learns is the composition of the two -- ranks of repaired designs -- and
 not the landscape.
 
-Why the arm stays in the suite even where it collapses
--------------------------------------------------------
+Two statements that must not be merged
+---------------------------------------
 
-Two statements, and they must not be merged. **First**, CMA-ES is a standard
-baseline for this problem: it appears in Jain et al. (ICML 2022), in
-Design-Bench, in FLEXS and in the high-dimensional Bayesian-optimisation
-literature, and Design-Bench decodes a continuous relaxation by per-position
-argmax exactly as the decoder above does. Its published behaviour is
-length-dependent -- competitive on short sequences, degrading as the sequence
-grows -- so an unbounded regret on this package's long constrained tasks
-corroborates a documented failure mode rather than indicating a broken arm.
+**First**, CMA-ES is a standard baseline for this problem -- Jain et al. (ICML
+2022), Design-Bench, FLEXS, and the high-dimensional Bayesian-optimisation
+literature -- and Design-Bench decodes a continuous relaxation by per-position
+argmax exactly as above. Its published behaviour is length-dependent, so an
+unbounded regret on long constrained tasks corroborates a documented failure mode
+rather than indicating a broken arm.
 
-**Second**, and separately, nothing in that literature says anything about which
-set *this* decoder projects onto. Whether the arm is confined to the same
-construction graph as every other is a property of the code above, established by
-the tests beside it and by no citation. The two statements are kept apart because
-merging them is how a defect in the projection would come to be read as the
-published failure mode and go unexamined: a reference explains a bad score, it
-never licenses one.
+**Second**, nothing in that literature says anything about which set *this*
+decoder projects onto. Whether the arm is confined to the same construction graph
+as every other is a property of the code above, established by the tests beside
+it and by no citation. Merging the two is how a defect in the projection would
+come to be read as the published failure mode.
 
 Why the covariance is diagonal
 ------------------------------
 
-The relaxation has ``d = length * vocabulary`` dimensions, which is 5,120 for the
-``L = 256`` protein sequences this package benchmarks on. A full covariance
-matrix is then 26 million entries, and CMA-ES needs its eigendecomposition,
-costing ``O(d^3) ~ 10^11`` operations per update. That is not a tuning
-inconvenience, it is intractable, and it is intractable for the honest reason
-that ``d`` is large rather than because of anything about this codebase.
+The relaxation has ``d = length * vocabulary`` dimensions, 5,120 for the
+``L = 256`` sequences this package benchmarks on. A full covariance matrix is
+then 26 million entries and CMA-ES needs its eigendecomposition, at
+``O(d^3) ~ 10^11`` operations per update.
 
-So this is the **separable** variant, sep-CMA-ES (Ros & Hansen, *PPSN* 2008):
-the covariance is constrained to be diagonal, its square root is then elementwise
-and free, and the learning rates for the rank-one and rank-mu updates are
-multiplied by ``(d + 2) / 3`` as that paper prescribes, since a diagonal matrix
-has ``d`` rather than ``d(d+1)/2`` parameters to estimate and can afford to move
-faster. The cost is real: sep-CMA-ES cannot learn correlations between
-coordinates, so it cannot represent epistasis between two positions in its search
-distribution. It compensates only in the sense that it reaches a good diagonal
-much faster.
+So this is the **separable** variant, sep-CMA-ES (Ros & Hansen, *PPSN* 2008): the
+covariance is constrained to be diagonal, its square root is then elementwise and
+free, and the learning rates for the rank-one and rank-mu updates are multiplied
+by ``(d + 2) / 3`` as that paper prescribes. The cost is real -- sep-CMA-ES
+cannot learn correlations between coordinates, so it cannot represent epistasis
+between two positions in its search distribution -- and it compensates only in
+reaching a good diagonal much faster.
 
 Everything else -- the recombination weights, the two evolution paths, the
 cumulative step-size adaptation -- follows Hansen's tutorial (arXiv:1604.00772)
-with its published default constants, so the baseline is the configuration its
-author chose rather than one convenient to us.
+with its published default constants.
 """
 
 from __future__ import annotations
