@@ -1,13 +1,7 @@
 """What a campaign spent, and on what.
 
-The oracle budget is the whole constraint. A directed-evolution round measures
-somewhere between a few dozen and a few thousand variants, and the surveyed
-literature puts a realistic total in the hundreds -- so a result reported at
-20,000 evaluations is not a result about directed evolution. The ledger exists
-so that the number every claim is indexed by cannot be quietly wrong.
-
-Six counts are kept separate because they diverge, and the gaps are the
-interesting part:
+The oracle budget is the constraint every result is indexed by. Six counts are
+kept separate because they diverge, and the gaps are what they are read for:
 
 * **proposals** -- candidates the sampler generated. Free. A rejection-sampling
   baseline under a feasibility constraint can generate ten times what it keeps,
@@ -27,60 +21,35 @@ interesting part:
 * **feasible** -- of those evaluated, how many the landscape could actually
   build.
 
-Repeats within a plate are the method's cost, repeats across plates are not
-------------------------------------------------------------------------------
+``duplicates`` and ``redundant`` are twins and are never summed.
+**``duplicates`` is repetition within one plate**, charged in wells: 96
+offspring of which 10 are identical consume 96 wells for 86 distinct data
+points. **``redundant`` is repetition against the campaign's memory across
+rounds**, charged in proposals and in nothing else, because the candidate never
+reached a well. A converged sampler produces both at once, so reading either
+alone misattributes the other's cost.
 
-A genetic algorithm that breeds 96 offspring of which 10 are identical has
-consumed 96 wells for 86 distinct data points, and that is the price of its own
-convergence -- it belongs to the method and is reported as ``duplicates``. A
-method re-proposing something measured *three rounds ago* is a different
-situation: the point of running rounds is that each one is informed by what the
-last measured, so the campaign remembers and does not re-order. Folding the two
-into one number would report a method that never repeats itself as wasteful
-merely for having searched somewhere it had already been.
-
-``duplicates`` and ``redundant`` are the twins that keep those two apart, and
-which is which is the whole of it: **``duplicates`` is repetition within one
-plate**, charged in wells; **``redundant`` is repetition against the campaign's
-memory across rounds**, charged in proposals and in nothing else. A converged
-sampler produces both at once, so reading either alone misattributes the
-other's cost -- a ledger showing only the first reads the collapse as a
-within-round convenience fee, and one showing only the second reads it as mode
-collapse the plate never paid for. That confusion is precisely what the pair
-exists to resolve, which is why they are reported side by side and never summed.
-
-Infeasible designs are charged
-------------------------------
-
-They cost the same to synthesise as feasible ones, so a method that proposes
-them has spent the budget. Stanton et al. report their genetic-algorithm
-baseline running at a feasible population fraction of 0.2-0.7, which under this
-accounting is most of a budget spent on constructs that cannot be made. Charging
-for them is what turns a masked sampler's feasibility-by-construction from a
-stated property into a measured advantage.
+Infeasible designs are charged: they cost the same to synthesise as feasible
+ones, so a method that proposes them has spent the budget.
 
 What is reported with more than one objective
 ---------------------------------------------
 
-"Best value" is a scalar claim, and with three objectives there is no scalar to
-claim it about. A ledger that answered anyway -- by taking a maximum across
-objectives measured on different scales -- would produce a number that rises
-when *any* objective rises, ranks methods, and means nothing. So it does not
-answer: [CampaignResult.best_value][evogfn.loop.ledger.CampaignResult.best_value]
+There is no scalar "best value" over objectives measured on different scales,
+so [CampaignResult.best_value][evogfn.loop.ledger.CampaignResult.best_value]
 raises and
 [simple_regret][evogfn.loop.ledger.CampaignResult.simple_regret] is ``None``.
-
 What replaces them are set indicators, computed on the objective vectors that
 were actually measured:
 
 * [hypervolume][evogfn.loop.ledger.CampaignResult.hypervolume] -- the volume the
   measured designs dominate above a **reference point**, which must be supplied.
-  It is the one common indicator that is monotone in Pareto dominance, so a run
-  that dominates another always scores higher.
+  Monotone in Pareto dominance, so a run that dominates another always scores
+  higher.
 * [igd_plus][evogfn.loop.ledger.CampaignResult.igd_plus] -- how far a supplied
-  reference front is from being covered, which is the half hypervolume is weak
-  at: a single excellent design can enclose a large volume while covering almost
-  none of the front.
+  reference front is from being covered, which is where hypervolume is weak: a
+  single excellent design can enclose a large volume while covering almost none
+  of the front.
 
 Both are ``None`` rather than zero when the campaign was not given what they
 need, because zero is a *result* -- "found nothing above the reference" -- and
@@ -117,24 +86,17 @@ class RoundRecord:
         evaluated: Oracle calls charged this round.
         feasible: How many of the evaluated candidates were constructible.
         duplicates: How many of the evaluated candidates repeated a design
-            already on the same plate. Zero for a campaign filling its plate
-            with distinct designs, and zero for a sampler that does not repeat
-            itself; anything else is the wells convergence cost. The **within a
-            plate** twin of ``redundant``; see the module docstring for why the
-            two are read together and never summed.
+            already on the same plate -- the wells cost of convergence. The
+            **within a plate** twin of ``redundant``; the module docstring says
+            why the two are never summed.
         redundant: How many proposals the campaign refused because it had
             measured that design in an *earlier round*. The **across rounds**
             twin of ``duplicates``: this repetition costs proposals and no
-            wells, because the candidate never reached one, while a duplicate
-            costs a well and is charged.
+            wells, because the candidate never reached one.
 
-            ``None`` when the campaign has no cross-round memory to consult --
-            ``skip_measured`` off, the ablation that removes the screening
-            entirely -- and that is not the same finding as a campaign that
-            consulted its memory and refused nothing. Zero would conflate the
-            two, and would do it in the direction that reads as "this sampler
-            never repeated itself". ``None``/``nan`` for a quantity nobody
-            obtained is the convention ``surrogate_correlation`` already sets.
+            ``None`` when the campaign has no cross-round memory to consult
+            (``skip_measured`` off), which is not the same as having consulted
+            it and refused nothing. Zero would conflate the two.
         best_in_round: Best objective value measured this round. With more than
             one objective this is the best *scalarised* value, under the
             trade-off the campaign's acquisition rule states -- the same one the
@@ -147,27 +109,21 @@ class RoundRecord:
             or when the front outgrew the exact method in
             [evogfn.metrics.pareto][] -- a ``nan`` here is always "not computed"
             and never "no volume", which is a real result and would be ``0.0``.
-        batch_diversity: Mean pairwise Hamming distance within the batch. What
-            a lab actually receives: a batch of near-duplicates is one
-            experiment repeated, whatever its mean predicted value.
+        batch_diversity: Mean pairwise Hamming distance within the batch.
         surrogate_correlation: Pearson correlation between what the surrogate
             predicted for this batch and what the oracle measured. ``nan``
-            before a surrogate exists. This is the single most useful
-            diagnostic in the ledger: it separates a method failing because its
+            before a surrogate exists. Separates a method failing because its
             sampler proposes badly from one failing because its model cannot
-            tell good designs from bad, and those call for opposite fixes.
+            tell good designs from bad.
         anchor: The design this round's proposals were built from, as a tuple of
             token indices, or ``None`` when the campaign was not tracking an
             anchor. A tuple rather than an array so the record stays comparable,
             hashable and serialisable like every other field.
         anchor_distance: Hamming distance from the campaign's original wild type
-            to ``anchor``. This is the number the whole re-anchoring mechanism
-            exists to move: with a fixed anchor it is zero in every round, and
-            the campaign can never reach a design further than one round's
-            mutation budget from the wild type however many rounds it runs. Read
-            down the rounds it is the cumulative distance travelled, and it is
-            the evidence that the campaign is doing directed evolution rather
-            than re-searching the same Hamming ball.
+            to ``anchor``. Zero in every round under a fixed anchor, where the
+            campaign can never reach a design further than one round's mutation
+            budget from the wild type however many rounds it runs. Read down the
+            rounds it is the cumulative distance travelled.
     """
 
     index: int
@@ -196,9 +152,7 @@ class RoundRecord:
         """Share of the round's oracle calls spent re-measuring its own plate.
 
         Zero means every well held a design the round had not already put on
-        that plate. It rises as a method converges, which is the point of
-        reporting it: convergence looks like an improving best-so-far and costs
-        wells, and this is the only place that cost is visible.
+        that plate. It rises as a method converges.
         """
         return self.duplicates / self.evaluated if self.evaluated else 0.0
 
@@ -208,12 +162,9 @@ class RoundRecord:
 
         Denominated in proposals where
         [duplicate_fraction][evogfn.loop.ledger.RoundRecord.duplicate_fraction]
-        is denominated in wells, and the mismatch is the point rather than an
-        oversight: a duplicate consumed a well and is charged, a redundant
-        candidate was dropped before selection and cost only the compute that
-        generated it. Putting both over ``evaluated`` would invite adding them,
-        and their sum is not a quantity -- it would count some of the sampler's
-        output twice and some of the plate not at all.
+        is denominated in wells: a duplicate consumed a well, a redundant
+        candidate was dropped before selection. The two shares are over
+        different denominators and must not be added.
 
         Returns:
             The share in ``[0, 1]``, or ``nan`` when the campaign had no memory
@@ -300,11 +251,9 @@ class CampaignResult:
             The largest finite measurement.
 
         Raises:
-            ValueError: If the campaign measured more than one objective. The
-                maximum over designs *and* objectives is a well-formed float
-                that answers no question: it mixes scales, rises whenever any
-                objective rises, and would silently index every claim in a
-                multi-objective result. Use
+            ValueError: If the campaign measured more than one objective, where
+                the maximum over designs *and* objectives mixes scales and rises
+                whenever any objective rises. Use
                 [hypervolume][evogfn.loop.ledger.CampaignResult.hypervolume],
                 [igd_plus][evogfn.loop.ledger.CampaignResult.igd_plus], or
                 ``trace()`` for the scalarised best-so-far the acquisition rule
@@ -329,11 +278,9 @@ class CampaignResult:
     def duplicate_fraction(self) -> float:
         """Mean over rounds of the wells each spent repeating its own plate.
 
-        Averaged over rounds rather than pooled over wells so that a campaign
-        whose plates are all the same size -- which is every campaign here --
-        weights each round equally, and so that the number reads as "what a
-        typical plate of this method looks like" rather than as a total that
-        grows with the budget.
+        Averaged over rounds rather than pooled over wells, so the number reads
+        as a typical plate for this method rather than as a total that grows
+        with the budget.
 
         Returns:
             A share in ``[0, 1]``, and ``0.0`` for a campaign with no rounds.
@@ -363,23 +310,18 @@ class CampaignResult:
     def hypervolume(self) -> float | None:
         r"""Volume the measured designs dominate above ``reference_point``.
 
-        The reference point is part of the measurement, not a detail of it: it
-        is the worst value considered acceptable on each objective, designs
-        failing to beat it on every objective contribute nothing, and moving it
-        rescales every number computed against it. Two runs compared on
-        hypervolumes taken from different reference points are not being
-        compared at all, and neither number carries the point it was taken from
-        -- which is why this is ``None`` unless one was supplied and why the
-        point that was used is kept on the result.
+        The reference point is part of the measurement: it is the worst value
+        considered acceptable on each objective, designs failing to beat it on
+        every objective contribute nothing, and moving it rescales every number
+        computed against it. Hypervolumes taken from different reference points
+        are not comparable, so this is ``None`` unless one was supplied and the
+        point used is kept on the result.
 
-        A reference set *too low* is not the safe choice either. Push it far
-        below the data and the volume is dominated by a large constant box that
-        every method earns, differences between methods shrink into the noise of
-        that constant, and a run that found nothing scores nearly as well as one
-        that found the front. For CH65 the defensible choice is the Tite-Seq
-        detection floor, ``(6, 6, 6)``: affinities there are $-\log_{10} K_D$
-        and 6.0 is where the assay stops resolving, so a design that fails to
-        beat it on an objective genuinely contributed nothing on that objective.
+        Setting it *too low* is not the safe choice: push it far below the data
+        and every method earns a large constant box, so differences between
+        methods shrink into that constant's noise. For CH65 the defensible
+        choice is the Tite-Seq detection floor, ``(6, 6, 6)`` -- affinities
+        there are $-\log_{10} K_D$ and 6.0 is where the assay stops resolving.
 
         Returns:
             The dominated volume, or ``None`` when no reference point was
@@ -400,9 +342,9 @@ class CampaignResult:
     def igd_plus(self) -> float | None:
         """How far ``reference_front`` is from being covered by what was measured.
 
-        **Lower is better.** Reported alongside hypervolume rather than instead
-        of it: hypervolume rewards a single design that encloses a large box,
-        and this is what notices that the rest of the front was never approached.
+        **Lower is better.** Reported alongside hypervolume, which rewards a
+        single design enclosing a large box; this notices that the rest of the
+        front was never approached.
 
         Returns:
             The IGD+ indicator, or ``None`` when no reference front was supplied
