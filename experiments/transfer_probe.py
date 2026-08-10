@@ -95,6 +95,12 @@ from typing import TYPE_CHECKING
 import numpy as np
 
 from evogfn.benchmark.determinism import configure_determinism, is_deterministic
+from evogfn.benchmark.scoring import (
+    SCORING_RULE,
+    WORST_FITNESS,
+    scored_metric,
+    scoring_note,
+)
 from evogfn.benchmark.statistics import compare, seeds_needed
 from evogfn.benchmark.store import ResultStore
 from evogfn.benchmark.suite import records_to_metric
@@ -142,24 +148,14 @@ _MIN_PAIRED = 2
 #: when a motif is absent, so zero is the worst *finite* fitness the landscape
 #: defines. It is read off the landscape rather than chosen for the table, which
 #: is the whole reason this convention can be stated in one line of a caption.
-_WORST_FITNESS = 0.0
-
-#: Stated in the report itself, because a mean computed under a convention and a
-#: mean computed without one are different numbers that print identically.
-_SCORING_RULE = (
-    "  scoring: a campaign that proposed nothing feasible finished and measured "
-    f"nothing; it is scored at the landscape's worst fitness ({_WORST_FITNESS:.1f}), "
-    "not dropped"
-)
-
-
 def _worst_case(record: RunRecord, metric: str) -> float | None:
-    """What one metric reads when a campaign measured nothing.
+    """What one metric reads when a campaign at anchor B measured nothing.
 
-    ``regret`` is stored as ``attainable_lower - best``, so the worst case is
-    the audited attainable optimum less the landscape's worst fitness -- a
-    per-seed quantity, since attainability is audited per anchor and a single
-    constant across seeds would be a different and wrong number.
+    The probe's own reader, rather than
+    [worst_case_from_attainable][evogfn.benchmark.scoring.worst_case_from_attainable]:
+    attainability here is audited **per anchor**, so the floor is a per-seed
+    quantity and a single constant across seeds would be a different and wrong
+    number. The record carries it as ``attainable_lower``.
 
     Args:
         record: The campaign that measured nothing.
@@ -170,34 +166,17 @@ def _worst_case(record: RunRecord, metric: str) -> float | None:
         diversity over an empty plate is undefined rather than bad.
     """
     if metric == "best":
-        return _WORST_FITNESS
+        return WORST_FITNESS
     if metric != "regret":
         return None
     lower = record.parameters.get("attainable_lower")
-    return None if lower is None else float(lower) - _WORST_FITNESS
+    return None if lower is None else float(lower) - WORST_FITNESS
 
 
 def _scored(
     records: Mapping[int, RunRecord], seeds: Sequence[int], metric: str
 ) -> tuple[np.ndarray, int, int]:
-    """One metric per seed, with unmeasured seeds scored rather than dropped.
-
-    A campaign whose every proposal was infeasible finishes normally: it spent
-    its plate, it was not `exhausted`, and it
-    measured nothing, so its ``best`` is ``-inf`` and its ``regret`` ``+inf``.
-    One such seed takes the arm's mean to infinity, and ``nanmean`` does not
-    help because an infinity is not a ``nan``.
-
-    Dropping those seeds would report the arm's mean over the seeds it happened
-    to succeed on, which flatters whichever arm failed most often. Scoring them
-    at the landscape's worst fitness keeps every seed in every arm, so the seed
-    sets stay identical and the comparison stays paired. What it costs is that
-    the mean is then part measurement and part convention -- hence the count
-    returned beside it, and `_SCORING_RULE` printed above the table.
-
-    Ordering mirrors `records_to_metric`
-    exactly -- seeds in the given order, absent and exhausted seeds skipped --
-    because the two are read side by side.
+    """One metric per seed, scored at this probe's per-anchor worst case.
 
     Args:
         records: Records by seed.
@@ -205,48 +184,10 @@ def _scored(
         metric: Field name.
 
     Returns:
-        ``(values, scored, unscorable)``: the metric, how many entries were
-        scored rather than measured, and how many measured nothing *and* had no
-        worst case to score them at.
+        ``(values, scored, unscorable)``, as
+        [scored_metric][evogfn.benchmark.scoring.scored_metric] returns them.
     """
-    values: list[float] = []
-    scored = 0
-    unscorable = 0
-    for seed in seeds:
-        record = records.get(seed)
-        if record is None or record.exhausted:
-            continue
-        raw = getattr(record, metric)
-        value = float("nan") if raw is None else float(raw)
-        if np.isfinite(value):
-            values.append(value)
-            continue
-        floor = _worst_case(record, metric)
-        if floor is None:
-            unscorable += 1
-            values.append(float("nan"))
-            continue
-        scored += 1
-        values.append(floor)
-    return np.asarray(values, dtype=np.float64), scored, unscorable
-
-
-def _scored_note(scored: int, unscorable: int) -> str:
-    """How much of a mean is convention rather than measurement.
-
-    Args:
-        scored: Seeds scored at the worst case.
-        unscorable: Seeds that measured nothing and could not be scored.
-
-    Returns:
-        A fragment, empty when every seed measured something.
-    """
-    parts = []
-    if scored:
-        parts.append(f"{scored} scored at worst")
-    if unscorable:
-        parts.append(f"{unscorable} unscorable")
-    return f"  [{', '.join(parts)}]" if parts else ""
+    return scored_metric(records, seeds, metric, _worst_case)
 
 
 def report(store: ResultStore, seeds: list[int], reference: str = REFERENCE_ARM) -> str:
@@ -269,7 +210,7 @@ def report(store: ResultStore, seeds: list[int], reference: str = REFERENCE_ARM)
     """
     lines = [
         "\n=== transfer probe -- diagnostic; licenses no method ranking",
-        _SCORING_RULE,
+        SCORING_RULE,
     ]
     for level in LEVELS:
         task = task_name(level)
@@ -294,7 +235,7 @@ def report(store: ResultStore, seeds: list[int], reference: str = REFERENCE_ARM)
                 f"  {name:<24} regret {mean:>7.4f} +/- {error:<7.4f} "
                 f"best {np.nanmean(best[np.isfinite(best)]):>7.4f}  "
                 f"div {np.nanmean(spread[np.isfinite(spread)]):>5.2f}  "
-                f"n={len(regret)}{_scored_note(scored, unscorable)}"
+                f"n={len(regret)}{scoring_note(scored, unscorable)}"
             )
 
         base = held.get(reference)
