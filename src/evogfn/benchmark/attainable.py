@@ -5,15 +5,11 @@ that is $1.0$ by construction. But a campaign does not search the landscape: it
 searches the [MutationEnvironment][evogfn.env.mutation.MutationEnvironment]
 built around a parent, under a mutation budget and a feasibility mask. If the
 planted optimum is not in *that* set, every method is measured against a target
-none of them could have hit, the regret column has a constant added to it, and
-the part of it that varies between arms -- the only part a comparison reads --
-is compressed into whatever is left.
-
-This module exists because that failure is easy to walk into. Reaching reward
-$1.0$ on an Ehrlich instance means placing every residue of every motif, which
-can sit far outside the mutation budget a task runs under, and a regret column
-computed against $1.0$ regardless is then dominated by a constant nobody
+none of them could have hit, and the regret column carries a constant nobody
 computed.
+
+Reaching reward $1.0$ on an Ehrlich instance means placing every residue of every
+motif, which can sit far outside the mutation budget a task runs under.
 
 What "attainable" means, and why it is often an interval
 --------------------------------------------------------
@@ -30,10 +26,9 @@ and the regret floor is $\max f - \mathrm{att}$. When $\mathcal{R}$ is small
 enough to enumerate this is a measurement, and
 [MutationEnvironment.reachable_terminal_states][evogfn.env.mutation.MutationEnvironment.reachable_terminal_states]
 makes it. It usually is not: a Hamming ball of any useful radius runs to many
-orders of magnitude more designs than can be held. Reporting a searched maximum
-as though it were the
-optimum would then be exactly the error this module was written to catch, one
-level down.
+orders of magnitude more designs than can be held, and reporting a searched
+maximum as though it were the optimum would be this module's own error one level
+down.
 
 So [attainable_optimum][evogfn.benchmark.attainable.attainable_optimum] returns
 an [AttainableOptimum][evogfn.benchmark.attainable.AttainableOptimum], which
@@ -54,9 +49,8 @@ f(x) = \prod_{i=1}^{c} \frac{1}{q}\left\lfloor \frac{g_i(x)}{k/q} \right\rfloor,
 g_i(x) = \max_{\ell} \sum_{j=1}^{k} \mathbb{1}\{x_{\ell + s^{(i)}_j} = m^{(i)}_j\},
 $$
 
-so the whole question is how large the match counts $g_i$ can be made. Two facts
-bound them, and both are properties of the construction graph, not of any
-search:
+so the question is how large the match counts $g_i$ can be made. Two facts bound
+them, both properties of the construction graph rather than of any search:
 
 **Per motif.** Every position of a placement is read once -- the offsets
 $s^{(i)}$ are strictly increasing -- so one substitution raises $g_i$ by at most
@@ -81,8 +75,7 @@ where $S_{ij}$ is the largest number of positions two placements of motifs $i$
 and $j$ can share *while requiring the same token there* -- computed exactly, by
 enumerating placement pairs. Since $g_i \le b_i + |D_i|$, this caps the total
 match gain. Without it the bound would be the per-motif one applied $c$ times
-over, which spends the whole budget once per motif and is far too generous to be
-worth stating.
+over, which spends the whole budget once per motif.
 
 Maximising the product over the integer vectors $(g_1,\dots,g_c)$ that satisfy
 both constraints is then a tiny enumeration, and its value is a certified upper

@@ -1,45 +1,30 @@
 """Persisted results, so no campaign is ever run twice.
 
-A suite run is hours of compute. Three things follow from that, and this module
-exists for all three.
+A suite run is hours of compute. Three things follow, and this module exists for
+all three.
 
 **It must survive interruption.** Each campaign is appended the moment it
 finishes, so a run killed at hour six keeps everything up to hour six. Nothing
 is held in memory waiting for a clean exit that may not come.
 
 **It must resume at seed granularity.** Raising a tier from 30 seeds to 50 runs
-twenty campaigns, not fifty. The key is ``(task, method, seed)``, which is the
-finest unit that produces an independent number.
+twenty campaigns, not fifty. The key is ``(task, method, seed)``, the finest unit
+that produces an independent number.
 
 **It must know when a result is stale.** A cached campaign produced by code that
-has since changed is worse than no cache: it silently mixes old numbers with new
-ones inside a single table. Every record stores a fingerprint of the source that
-produced it, and a record whose fingerprint no longer matches is re-run rather
-than trusted.
+has since changed silently mixes old numbers with new ones inside one table.
+Every record stores a fingerprint of the source that produced it, and a record
+whose fingerprint no longer matches is re-run rather than trusted.
 
 What is fingerprinted, and what is not
 --------------------------------------
 
 The fingerprint is **per module**, one entry per ``.py`` file, and a record
-stores only the modules its own run could have reached: the caller declares
-entry points, and a static walk of the import graph expands them to their
-transitive closure.
-
-Per *package* was the obvious first answer and it was far too coarse. A record
-was stale if any package it named had changed anywhere, so adding an unrelated
-new file -- ``metrics/pareto.py``, say -- invalidated every genetic-algorithm
-result in the store, none of which can reach it. The only way out was to reason
-by hand about which code paths were byte-identical and then call
-[ResultStore.bless][evogfn.benchmark.store.ResultStore.bless]. Hand-reasoning
-about staleness is precisely what must not be load-bearing: it is unreviewable,
-and it fails silently in the direction of trusting a stale number.
-
-Nothing is excluded by name any more. The old scheme had to exempt
-``benchmark`` itself -- adding a task or editing a report would otherwise have
-invalidated every result in the store -- and the closure now does that job
-properly: a report no campaign imports is simply never in one, while a task
-definition that a campaign does reach is, which is right, since it decides what
-was run.
+stores only the modules its own run could have reached: the caller declares entry
+points, and a static walk of the import graph expands them to their transitive
+closure. Nothing is excluded by name -- a report no campaign imports is simply
+never in a closure, while a task definition a campaign does reach is, which is
+right, since it decides what was run.
 
 The walk is static, over `ast`, and deliberately does not import anything:
 importing has side effects, costs seconds per module here, and would need the
@@ -49,9 +34,9 @@ What the walk cannot see
 ------------------------
 
 A static walk is an over-approximation of what a run *reads* and an
-under-approximation of what it *can reach*. The first is harmless -- the cost
-is a re-run. The second is the failure mode that matters, so the honest limits
-are these:
+under-approximation of what it *can reach*. The first is harmless -- the cost is
+a re-run. The second is the failure mode that matters, so the honest limits are
+these:
 
 *Dynamic imports.* ``importlib.import_module(name)`` and any ``__import__``
 with a computed name are invisible. So are Hydra's ``_target_`` strings, which
@@ -65,13 +50,11 @@ lookups keyed by string change behaviour without changing an import.
 versions of torch and numpy underneath all change results and are not hashed.
 
 *Parent ``__init__.py`` files, when nothing imports them by name.* Importing
-``pkg.a.b`` really does execute ``pkg/a/__init__.py``, so following the letter
-of the semantics would put every ancestor package in every closure. That widens
-a closure until it covers most of the tree -- and puts ``metrics/pareto.py``
-back in a genetic-algorithm record, which is the exact failure this replaced.
-The judgement is that these files re-export and nothing
-else; one that registered a handler or patched a default at import time would
-break it, and that is the shape of edit to be careful with.
+``pkg.a.b`` really does execute ``pkg/a/__init__.py``, so following the letter of
+the semantics would put every ancestor package in every closure and widen it
+until it covers most of the tree. The judgement is that these files re-export and
+nothing else; one that registered a handler or patched a default at import time
+would break it, and that is the shape of edit to be careful with.
 
 Against those, [ResultStore.stamp][evogfn.benchmark.store.ResultStore.stamp] is
 happy to over-include: an entry point list that is too broad wastes compute, one
@@ -88,23 +71,20 @@ The hole the walk cannot cover, because it is a person
 
 [ResultStore.bless][evogfn.benchmark.store.ResultStore.bless] overrides all of
 the above by hand, and it is the only way a record can be wrong about its own
-code while claiming to be current. A fix that changes what a finished run would
-have recorded is exactly the case the fingerprint is there to catch, and a
-bless is what un-catches it.
+code while claiming to be current.
 
 Two things follow, and both are enforced below rather than written down as
 advice.
 
-*A bless names what it waves through.* Restamping a whole closure is one
-separate assertion per module that a change could not have altered a finished
-run, made in one call, usually to clear one edit the caller had in mind. Only
+*A bless names what it waves through.* Restamping a whole closure is one separate
+assertion per module that a change could not have altered a finished run. Only
 the modules named are refreshed, so everything else stays stale and gets re-run.
 
 *A bless is recorded on the record.* ``blessed`` says which digests were
-overridden rather than reproduced, and it survives every later read, so a
-suspect column can be traced to the assertion that let it through instead of to
-file timestamps. A record that carries names in that field is a number no
-re-run has ever confirmed.
+overridden rather than reproduced, and it survives every later read, so a suspect
+column can be traced to the assertion that let it through instead of to file
+timestamps. A record that carries names in that field is a number no re-run has
+ever confirmed.
 """
 
 from __future__ import annotations

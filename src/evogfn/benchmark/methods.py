@@ -1,136 +1,82 @@
 """The methodologies under test: samplers crossed with training objectives.
 
 A methodology is whatever turns a task and a seed into a campaign. Keeping that
-one callable means a GFlowNet variant, a classical baseline, and a baseline
-given surrogate access are all the same kind of thing to the harness, and no arm
-can quietly receive a different budget, surrogate or starting point than
-another.
+one callable means a GFlowNet variant, a classical baseline and a baseline given
+surrogate access are all the same kind of thing to the harness, so no arm can
+quietly receive a different budget, surrogate or starting point than another.
 
-Everything a methodology varies is varied *inside* the campaign it returns. The
-task fixes the landscape, the protocol and the wild type; the seed fixes the
+The task fixes the landscape, the protocol and the wild type; the seed fixes the
 surrogate initialisation and the sampler's randomness. What is left is the
-method, which is the only thing a comparison should be measuring.
+method.
 
 The GFlowNet variants train against a proxy, never the oracle
 --------------------------------------------------------------
 
 Each builds a [ProxyLandscape][evogfn.surrogate.proxy.ProxyLandscape] over the
 same surrogate instance the campaign refits, so training costs proxy evaluations
-and never oracle calls. The surrogate is *constitutive* of that pipeline -- it
-is what makes a GFlowNet trainable at 384 assays at all -- rather than an extra
-it is being handed.
+and never oracle calls. The surrogate is constitutive of that pipeline -- it is
+what makes a GFlowNet trainable at 384 assays -- rather than an extra it is
+handed.
 
 The baselines are the pipelines their papers describe
 -----------------------------------------------------
 
-Which means: exactly the components their own papers name, and nothing else.
-For most of them that is bare -- no deep ensemble screening their pool, no proxy
-to optimise against, and a candidate pool their own paper would recognise.
-Handing a classical arm all three makes it a hybrid nobody published, and
-pairing a headline number against such an arm compares against something that
-does not exist in the literature. Published CMA-ES has no surrogate; nor does a
-feasibility-rejecting genetic algorithm, nor either site-saturation walk, nor
-MLDE -- which fits its own kernel ensemble and would otherwise be handed a
-second model to fit predictions to. AdaLead fits its own too.
+Exactly the components their own papers name, and nothing else. For most that is
+bare: no deep ensemble screening their pool, no proxy to optimise against, and a
+candidate pool their own paper would recognise. Published CMA-ES has no
+surrogate; nor does a feasibility-rejecting genetic algorithm, nor either
+site-saturation walk, nor MLDE, which fits its own kernel ensemble. AdaLead fits
+its own too.
 
-`alde` is the exception that proves the rule, and it is bare in the same sense.
-Its published configuration *is* a five-member bootstrapped ensemble read through
-Thompson sampling over an exhaustively screened library, so the surrogate and the
-acquisition rule are constitutive of that pipeline rather than extras handed to
-it -- the same standing the proxy has for a GFlowNet. Taking them away would
-leave an arm called ALDE that is not ALDE.
+`alde` is the exception. Its published configuration *is* a five-member
+bootstrapped ensemble read through Thompson sampling over an exhaustively
+screened library, so the surrogate and the acquisition rule are constitutive of
+that pipeline. Taking them away would leave an arm called ALDE that is not ALDE.
 
-One baseline is run twice, because its budget is not ours
----------------------------------------------------------
+Three MLDE arms, because one budget and one landscape both fail to fit
+-----------------------------------------------------------------------
 
-MLDE's published protocol is 384 screened variants plus a designed plate: 480
-assays, against the 384 every other arm here spends. It does not fit, and there
-is no configuration in which it does -- its *training set alone* is this suite's
-whole budget. So it runs twice. `mlde` is the compressed arm, trained on one
-plate instead of four, which is a handicap its own module names and quantifies;
-`mlde-over-budget` is the published protocol, screening every plate the task
-affords and designing one more.
+MLDE's published protocol is 480 assays against the 384 every other arm spends,
+and its training set alone is this suite's whole budget. So `mlde` is the
+compressed arm, trained on one plate instead of four, and `mlde-over-budget` is
+the published protocol, screening every plate the task affords and designing one
+more. Beating a baseline at its own budget is a stronger claim than beating it at
+ours; reporting only the compressed arm would rest the headline on a comparator
+we had shortened.
 
-Beating a baseline at *its own* budget is a stronger claim than beating it at
-ours, and it is the only version of the claim that survives the obvious
-objection. Reporting only the compressed arm would leave the headline resting on
-a comparator we had shortened, with nothing in the table saying so; reporting
-only the over-budget arm would compare across budgets, which is the failure
-[Protocol][evogfn.benchmark.protocol.Protocol] exists to make visible. Both rows,
-and the arm that costs more says so in its name.
+Both gate their handover on **usable** measurements, and an infeasible assay
+carries no fitness to regress on. On ``feasibility`` the mean feasible share of a
+random screen is 0.053, so 384 assays buy about 20 training examples against
+`mlde`'s 96 and `mlde-over-budget`'s 384: neither handover happens, and only
+``fitted`` in the stored record says so.
 
-And a third arm, because on a constrained landscape neither of them fits
--------------------------------------------------------------------------
-
-Both of those arms gate their handover on **usable** measurements, and an
-infeasible assay carries no fitness to regress on. On the ``feasibility`` task
-the mean feasible share of a random screen is 0.053, so 384 assays buy about 20
-training examples against `mlde`'s 96 and `mlde-over-budget`'s 384. Neither
-handover ever happens: both rows are random screens tabled under a supervised
-method's name, and only ``fitted`` in the stored record says so. That is a real
-finding about the setting and both arms stay exactly as they are to report it.
-
-What it cannot tell us is *why* the row lost, and the two answers are opposite.
 `mlde+earlyfit` is the third arm, at the same oracle budget and at a training
-size small enough that the handover can happen -- **ours**, not Wittmann et al.'s
-protocol, which is what the ``+`` says here as it does for ``cmaes+dp``. It
-answers "would this method be competitive if it ever got to be this method?", and
-between the two rows a reader can separate an arm that is a poor fit for
-constrained spaces from an arm that never fitted. What it gives up is stated
-where the training size is derived, in
-[evogfn.algorithms.baselines.mlde][]: eight measurements is a real fit and very
-nearly no model selection, so a favourable number from it bounds a trained MLDE
-from below rather than measuring one.
+size small enough that the handover can happen -- **ours**, which is what the
+``+`` says here as it does for ``cmaes+dp``. Between the two rows a reader can
+separate an arm that suits constrained spaces badly from an arm that never
+fitted. Eight measurements is a real fit and very nearly no model selection, so a
+favourable number from it bounds a trained MLDE from below; see
+[evogfn.algorithms.baselines.mlde][].
 
-What is *not* here is as much a decision as what is
----------------------------------------------------
+What is not here
+----------------
 
 **Simulated annealing** appears in no baseline table of either lineage this suite
-is measured against, so it is not an arm;
+is measured against.
 [SimulatedAnnealing][evogfn.algorithms.baselines.annealing.SimulatedAnnealing]
-remains available to anyone who wants the comparison, and a registry entry is
-what would put it in a results row.
+remains available; a registry entry is what would put it in a results row.
 
-**δ-CS** (Kim et al., *Improved Off-policy Reinforcement Learning in Biological
-Sequence Design*, ICML 2025) is excluded, and the reasoning is worth writing down
-because it is the comparator a reviewer is most likely to name. Its own algorithm
-is four steps: draw a high-scoring sequence from a **rank-based reweighted prior
-over an offline dataset**, mask each position i.i.d. Bernoulli(δ), re-fill the
-masked positions with a GFlowNet forward policy trained by trajectory balance,
-and adapt δ from a proxy ensemble's disagreement, δ(x) = δ_const - λσ(x). It runs
-at 10 rounds of 128, so 1,280 assays.
-
-Three of those four steps have no faithful reading here:
-
-* **There is no offline dataset.** A campaign in this suite starts from a wild
-  type and zero measurements; δ-CS's benchmarks start from thousands of labelled
-  sequences, and its headline result -- high-scoring designs "even with a single
-  active round" -- is a statement about that prior. Step one has nothing to draw
-  from at round zero, and whatever we substituted would be ours.
-* **δ indexes a set we would have to choose.** The published δ is per position of
-  the *whole sequence*. This suite's state is a set of substitutions inside a
-  mutation budget, so "mask with probability δ" can mean the whole sequence or
-  only the applied substitutions, and at the shipped defaults those differ by
-  roughly a factor of six in how much they destroy. Neither is the paper's, and
-  picking one is a choice we make on the baseline's behalf -- the same objection
-  that keeps `_cmaes_exact` out of the
-  table.
-* **It is a GFlowNet.** δ-CS is trajectory balance plus a destroy-and-rebuild
-  operator and a proxy ensemble; this project's arms are trajectory balance
-  family objectives plus a proxy ensemble. An arm we implemented, tuned and
-  placed in the *baselines* column, then beat with our own, would be a comparison
-  between two of our implementations wearing someone else's citation. Where it
-  belongs, if it is ever run, is beside `gfn-tb` as a variant at its own budget
-  -- not in `BASELINES`.
-
-That is an exclusion with a reason rather than an omission, which is the
-distinction this section exists to mark: ``docs/limitations.md`` already lists
-δ-CS among the controls that were not run, and it stays there.
-
-What replaces the silent default is a named ladder on one representative
-baseline, `BASELINES`. It answers the attribution question a reviewer will ask
--- was it the surrogate or the constructive sampler? -- in a decomposition row
-rather than by making the yardstick a hybrid.
+**δ-CS** (Kim et al., ICML 2025) is excluded for three reasons, and it is the
+comparator a reviewer is most likely to name. Its step one draws from a
+rank-based reweighted prior over an **offline dataset** of thousands of labelled
+sequences, where a campaign here starts from a wild type and zero measurements.
+Its δ is per position of the whole sequence, where this suite's state is a set of
+substitutions inside a mutation budget -- the two readings differ by roughly a
+factor of six in how much they destroy, and picking one is a choice made on the
+baseline's behalf. And it is itself a trajectory-balance GFlowNet plus a
+destroy-and-rebuild operator, so an arm we implemented and placed in the
+baselines column would be a comparison between two of our implementations. If it
+is ever run it belongs beside `gfn-tb` at its own budget, not in `BASELINES`.
 
 Pool size is part of the method
 -------------------------------
@@ -138,21 +84,17 @@ Pool size is part of the method
 A genetic algorithm's pool is its population, and Stanton et al. run population
 == evaluation batch == one plate. CMA-ES's is ``lambda``. Hill climbing proposes
 a neighbourhood of the current point, and the site-saturation walks propose
-exactly the designs their protocol names. MLDE's is an exhaustive library,
-deliberately, and it excludes measured designs internally because that is its
-protocol; ALDE's is the same library, for the same reason. AdaLead's is one
-plate, because its screening happens *inside* its own rollout and what it hands
-up is already the batch it would assay. These differ by three orders of
-magnitude, so one global ``max(2048, batch * 4)`` could not be right for more
-than one of them -- and a pool that large always holds enough distinct candidates
-to fill a plate no matter how badly a method has converged, which hides
-convergence rather than reporting it.
+exactly the designs their protocol names. MLDE's is an exhaustive library, and it
+excludes measured designs internally because that is its protocol; ALDE's is the
+same. AdaLead's is one plate, its screening happening inside its own rollout.
+These differ by three orders of magnitude, so one global
+``max(2048, batch * 4)`` could not be right for more than one of them -- and a
+pool that large always holds enough distinct candidates to fill a plate however
+badly a method has converged, which hides convergence rather than reporting it.
 
-A consequence worth naming: `genetic-feasible`'s rejection burden and the
-threshold at which it declares rejection sampling impractical both key on how
-many candidates it is asked for, so its behaviour moves with this. That is the
-point rather than a side effect -- what that arm burns is proposals, and
-proposals are now a property of the method rather than of the harness.
+`genetic-feasible`'s rejection burden and the threshold at which it declares
+rejection sampling impractical both key on how many candidates it is asked for,
+so its behaviour moves with this.
 
 Every methodology can follow a moved anchor
 -------------------------------------------
@@ -160,8 +102,8 @@ Every methodology can follow a moved anchor
 A task that re-anchors moves its
 [MutationEnvironment][evogfn.env.mutation.MutationEnvironment] to the best design
 measured so far at the end of every round, and the campaign refuses at
-construction if the sampler cannot follow. There are two ways to follow, and the
-campaign prefers the first:
+construction if the sampler cannot follow. Two ways to follow, and the campaign
+prefers the first:
 
 * the sampler implements
   [reanchored][evogfn.loop.campaign.ReanchorableSampler.reanchored] and says what
@@ -170,18 +112,16 @@ campaign prefers the first:
 * the campaign rebuilds it from a factory, which is always correct and always
   forgetful.
 
-Every methodology here supplies a factory, so no task can be configured to
-re-anchor and then fail at construction. The factories are written to close over
-whatever the rebuild must not lose -- the *same* `SequencePolicy` object, so a
-GFlowNet keeps its trained weights, and the *same* `ProxyLandscape`, so it keeps
-its link to the surrogate the campaign refits. What a rebuild does lose is the
-sampler's own accounting: `proxy_calls` and the round count restart, and
+Every methodology supplies a factory, so no task can re-anchor and then fail at
+construction. The factories close over whatever the rebuild must not lose -- the
+*same* `SequencePolicy`, so a GFlowNet keeps its trained weights, and the *same*
+`ProxyLandscape`, so it keeps its link to the surrogate the campaign refits.
+
+What a rebuild does lose is the sampler's own accounting: `proxy_calls` and the
+round count restart, and
 [Campaign.sampler][evogfn.loop.campaign.Campaign.sampler] returns the rebuilt
 object, so a stored ``proxy_calls`` under re-anchoring counts the last anchor's
-rounds rather than the campaign's. That is the reason a sampler with state worth
-keeping should grow a `reanchored` hook rather than rely on the factory -- and
-because the campaign resolves the hook first, doing so takes effect here without
-any change to this module.
+rounds rather than the campaign's.
 """
 
 from __future__ import annotations
