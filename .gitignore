@@ -1,6 +1,7 @@
 # Local working directories — never committed
 notes/
 manuscript/
+archived/
 
 # Byte-compiled / optimized
 __pycache__/
