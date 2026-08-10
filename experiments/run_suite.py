@@ -89,6 +89,12 @@ from evogfn.benchmark.methods import (
     shipped_base,
     variant_arms,
 )
+from evogfn.benchmark.scoring import (
+    SCORING_RULE,
+    scored_metric,
+    scoring_note,
+    worst_case_from_attainable,
+)
 from evogfn.benchmark.selection import _build_objective
 from evogfn.benchmark.statistics import (
     compare,
@@ -119,6 +125,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable, Mapping, Sequence
 
     from evogfn.benchmark.attainable import AttainableOptimum
+    from evogfn.benchmark.scoring import WorstCase
     from evogfn.benchmark.statistics import PairedComparison
     from evogfn.benchmark.store import RunRecord
     from evogfn.benchmark.tasks import Task
@@ -904,6 +911,11 @@ def report(store: ResultStore, tier: Tier, reference: str | None = None) -> str:
         copies = _reproduce(store, task, held)
         seeds = [s for s in tier.seeds if all(s in held[n] for n in names if held[n])]
         rows, solved, unfitted = _arm_rows(held, names, tier.seeds, attainable, reproduced=copies)
+        # Above the rows it applies to, and only where it applied: a mean taken
+        # under the convention and one taken without it print identically, so a
+        # table that states the rule unconditionally teaches a reader to skip it.
+        if any("scored at worst" in row or "unscorable" in row for row in rows):
+            lines.append(SCORING_RULE)
         lines.extend(rows)
         lines.extend(_reproduction_legend(copies))
         for name in sorted(solved):
@@ -927,12 +939,25 @@ def report(store: ResultStore, tier: Tier, reference: str | None = None) -> str:
 
         lines.extend(
             _paired(
-                held, names, seeds, reference, solved=solved, unfitted=unfitted, reproduced=copies
+                held,
+                names,
+                seeds,
+                reference,
+                solved=solved,
+                unfitted=unfitted,
+                reproduced=copies,
+                worst_case=worst_case_from_attainable(attainable.lower if attainable else None),
             )
         )
         lines.extend(
             _mechanism_pairs(
-                held, names, seeds, solved=solved, unfitted=unfitted, reproduced=copies
+                held,
+                names,
+                seeds,
+                solved=solved,
+                unfitted=unfitted,
+                reproduced=copies,
+                worst_case=worst_case_from_attainable(attainable.lower if attainable else None),
             )
         )
     # After every per-task table, never instead of them. The tables above are
@@ -1021,7 +1046,7 @@ class InstanceEffects:
         )
 
 
-def instance_effects(  # noqa: PLR0913 - a per-instance effect names both arms and every draw
+def instance_effects(  # noqa: PLR0913, PLR0917 - a per-instance effect names both arms and every draw
     store: ResultStore,
     tasks: Sequence[Task],
     shape: str,
@@ -1290,7 +1315,18 @@ def _arm_rows(
         records = held[name]
         if not records:
             continue
-        regret = records_to_metric(records, seeds, "regret")
+        # Scored rather than dropped: a campaign whose every proposal was
+        # infeasible finished, spent its plate and measured nothing, so its
+        # regret is `+inf` and one such seed takes the whole row to infinity.
+        # See [evogfn.benchmark.scoring][] for why the alternative -- dropping
+        # those seeds -- both flatters the arm that failed most often and breaks
+        # the pairing below.
+        regret, scored, unscorable = scored_metric(
+            records,
+            seeds,
+            "regret",
+            worst_case_from_attainable(attainable.lower if attainable else None),
+        )
         feasible = records_to_metric(records, seeds, "feasible_fraction")
         spread = records_to_metric(records, seeds, "diversity")
         spent = records_to_metric(records, seeds, "oracle_calls")
@@ -1346,6 +1382,7 @@ def _arm_rows(
             f"at-opt {share:>5.2f}  feas {feasible.mean():>5.3f}  "
             f"div {spread.mean():>5.2f}  spent {spent.mean():>6.0f}  "
             f"proxy {proxy.mean():>7.0f}  n={len(regret)}{failed}{unfit}{mark}{repeat}"
+            f"{scoring_note(scored, unscorable)}"
         )
     return lines, solved, unfitted
 
@@ -1359,6 +1396,7 @@ def _paired(  # noqa: PLR0913 - each argument is one qualifier a p-value needs
     solved: set[str],
     unfitted: set[str],
     reproduced: Mapping[str, str] | None = None,
+    worst_case: WorstCase | None = None,
 ) -> list[str]:
     """Compare every arm against the reference, paired across shared seeds.
 
@@ -1378,6 +1416,10 @@ def _paired(  # noqa: PLR0913 - each argument is one qualifier a p-value needs
             difference is exactly zero, so the standard error is zero -- and a
             printed ``nan`` there would look like a failed test rather than a
             comparison that never had anything to compare.
+        worst_case: How to score a seed whose campaign measured nothing, so that
+            an unmeasured seed neither makes every difference against it ``-inf``
+            nor gets dropped from one side of a pair. ``None`` scores nothing,
+            which is right only where the task was never audited.
 
     Returns:
         Report lines, including a line naming the omission when there is
@@ -1415,8 +1457,13 @@ def _paired(  # noqa: PLR0913 - each argument is one qualifier a p-value needs
             )
             lines.append(f"    {name} vs {reference}: not paired -- {because}")
             continue
-        mine = records_to_metric(held[name], seeds, "regret")
-        theirs = records_to_metric(base, seeds, "regret")
+        # Scored, not dropped, and by the same rule the rows above use: an
+        # unmeasured seed left in raw would make every difference against it
+        # `-inf`, and dropped from one side only would pair two different seed
+        # sets. See [evogfn.benchmark.scoring][].
+        reader = worst_case or worst_case_from_attainable(None)
+        mine, _, _ = scored_metric(held[name], seeds, "regret", reader)
+        theirs, _, _ = scored_metric(base, seeds, "regret", reader)
         if len(mine) != len(theirs) or len(mine) < 2:  # noqa: PLR2004
             # Said rather than skipped. The lengths differ when one of the two
             # arms exhausted on a seed the other completed, and a pairing that
@@ -1466,6 +1513,7 @@ def _mechanism_pairs(  # noqa: PLR0913 - each argument is one qualifier a p-valu
     solved: set[str],
     unfitted: set[str],
     reproduced: Mapping[str, str] | None = None,
+    worst_case: WorstCase | None = None,
 ) -> list[str]:
     """The mechanism rungs, paired against the shipped arm rather than `genetic`.
 
@@ -1493,6 +1541,10 @@ def _mechanism_pairs(  # noqa: PLR0913 - each argument is one qualifier a p-valu
             mechanism has nothing to act on here, so it is exactly the rung this
             block cannot say anything about -- and the block says that, in place of
             a difference that is zero by construction.
+        worst_case: Passed through to
+            [_paired][run_suite._paired]; the rungs are the arms this most often
+            matters for, since a mechanism that proposes nothing feasible is
+            exactly what it is there to report.
 
     Returns:
         Report lines, or none where this tier holds no rungs -- which is every
@@ -1521,7 +1573,16 @@ def _mechanism_pairs(  # noqa: PLR0913 - each argument is one qualifier a p-valu
         ]
     return [
         heading,
-        *_paired(held, rungs, seeds, base, solved=solved, unfitted=unfitted, reproduced=copies),
+        *_paired(
+            held,
+            rungs,
+            seeds,
+            base,
+            solved=solved,
+            unfitted=unfitted,
+            reproduced=copies,
+            worst_case=worst_case,
+        ),
     ]
 
 
