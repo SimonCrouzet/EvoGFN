@@ -110,8 +110,8 @@ packages = ["src/evogfn"]
 dev = [
     "pytest>=8.3",
     "pytest-cov>=5.0",
-    "hypothesis>=6.164.0",
-    "ruff>=0.7",
+    "hypothesis>=6.165.2",
+    "ruff>=0.16.2",
     "mypy>=1.13",
     "pre-commit>=4.0",
 ]
