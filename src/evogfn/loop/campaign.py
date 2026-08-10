@@ -1,9 +1,9 @@
 """The design-build-test-learn round engine.
 
-A campaign is what directed evolution actually is: a few rounds, each measuring
-a batch of variants, each informed by everything measured before. This module
-runs that loop identically for every sampler, so a difference in results is a
-difference between methods rather than between harnesses.
+A campaign is a few rounds, each measuring a batch of variants, each informed by
+everything measured before. This module runs that loop identically for every
+sampler, so a difference in results is a difference between methods rather than
+between harnesses.
 
 What a round does
 -----------------
@@ -24,39 +24,30 @@ The plate is always full
 ------------------------
 
 Every round charges exactly ``batch_size`` oracle calls, so a campaign spends
-exactly ``rounds * batch_size``. That is an invariant rather than a tendency,
-and it is stated here because the alternative is silent: with a pool the size of
-the plate, deduplicating it and assaying whatever survives leaves part of the
-oracle budget unspent without any round reporting an error, and the budget every
-claim is indexed by is then wrong in the direction that flatters whichever
-method happens to repeat itself least.
+exactly ``rounds * batch_size``. That is an invariant rather than a tendency: the
+alternative fails silently, leaving part of the oracle budget unspent without any
+round reporting an error, and the budget every claim is indexed by is then wrong
+in the direction that flatters whichever method repeats itself least.
 
 Where the line between "already measured" and "measured twice" is drawn
 -----------------------------------------------------------------------
 
 **Across rounds, the campaign remembers.** A design measured in an earlier round
 is not re-ordered, and the sampler is asked again until the plate fills without
-it. This is protocol, on the same footing as re-anchoring: the whole reason to
-run rounds rather than one large batch is that each round is informed by what
-the last one measured, and a lab does not re-assay a variant whose number is
-already in the notebook. It is given to every arm on that reasoning, not to one
-method as a favour.
+it. This is protocol, on the same footing as re-anchoring, and it is given to
+every arm.
 
 **Within a round, duplicates are charged.** A genetic algorithm that breeds 96
 offspring of which 10 are identical has consumed 96 wells and bought 86 distinct
-data points, and that is the real price of its own convergence. Silently
-collapsing them would hand a converging method free measurements and hide the
-one cost convergence has. The topping-up above serves the cross-round memory and
-nothing else: it never launders a repeat the sampler produced inside one plate.
+data points. The topping-up above serves the cross-round memory and nothing else:
+it never launders a repeat the sampler produced inside one plate.
 [RoundRecord.duplicate_fraction][evogfn.loop.ledger.RoundRecord.duplicate_fraction]
-reports what that cost, so it is measurable rather than assumed.
+reports what that cost.
 
 **Both halves are counted, and they are twins.** ``duplicate_fraction`` is
-repetition *within* one plate; `RoundRecord.redundant`
-is repetition against the campaign's memory *across* rounds -- the skip below,
-which used to happen silently. A converged sampler produces both at once, so
-reading either alone attributes the other's cost to itself, and resolving that
-misattribution is the only reason the second number exists.
+repetition *within* one plate; `RoundRecord.redundant` is repetition against the
+campaign's memory *across* rounds. A converged sampler produces both at once, so
+reading either alone attributes the other's cost to itself.
 
 ``distinct_batch`` is the ablation that moves the line, filling the plate with
 ``batch_size`` distinct designs instead of ``batch_size`` proposals. It is a
@@ -67,35 +58,28 @@ neither can be derived from the other's ledger.
 Why the sampler does not touch the oracle
 -----------------------------------------
 
-Training a GFlowNet takes thousands of reward evaluations. Charging those
-against the oracle budget would exhaust a realistic 384-call campaign before the
-first round finished, and no published method does it -- GFN-AL trains the
-sampler against a learned proxy and spends the real budget only on the selected
-batch. Getting this wrong does not produce an error; it produces a benchmark in
-which the GFlowNet appears catastrophically sample-inefficient for a reason that
-has nothing to do with GFlowNets.
+Training a GFlowNet takes thousands of reward evaluations, which would exhaust a
+384-call campaign before the first round finished. No published method does it --
+GFN-AL trains the sampler against a learned proxy and spends the real budget only
+on the selected batch. Getting this wrong does not produce an error; it produces
+a benchmark in which the GFlowNet appears catastrophically sample-inefficient for
+a reason that has nothing to do with GFlowNets.
 
 The seam is deliberately implicit: a sampler that wants to train against the
 surrogate is constructed with *the same surrogate instance* the campaign holds.
-Refitting mutates it in place, so the sampler sees each round's model without
-the campaign needing to know which samplers care.
+Refitting mutates it in place, so the sampler sees each round's model without the
+campaign needing to know which samplers care.
 
 Re-anchoring between rounds
 ---------------------------
 
 A [MutationEnvironment][evogfn.env.mutation.MutationEnvironment] searches within
 ``max_mutations`` of the design it is anchored to. Hold that anchor at the wild
-type for the whole campaign and every round re-searches the same Hamming ball:
-four rounds of a four-mutation budget still reach only four mutations from the
-wild type, not sixteen. That is not what directed evolution does. Each real round
-starts from the best variant the last one produced, and cumulative distance grows
-while the per-round budget does not.
-
-The difference is not a matter of degree. A planted optimum can sit further from
-the wild type than a per-round mutation budget reaches, so under a fixed anchor
-no method can reach it *in principle* -- and a regret reported against it is a
-regret nothing could have closed, which every method reports identically and
-which says nothing about any of them.
+type and every round re-searches the same Hamming ball: four rounds of a
+four-mutation budget still reach only four mutations from the wild type, not
+sixteen. A planted optimum can sit further from the wild type than a per-round
+budget reaches, so under a fixed anchor no method can reach it in principle, and
+a regret reported against it is one nothing could have closed.
 
 ``reanchor`` turns the mechanism on, and it is off by default so that no number
 already reported moves without someone asking for it. What the sampler needs when
@@ -109,22 +93,20 @@ construction rather than mid-campaign.
 Defaults
 --------
 
-Four rounds of 96, so 384 oracle calls. That is not a round number picked for
-convenience -- it is the size of real ML-guided campaigns. ALDE (Arnold lab,
-2025) screened 396 variants as six 96-well plates over three rounds; LaMBO-2's
-wet-lab campaign measured 374 over three rounds. The iterative-benchmark
-convention of 1,000-10,000 evaluations sits above even *classical* directed
-evolution, and well above the regime where MLDE's advantage is claimed.
+Four rounds of 96, so 384 oracle calls, which is the size of real ML-guided
+campaigns: ALDE (Arnold lab, 2025) screened 396 variants as six 96-well plates
+over three rounds, and LaMBO-2's wet-lab campaign measured 374 over three. The
+iterative-benchmark convention of 1,000-10,000 evaluations sits above even
+classical directed evolution.
 
 Running against more than one objective
 --------------------------------------
 
 [CH65Landscape][evogfn.landscapes.ch65.CH65Landscape] returns three affinities
-per variant, and every step of the round above assumes one number: the surrogate
-is fitted to a scalar, the acquisition rule ranks a scalar, the ledger records a
-best-so-far. Something has to state the trade-off, and the campaign refuses to
-be that something -- an invented weighting would be applied to the surrogate, to
-the ranking and to the report without ever appearing in the output.
+per variant, and every step above assumes one number. Something has to state the
+trade-off, and the campaign refuses to be that something -- an invented weighting
+would be applied to the surrogate, to the ranking and to the report without ever
+appearing in the output.
 
 Instead the *acquisition rule* carries it. A multi-objective campaign is
 constructed with
@@ -133,15 +115,14 @@ loop asks it, through
 [reduce_objectives][evogfn.acquisition.base.Acquisition.reduce_objectives], for
 the one value it ranks. The surrogate's training target, the incumbent an
 improvement rule improves on, and ``best_so_far`` are then the same trade-off by
-construction rather than by three separate call sites agreeing. A rule that
-cannot answer makes the campaign raise *before* the first oracle call, not
-after 384 of them.
+construction. A rule that cannot answer makes the campaign raise *before* the
+first oracle call.
 
 What survives as a vector is the *record*: every measurement is stored as the
 objective vector it was, and
-[CampaignResult][evogfn.loop.ledger.CampaignResult] reports hypervolume and
-IGD+ over those vectors. The scalarisation directs the search; it does not
-decide what the search is scored by.
+[CampaignResult][evogfn.loop.ledger.CampaignResult] reports hypervolume and IGD+
+over those vectors. The scalarisation directs the search; it does not decide what
+the search is scored by.
 """
 
 from __future__ import annotations
