@@ -146,26 +146,45 @@ def _record(*, method, seed, regret, task=None):
 class TestTheRungsAreInTheHeadlineTier:
     """Reported, not promoted: they are there without anybody taking a step."""
 
-    def test_every_rung_runs_in_main(self, run_suite, rungs):
+    def test_every_unsuspended_rung_runs_in_main(self, run_suite, rungs):
         # The whole change in one assertion. It has to hold with no file written
         # and no flag passed, because "the rungs appear once somebody promotes"
         # is exactly the design this replaced.
-        assert set(rungs) <= set(run_suite.methods_for(_tier(run_suite.MAIN_TIER)))
+        #
+        # Read against `SUSPENDED_ARMS` rather than against a fixed list of five:
+        # a suspension is a statement about one arm's stored numbers, and a test
+        # that hard-codes the ladder's width turns every such statement into a
+        # failure somewhere unrelated to it.
+        live = set(rungs) - run_suite.SUSPENDED_ARMS
+        assert live
+        assert live <= set(run_suite.methods_for(_tier(run_suite.MAIN_TIER)))
 
-    def test_main_adds_exactly_the_four_rungs_that_are_not_the_shipped_arm(
-        self, run_suite, rungs, base
-    ):
-        # The base rung *is* the selected arm, so the tier gains four arms and
-        # not five. Read against `replication`, which runs the same baselines and
+    def test_a_suspended_rung_reaches_no_tier_at_all(self, run_suite):
+        # The other half, and the one that matters: an arm is suspended because
+        # its stored numbers are not believed, so reaching *any* table by *any*
+        # route is the failure. `methods_for` applies the filter last for that
+        # reason, after every per-tier addition.
+        for name in ("main", "replication", "objectives", "sensitivity"):
+            reached = run_suite.SUSPENDED_ARMS & set(run_suite.methods_for(_tier(name)))
+            assert not reached, f"{name} runs a suspended arm: {sorted(reached)}"
+
+    def test_main_adds_exactly_the_rungs_that_are_not_the_shipped_arm(self, run_suite, base):
+        # The base rung *is* the selected arm, so the tier gains the ladder
+        # minus one. Read against `replication`, which runs the same baselines and
         # the same selected arm and none of the rungs: the difference between the
-        # two tiers is the study, and a fifth entry there would be the shipped
+        # two tiers is the study, and a further entry there would be the shipped
         # configuration under a second name.
         headline = run_suite.methods_for(_tier(run_suite.MAIN_TIER))
         without = run_suite.methods_for(_tier("replication"))
 
         assert base in headline
         assert base in without
-        assert set(headline) - set(without) == set(rungs) - {base}
+        # Derived from the builder rather than from `variant_arms`, because the
+        # ladder is not the only source of rungs: `+reinit` is the shipped arm's
+        # own amortisation switched off, so it is added beside them and belongs
+        # in this difference without belonging in that list.
+        added = set(run_suite._mechanism_rungs(without)) - run_suite.SUSPENDED_ARMS
+        assert set(headline) - set(without) == added
 
     def test_a_builder_that_renamed_the_shipped_arm_raises(self, run_suite, monkeypatch):
         # The silent version of this is the bad one: the ladder's base and the
@@ -346,6 +365,20 @@ class TestTheRungsThatCannotBeMeasuredAreReproducedRatherThanRun:
     measurable and the row is a copy of an arm it no longer equals.
     """
 
+    @pytest.fixture(autouse=True)
+    def _unsuspended(self, run_suite, monkeypatch):
+        """Every test here is about the reproduction machinery, not the roster.
+
+        `SUSPENDED_ARMS` holds an arm back from every tier while its stored
+        numbers are being diagnosed, which is a statement about those numbers.
+        The reproduction rows are a statement about the *environment* -- a rung
+        whose mechanism has nothing to act on here is its neighbour's campaign
+        under another name, whoever is currently suspended. Leaving the
+        suspension in place would make these tests assert the roster instead,
+        and they would go green the day it changed for an unrelated reason.
+        """
+        monkeypatch.setattr(run_suite, "SUSPENDED_ARMS", frozenset())
+
     @pytest.fixture
     def loose(self):
         """A task where the mechanism has nothing to defer."""
@@ -361,10 +394,24 @@ class TestTheRungsThatCannotBeMeasuredAreReproducedRatherThanRun:
         return store
 
     def test_the_two_terminal_rungs_are_named_as_reproductions(self, run_suite, loose, base):
-        assert run_suite._reproduced_on(loose) == {
-            f"{base}+terminal": base,
-            f"{base}+terminal+anchor": f"{base}+anchor",
-        }
+        # Asserted entry by entry rather than as a whole dict. The mapping gains
+        # a rung whenever a mechanism turns out to have nothing to act on here --
+        # `+reinit` did, on a task that never moves its anchor -- and an equality
+        # against a literal turns each such addition into a failure of the two
+        # entries it says nothing about.
+        reproduced = run_suite._reproduced_on(loose)
+
+        assert reproduced[f"{base}+terminal"] == base
+        assert reproduced[f"{base}+terminal+anchor"] == f"{base}+anchor"
+
+    def test_a_task_that_never_moves_its_anchor_also_reproduces_the_reinit_rung(
+        self, run_suite, loose, base
+    ):
+        # For the same reason and by the same rule: nothing can survive a move
+        # the task never makes, so carrying the policy is the base arm under a
+        # second name.
+        assert not loose.reanchor
+        assert run_suite._reproduced_on(loose)[f"{base}{run_suite.REINIT_RUNG}"] == base
 
     def test_a_task_that_constrains_construction_reproduces_nothing(self, run_suite):
         # Derived from the environment, so the diagnostic instance -- which has a
