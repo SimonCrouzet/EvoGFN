@@ -196,7 +196,7 @@ import itertools
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, replace
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
@@ -210,7 +210,12 @@ from evogfn.algorithms.gflownet.sampler import GFlowNetSampler
 from evogfn.algorithms.gflownet.training import TrainingConfig
 from evogfn.algorithms.inner_loop import ProxyOptimising
 from evogfn.benchmark.determinism import is_deterministic
-from evogfn.benchmark.methods import DEFAULT_HIDDEN_DIM
+from evogfn.benchmark.methods import (
+    DEFAULT_HIDDEN_DIM,
+    ArmParameter,
+    _objective_parameters,
+    shipped_base,
+)
 from evogfn.benchmark.protocol import PLATE, Protocol
 from evogfn.benchmark.suite import DIAGNOSTIC_MUTATIONS, Purpose, Tier
 from evogfn.benchmark.tasks import Task
@@ -247,6 +252,48 @@ if TYPE_CHECKING:
 #: because those are the only two and naming them is more informative than
 #: naming the two methods they have in common.
 MultiObjectiveMethodology = Callable[["Task", int], "Campaign | PreferenceEnsemble"]
+
+
+@dataclass(frozen=True, slots=True)
+class MultiObjectiveArm:
+    """A runnable arm, and the configuration that produced it.
+
+    The single-objective suite's [Arm][evogfn.benchmark.methods.Arm] carries its
+    resolved settings so every record can state what ran. This suite's arms were
+    bare closures, so `run_multi_objective_task` had nothing to stamp and every
+    multi-objective record stored ``parameters: {}``.
+
+    That is not cosmetic here. `preference_arms` states outright that its names
+    are fixed on the axis the tier varies and do *not* encode the objective, so
+    "a diagnostic run under a non-default one is distinguished by the run's
+    configuration rather than by the arm name" -- a contract that can only hold
+    if the configuration reaches the record. It did not, so two diagnostics run
+    at different objectives were one indistinguishable ``(task, arm)`` cell.
+
+    Callable, so it substitutes for `MultiObjectiveMethodology` wherever one is
+    declared and no caller had to change; the parameters are read by attribute at
+    the one place that stamps them, the way ``bred_designs`` already is.
+
+    Attributes:
+        run: What the arm does with a task and a seed.
+        parameters: Its resolved configuration, stamped onto every record.
+    """
+
+    run: MultiObjectiveMethodology
+    parameters: Mapping[str, ArmParameter]
+
+    def __call__(self, task: Task, seed: int) -> Campaign | PreferenceEnsemble:
+        """Run the arm.
+
+        Args:
+            task: What to run on.
+            seed: The seed.
+
+        Returns:
+            One campaign, or an ensemble sharing one budget.
+        """
+        return self.run(task, seed)
+
 
 #: CH65's 16 binary sites, and the per-round mutation budget on `ch65-real`. Equal
 #: to the sequence length, so the ball of radius 16 around the germline *is* the
@@ -1582,7 +1629,16 @@ def classical_arm(
             pool_size=pool_size,
         )
 
-    return arm
+    return MultiObjectiveArm(
+        arm,
+        {
+            "family": "classical",
+            "sampler": getattr(build, "__name__", "unknown").lstrip("_"),
+            "surrogate": surrogate,
+            "proxy_access": proxy_access,
+            "pool_size": float(pool_size),
+        },
+    )
 
 
 def _random(env: MutationEnvironment, seed: int) -> Sampler:
@@ -1660,7 +1716,7 @@ def nsga2_arm() -> MultiObjectiveMethodology:
             pool_size=task.protocol.batch_size * UNSELECTED_POOL_PLATES,
         )
 
-    return arm
+    return MultiObjectiveArm(arm, {"family": "population", "sampler": "NSGA-II"})
 
 
 def scalarized_gflownet_arm(  # noqa: PLR0913 - the training knobs, plus the axis this suite sweeps
@@ -1775,7 +1831,18 @@ def scalarized_gflownet_arm(  # noqa: PLR0913 - the training knobs, plus the axi
         ]
         return campaigns[0] if preferences == 1 else PreferenceEnsemble(campaigns)
 
-    return arm
+    return MultiObjectiveArm(
+        arm,
+        {
+            "family": "gflownet",
+            **_objective_parameters(objective),
+            "preferences": float(preferences),
+            "steps": float(steps),
+            "beta": beta,
+            "learn_flow": learn_flow,
+            "hidden_dim": float(hidden_dim),
+        },
+    )
 
 
 def _one_gflownet(  # noqa: PLR0913 - one campaign per preference, and it needs all of it
@@ -2085,7 +2152,20 @@ def preference_conditioned_arm(  # noqa: PLR0913 - the training knobs, plus what
             pool_size=DEFAULT_POOL,
         )
 
-    return arm
+    return MultiObjectiveArm(
+        arm,
+        {
+            "family": "gflownet-preference-conditioned",
+            **_objective_parameters(objective),
+            "preferences": float(preferences),
+            "steps": float(steps),
+            "beta": beta,
+            "alpha": alpha,
+            "preference_bins": float(n_bins),
+            "hidden_dim": float(hidden_dim),
+            "scalarization": type(scalarization).__name__ if scalarization else "default",
+        },
+    )
 
 
 def _as_multi_objective(task: Task) -> MultiObjectiveTask:
@@ -2109,6 +2189,49 @@ def _as_multi_objective(task: Task) -> MultiObjectiveTask:
             f"MultiObjectiveTask"
         )
     return task
+
+
+def _scalar_settings(
+    objective: GFlowNetObjective | None,
+    *,
+    learn_flow: bool | None = None,
+    hidden_dim: int | None = None,
+) -> dict[str, Any]:
+    """The configuration a scalarised GFlowNet arm runs under.
+
+    Defaults to the **recorded single-objective selection** rather than to this
+    module's own constants. A scalarised arm is the single-objective method
+    applied to a weighted sum, so running it at anything else reports a method
+    nobody selected -- and until this existed the suite did exactly that, at
+    trajectory balance where the selection chose sub-trajectory balance, at
+    ``beta=3.0`` where it chose ``0.1`` and at width 128 where it chose 64.
+
+    Read through `shipped_base` for the reason
+    [variant_arms][evogfn.benchmark.methods.variant_arms] does: a module that
+    reaches into a results file is coupled to it, while a parameter with a
+    restated default drifts the moment a selection moves. Every value stays
+    overridable, so a caller studying a different configuration says so.
+
+    Args:
+        objective: The training objective, or ``None`` for the selection's.
+        learn_flow: Whether to build a flow head, or ``None`` for the
+            selection's. Sub-trajectory balance needs one, so a caller taking
+            the selected objective and this module's old ``False`` would get a
+            silently flowless subTB.
+        hidden_dim: Trunk width, or ``None`` for the selection's.
+
+    Returns:
+        Keyword arguments for
+        [scalarized_gflownet_arm][evogfn.benchmark.multi_objective.scalarized_gflownet_arm].
+    """
+    base = shipped_base()
+    return {
+        "objective": base.objective if objective is None else objective,
+        "beta": base.beta,
+        "steps": base.steps,
+        "learn_flow": base.learn_flow if learn_flow is None else learn_flow,
+        "hidden_dim": base.hidden_dim if hidden_dim is None else hidden_dim,
+    }
 
 
 #: The arms of the main and explanatory tiers: five published pipelines, then
@@ -2139,14 +2262,16 @@ ARMS: dict[str, MultiObjectiveMethodology] = {
     "random": classical_arm(_random),
     "nsga2": nsga2_arm(),
     "genetic": classical_arm(_genetic),
-    "gfn-tb-scalar": scalarized_gflownet_arm(),
+    "gfn-tb-scalar": scalarized_gflownet_arm(**_scalar_settings(None)),
     # The preference-conditioned pipeline, and the only arm here whose policy is
     # trained on the multi-objective problem rather than on a scalarisation of
     # it. Registered at the same defaults `preference_arms` builds it at, so the
     # headline row and the diagnostic's conditioned row are the same arm: were
     # they configured differently, F2's finding would be about something other
     # than the row the table reports and only the shared name would say so.
-    "mogfn-pc": preference_conditioned_arm(),
+    "mogfn-pc": preference_conditioned_arm(
+        beta=_scalar_settings(None)["beta"], hidden_dim=_scalar_settings(None)["hidden_dim"]
+    ),
     # Ablations. Each keeps the library pool because a screen with nothing to
     # screen is not a screen: at a plate the model would rank 96 candidates into
     # 96 wells and change nothing at all.
@@ -2195,8 +2320,8 @@ SCOPE_NOTES: dict[str, str] = {
 def preference_arms(
     objective: GFlowNetObjective | None = None,
     *,
-    learn_flow: bool = False,
-    hidden_dim: int = DEFAULT_HIDDEN_DIM,
+    learn_flow: bool | None = None,
+    hidden_dim: int | None = None,
 ) -> dict[str, MultiObjectiveMethodology]:
     """The same GFlowNet at each preference count, at fixed total budget.
 
@@ -2238,14 +2363,20 @@ def preference_arms(
         the change, and what makes it wrong to read two such runs as the same
         arm.
     """
+    chosen = _scalar_settings(objective, learn_flow=learn_flow, hidden_dim=hidden_dim)
     arms: dict[str, MultiObjectiveMethodology] = {
-        f"gfn-tb-pref{count}": scalarized_gflownet_arm(
-            count, objective, learn_flow=learn_flow, hidden_dim=hidden_dim
-        )
+        f"gfn-tb-pref{count}": scalarized_gflownet_arm(count, **chosen)
         for count in PREFERENCE_COUNTS
     }
+    # The conditioned arm does **not** take the scalar arms' objective, and the
+    # reason is structural rather than an oversight. Preference conditioning
+    # needs an objective that conditions on the preference vector, and the
+    # selection's sub-trajectory balance would need intermediate flow scoring
+    # that this loop does not do -- this arm has no ``learn_flow`` to give it a
+    # flow head with. It keeps `ConditionalTrajectoryBalance` and takes only the
+    # settings that *are* transferable.
     arms["mogfn-pc"] = preference_conditioned_arm(
-        PC_PREFERENCE_COUNT, objective, hidden_dim=hidden_dim
+        PC_PREFERENCE_COUNT, beta=chosen["beta"], hidden_dim=chosen["hidden_dim"]
     )
     return arms
 
@@ -2437,6 +2568,11 @@ def run_multi_objective_task(
                     # different points are not comparable, and nothing in either
                     # number says so.
                     protocol=repr(task),
+                    # By attribute, for the reason the fields below are: an arm
+                    # that states no configuration is not an error, and asking
+                    # the callable interface for one would make every closure
+                    # declare a mapping only `MultiObjectiveArm` carries.
+                    parameters=dict(getattr(arm, "parameters", {})),
                     **set_indicators(task, result),
                     diversity=(
                         diversity(result.sequences)

@@ -80,6 +80,7 @@ from evogfn.benchmark.store import ResultStore
 from evogfn.benchmark.suite import Tier, records_to_metric
 
 if TYPE_CHECKING:
+    from evogfn.benchmark.multi_objective import MultiObjectiveMethodology
     from evogfn.benchmark.tasks import Task
 
 #: Seeds for the headline tier. Fewer than the single-objective suite's 100: a
@@ -133,6 +134,29 @@ TIER_ROLES = {
 
 # Two observations are the fewest a paired comparison can be drawn from.
 _MIN_PAIRED = 2
+
+
+def _arms(tier: Tier, wanted: list[str] | None) -> dict[str, MultiObjectiveMethodology]:
+    """The arms a tier runs, narrowed to those named.
+
+    Args:
+        tier: The tier being run.
+        wanted: Arm names to keep, or ``None`` for all of them.
+
+    Returns:
+        Arms by name.
+
+    Raises:
+        ValueError: If a named arm is not one this tier runs. Silently sweeping a
+            smaller set is how a shard comes to run nothing and report success,
+            and a typo in a launcher script is exactly how that happens.
+    """
+    arms = arms_for_tier(tier)
+    if not wanted:
+        return arms
+    if missing := sorted(set(wanted) - set(arms)):
+        raise ValueError(f"{tier.name} runs no arm named {missing}; it has {sorted(arms)}")
+    return {name: arm for name, arm in arms.items() if name in wanted}
 
 
 def _task_note(task: Task) -> str:
@@ -287,6 +311,15 @@ def main(argv: list[str] | None = None) -> int:
         "keeps one file per task and method -- so a process per task uses the "
         "cores far better than threads do, most of the work being serial Python.",
     )
+    parser.add_argument(
+        "--method",
+        action="append",
+        help="Run only these arms. The unit of parallelism this suite was missing: "
+        "sharding by task cannot split a tier that has one, and `preferences` is "
+        "one task whose arms cost 54s, 174s and 265s each as the preference count "
+        "climbs -- so the tier that gates the main table ran serially. The store "
+        "keeps one file per task and method, so arm shards never contend.",
+    )
     parser.add_argument("--seeds", type=int, default=MAIN_SEEDS, help="Seeds for the main tier.")
     parser.add_argument(
         "--explanatory-seeds",
@@ -323,7 +356,7 @@ def main(argv: list[str] | None = None) -> int:
     started = time.perf_counter()
     for tier in selected:
         if not args.report:
-            ran = run_multi_objective_tier(tier, arms_for_tier(tier), store, report=_flush)
+            ran = run_multi_objective_tier(tier, _arms(tier, args.method), store, report=_flush)
             _flush(f"{tier.name}: ran {ran} campaigns")
         _flush(report(store, tier))
     _flush(f"\ntotal {time.perf_counter() - started:.0f}s")
