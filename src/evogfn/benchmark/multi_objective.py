@@ -1,149 +1,112 @@
 r"""The multi-objective suite: what a second objective costs, and when it changes the answer.
 
 Every task in [evogfn.benchmark.suite][] returns one number per design. This
-module holds the ones that do not, and it is a separate module rather than five
-more rows in `suite.MAIN` because almost nothing carries over. A multi-objective
-campaign refuses a scalar acquisition rule at construction, scores itself with
-set indicators instead of a regret, needs a reference point *and* a reference
-front before either indicator means anything, and has a baseline
-([NSGA2][evogfn.algorithms.baselines.nsga2.NSGA2]) that no single-objective task
-can run. Interleaving the two would put a `nan` in the regret column of half the
-suite and an unusable "best value" in the other half.
+module holds the ones that do not. It is a separate module because almost
+nothing carries over: a multi-objective campaign refuses a scalar acquisition
+rule at construction, scores itself with set indicators instead of a regret,
+needs a reference point *and* a reference front before either indicator means
+anything, and has a baseline
+([NSGA2][evogfn.algorithms.baselines.nsga2.NSGA2]) no single-objective task can
+run.
 
 ## Three tiers, and they are not read the same way
 
-**Main tests** carry results. Two of them, chosen so that between them they say
-something about a real assay and something about a controlled one:
+**Main tests** carry results:
 
-* `ch65-real` -- three antibody affinities actually measured by Tite-Seq, on the
-  16-site somatic-mutation lattice of CH65. The trade-off here is not a
-  construction; the paper it comes from is *about* breadth costing potency.
+* `ch65-real` -- three antibody affinities measured by Tite-Seq, on the 16-site
+  somatic-mutation lattice of CH65. The paper it comes from is *about* breadth
+  costing potency, so the trade-off is imposed by the biology.
 * `mo-ehrlich-hard` -- two Ehrlich objectives at maximum conflict, at L=10, v=4,
-  c=2, k=5, density 0.5, seed 2. The alphabet is what that task is for: four
-  letters is DNA/RNA, and it makes $4^{10}$ = 1,048,576 sequences enumerable, so
-  the reference front IGD+ measures coverage of is the **true** one. That
-  settles the instance parameters rather than mirroring `protocol-alde`'s: a
-  20-letter alphabet is enumerable only to L=5, so a paired instance and an
-  exact front cannot both be had. See
-  [MO_VOCAB_SIZE][evogfn.benchmark.multi_objective.MO_VOCAB_SIZE] and the
-  constants below it for what each alignment with the single-objective suite
-  costs or keeps.
+  c=2, k=5, density 0.5, seed 2. Four letters is DNA/RNA and makes $4^{10}$ =
+  1,048,576 sequences enumerable, so the reference front IGD+ measures coverage
+  of is the **true** one. A 20-letter alphabet is enumerable only to L=5, so an
+  instance paired with `protocol-alde` and an exact front cannot both be had.
+  See [MO_VOCAB_SIZE][evogfn.benchmark.multi_objective.MO_VOCAB_SIZE] and the
+  constants below it for what each alignment costs or keeps.
 
-**Explanatory sweeps** answer "under what conditions does the ranking change".
-They vary conflict at fixed objective count, and objective count at fixed
-conflict, on the same instance family at a different seed. They are *not* inputs
-to the main table -- a method that wins at low conflict and loses at 1.0 has not
-won anything, and the sweep is how that gets said rather than a source of extra
-headline rows. The conflict rungs bracket the point at which a trade-off starts
-to exist rather than sitting on round numbers; see
+**Explanatory sweeps** answer "under what conditions does the ranking change",
+varying conflict at fixed objective count and objective count at fixed conflict,
+on the same instance family at a different seed. They are *not* inputs to the
+main table. The conflict rungs bracket the point at which a trade-off starts to
+exist rather than sitting on round numbers; see
 [CONFLICT_SWEEP][evogfn.benchmark.multi_objective.CONFLICT_SWEEP].
 
-**The one diagnostic that decides something** is `mo-preferences`. A scalarised
-method searches wherever its preference $\omega$ points, so comparing one
-preference against a population method is comparing a point against a set, and
-the usual response is to assert that this is either fine or fatal. Here it is
-measured: the same GFlowNet runs at 1, 4 and 8 preference vectors **at fixed
-total budget**, so 8 preferences buys 48 assays each rather than 8 x 384. What
-comes out sets how many preferences the main-table GFlowNet arm gets, and
-nothing else.
+**`mo-preferences`** is the one diagnostic that decides something. The same
+GFlowNet runs at 1, 4 and 8 preference vectors **at fixed total budget**, so 8
+preferences buys 48 assays each rather than 8 x 384. What comes out sets how
+many preferences the main-table GFlowNet arm gets, and nothing else.
 
 ## What is measured, and what refuses to be
 
-Hypervolume above a reference point and IGD+ against a reference front, which is
-the pair [CampaignResult][evogfn.loop.ledger.CampaignResult] already reports.
-Both need something stated from outside the run, and both are stated here rather
-than defaulted:
+Hypervolume above a reference point and IGD+ against a reference front, the pair
+[CampaignResult][evogfn.loop.ledger.CampaignResult] already reports. Both need
+something stated from outside the run, and both are stated per task rather than
+defaulted, so a landscape gaining or losing a `reference_point` property cannot
+silently move a published number:
 
 * **The reference point** is a claim about the assay -- the worst value worth
   counting on each objective. CH65's is the Tite-Seq detection floor `(6, 6, 6)`,
-  where the titration stops resolving. The Ehrlich tasks' is the origin, because
-  an Ehrlich objective at 0 has satisfied no motif and has genuinely contributed
-  nothing. Each task carries its own explicitly instead of relying on the
-  landscape to expose one, so a landscape growing or losing a `reference_point`
-  property cannot silently move a published number.
-* **The reference front** is what IGD+ measures coverage of, and every task here
-  now supplies the exact one: CH65's by sweeping its measured library, the
-  Ehrlich tasks' by enumerating their $4^{10}$ space. `front_is_exact` is
-  therefore `True` throughout.
+  where the titration stops resolving. The Ehrlich tasks' is the origin, an
+  objective at 0 having satisfied no motif.
+* **The reference front** is what IGD+ measures coverage of, and every task
+  supplies the exact one: CH65's by sweeping its measured library, the Ehrlich
+  tasks' by enumerating their $4^{10}$ space. `front_is_exact` is `True`
+  throughout.
 
-Hypervolume is **computable here only if the optional `moo` extra is
-installed**, and where it is not that is reported rather than patched.
+Hypervolume is **computable only if the optional `moo` extra is installed**, and
+where it is not that is reported rather than patched.
 [evogfn.metrics.pareto][] is exact in every dimension it accepts; its built-in
 method stops at 16 front points in three or more objectives, and pymoo takes
-over past that when it is available. The limit is reachable, and by the wrong
-runs: an arm that converges carries a wider measured front than one that
-scatters, so it is the converged arms whose hypervolume a core-only install
-loses -- which is why `ch65-real` also carries an exact reference front and is
-read on IGD+. A `nan` in that column is "not computed", never "no volume".
+over past that when available. The limit is reachable by the wrong runs -- an arm
+that converges carries a wider measured front than one that scatters -- which is
+why `ch65-real` also carries an exact reference front and is read on IGD+. A
+`nan` in that column is "not computed", never "no volume".
 
-## Left-censoring on CH65, and what it does to a front
+## Left-censoring on CH65
 
 47.4% of CH65's `affinity_SI06` values sit at the detection floor. Those variants
-are *tied at a bound*, not measured, and two of them reported at 6.0 may differ
-by any amount below it. A front computed over the measured library therefore
-risks carrying points that are non-dominated only because a censored objective
-could not resolve them.
+are *tied at a bound*, not measured, so a front over the measured library risks
+carrying points that are non-dominated only because a censored objective could
+not resolve them.
 
-The damage such a point can do is bounded, and the reason is arithmetical --
-[hypervolume][evogfn.metrics.pareto.hypervolume] only counts designs *strictly
-above* the reference point, and a censored value sits exactly on it, so the
-variants uncensored on every objective are precisely the ones that contribute
-any volume at all. A front over the uncensored variants is what this module
-scores IGD+ against, for that reason.
+The damage is bounded arithmetically:
+[hypervolume][evogfn.metrics.pareto.hypervolume] counts only designs *strictly
+above* the reference point and a censored value sits exactly on it, so the
+variants uncensored on every objective are the only ones contributing volume. A
+front over the uncensored variants is what IGD+ is scored against.
 
 ## Arms
 
-Four published pipelines and a three-rung ladder, laid out exactly as
-[evogfn.benchmark.methods][]'s `BASELINES` is and for the same reason: a method
-for directed evolution is a whole pipeline, and a pipeline is what a lab chooses
-between. The surrogate is *constitutive* of the GFlowNet pipeline -- it is what
-makes a policy trainable at 384 assays -- but handing one to a genetic algorithm
-produces a method nobody published, so that addition is a named rung rather than
-a silent default.
+Four published pipelines and a three-rung ladder, laid out as
+[evogfn.benchmark.methods][]'s `BASELINES` is: a pipeline is what a lab chooses
+between, so the surrogate is constitutive of the GFlowNet pipeline but a named
+rung when added to a genetic algorithm.
 
-The pipelines, which are what the headline table compares:
-
-* `random` -- mutagenesis, no surrogate. The floor: a hypervolume with nothing
-  below it is a number rather than a result.
+* `random` -- mutagenesis, no surrogate. The floor.
 * `nsga2` -- NSGA-II, ranking by dominance. The incumbent, and the arm that picks
-  no trade-off at all, which is exactly what scalarisation gives up.
+  no trade-off at all.
 * `genetic` -- a weighted-sum genetic algorithm, bare. The reference every other
-  arm is paired against, because directed evolution *is* a genetic algorithm and
-  this is the pipeline a lab would otherwise run. Bare on purpose: a reference
-  that is itself a hybrid nobody published would pair every headline number
-  against something a reviewer does not have to accept.
+  arm is paired against.
 * `gfn-tb-scalar` -- a trajectory-balance GFlowNet over a **fixed** weighted-sum
-  scalarisation. GFlowNet-AL under one preference, and the scalarised *control*
-  rather than this suite's GFlowNet entry. The name says `-scalar` because
-  `mogfn-pc` now stands beside it in the same table: MOGFN-PC samples a
-  preference per step and conditions the policy on it, the two are not the same
-  method, and a row named plain `gfn-tb` directly above one named `mogfn-pc`
-  invites exactly the reading the scope note exists to refuse. The rename was
-  made while nothing was stored under either key, which is the only time it is
-  free -- every record is keyed by the arm name.
+  scalarisation: GFlowNet-AL under one preference, and the scalarised control
+  rather than this suite's GFlowNet entry. Named `-scalar` because `mogfn-pc`
+  stands beside it in the same table and the two are not the same method. The
+  rename was made while nothing was stored under either key, which is the only
+  time it is free -- every record is keyed by the arm name.
 * `mogfn-pc` -- one policy conditioned on the trade-off, trained once over the
-  whole simplex and queried across a grid of them. The published
-  preference-conditioned GFlowNet, and the arm the section below is about.
+  whole simplex and queried across a grid of them.
 
-## The one arm that is not a fixed preference
+`mogfn-pc` is registered twice, answering different questions. In `ARMS` it is a
+headline row against the other published pipelines -- it has to be there, because
+`main` is the only tier that carries results. In the `preferences` tier it is
+read against `gfn-tb-pref{N}`: one conditioned model on the full budget versus
+``N`` replicated ones on ``1/N`` each, at the same ``N`` trade-offs, which is the
+comparison that isolates *amortisation*.
 
-`mogfn-pc` is registered twice, and the two registrations answer different
-questions. In `ARMS` it is a headline row, a published pipeline against the other
-published pipelines -- and it has to be there, because `main` is the only tier
-that carries results, so an arm reachable only from a diagnostic tier can never
-appear in a claim at all. In the `preferences` tier it is read against
-`gfn-tb-pref{N}`: one conditioned model on the full budget versus ``N``
-replicated ones on ``1/N`` each, at the same ``N`` trade-offs, which is the only
-comparison that isolates *amortisation* from everything else a GFlowNet does. The
-table says whether it wins; the diagnostic says what the win is made of.
-
-It is also the one arm here outside the reduction the rest of this module sits
-inside. Every other arm applies its preference before the surrogate predicts
-anything, so its policy's inner learning problem is the single-objective one;
-`mogfn-pc` carries its own multi-output surrogate and applies the preference at
-reward time. That is why it is worth building, and it is equally why it does not
-license bringing back the scalarised single-objective baselines: nothing about it
-changes what a scalarised hill-climber is.
+It is also the one arm outside the reduction the rest of this module sits inside.
+Every other arm applies its preference before the surrogate predicts anything, so
+its policy's inner learning problem is the single-objective one; `mogfn-pc`
+carries its own multi-output surrogate and applies the preference at reward time.
 
 The ladder, on the two representative pipelines, one thing added per rung:
 
@@ -156,38 +119,30 @@ arm                what it adds
 ``random+screen``  the same first rung on the floor
 =================  =====================================================
 
-`genetic+search` is named for the mechanism rather than for the fact that a
-proxy is present, and the rungs read the same way here as in the
-single-objective table, which is the only way a reader can line the two up.
-
 Every arm is handed a
 [ScalarizedAcquisition][evogfn.acquisition.rules.ScalarizedAcquisition], NSGA-II
 included, because the campaign refuses a scalar rule against a vector-valued
 landscape at construction. For NSGA-II that rule ranks nothing -- the arm runs
-without a surrogate, so no pool is ever scored -- but the campaign still uses
+without a surrogate -- but the campaign still uses
 [reduce_objectives][evogfn.acquisition.base.Acquisition.reduce_objectives] for
-the ledger's ``best_so_far`` and for the re-anchoring step. Since every arm gets
-the *same* uniform preference for that, the anchor rule is a property of the
+the ledger's ``best_so_far`` and for the re-anchoring step. Every arm gets the
+*same* uniform preference for that, so the anchor rule is a property of the
 protocol rather than of an arm.
 
 ## Pool size is part of the method, here as well
 
-A genetic algorithm's pool is its population, and Stanton et al. run population
-== evaluation batch == one plate, so `genetic` and `random` are asked for exactly
-[PLATE_POOL][evogfn.benchmark.multi_objective.PLATE_POOL]. The screened rungs
-keep the 2048-candidate library, because a screen with nothing to screen is not a
-screen -- at a plate the model would rank 96 candidates into 96 wells and change
-nothing.
+`genetic` and `random` are asked for exactly
+[PLATE_POOL][evogfn.benchmark.multi_objective.PLATE_POOL], since Stanton et al.
+run population == evaluation batch == one plate. The screened rungs keep the
+2048-candidate library, because at a plate the model would rank 96 candidates
+into 96 wells and change nothing.
 
-Whether a plate is *survivable* here is a fair question, because these tasks are
-far more saturated than their single-objective counterparts: at L=10, v=4 and a
-radius of 4, the ball a campaign proposes from is small against a budget of 384
-assays, so a plate-sized pool has to work harder to fill a plate with distinct
-designs. What makes it survivable is the campaign itself: it fills a short plate
-by asking again, up to
-[MAX_PROPOSAL_ATTEMPTS][evogfn.loop.campaign.MAX_PROPOSAL_ATTEMPTS] calls, so
-the population stays the published one and coherence wins -- the same published
-GA appears in both tables.
+These tasks are far more saturated than their single-objective counterparts: at
+L=10, v=4 and a radius of 4 the ball a campaign proposes from is small against
+384 assays, so a plate-sized pool has to work harder to fill a plate with
+distinct designs. The campaign absorbs that by asking again, up to
+[MAX_PROPOSAL_ATTEMPTS][evogfn.loop.campaign.MAX_PROPOSAL_ATTEMPTS] calls, so the
+population stays the published one and the same GA appears in both tables.
 """
 
 from __future__ import annotations
