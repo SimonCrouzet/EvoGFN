@@ -1,195 +1,134 @@
 """MLDE: the supervised baseline protein engineers actually run.
 
 Machine-learning-assisted directed evolution (Wittmann, Yue & Arnold, *Cell
-Systems* 2021) is three steps and no more: screen a random sample of the library,
-fit a regressor to it, order the variants it predicts best. There is no
-acquisition function, no uncertainty, no policy and no second thought. It is
-nonetheless the reference point the field cites for supervised library design.
+Systems* 2021) is three steps: screen a random sample of the library, fit a
+regressor to it, order the variants it predicts best. No acquisition function,
+no uncertainty, no policy.
 
-It is here because it is the cheapest way for this project's central claim to be
-wrong. If one supervised fit on a random plate reaches the same designs a
-GFlowNet reaches, then everything the GFlowNet adds -- the flow objective, the
-masked policy, the multi-round loop -- has bought nothing, and the honest report
-is that a regression was enough. Beating a genetic algorithm while losing to
-ridge regression on a random sample would be a hollow result.
-
-A baseline is only worth beating if it is the real thing, so what is and is not
-the published method is spelled out below rather than left for a reader to infer.
+What is and is not the published method is spelled out below rather than left
+for a reader to infer.
 
 Single-shot by design, multi-round by this harness
 --------------------------------------------------
 
 MLDE is a *two-stage* method: one training sample, one prediction, done. This
-repository's campaign loop instead calls ``propose`` and ``observe`` once per
-round, so this implementation refits on the accumulated measurements every round
-and proposes against the refreshed model. That is a deviation and must be
-reported as one -- iterating the fit makes it closer to CLADE (Qiu & Wei, 2021)
-or to ftMLDE than to MLDE as published, and it can only help the baseline, which
-is the right direction for a deviation in a baseline to run.
+repository's campaign loop calls ``propose`` and ``observe`` once per round, so
+this implementation refits on the accumulated measurements every round. That is
+a deviation, and it can only help the baseline.
 
 The budget it cannot have
 -------------------------
 
-State this plainly, because the results table depends on it. The published
-protocol is **384 training variants plus a top-96 design plate, 480 assays**
-(`PUBLISHED_BUDGET`). This repository's four-plate campaign budget is 384
-assays *in total*. MLDE's training set alone therefore exceeds the entire budget
-it is benchmarked under, and there is no configuration in which the published
-method fits inside 384 calls.
+The published protocol is **384 training variants plus a top-96 design plate,
+480 assays** (`PUBLISHED_BUDGET`), against this repository's four-plate budget of
+384 in total. MLDE's training set alone exceeds the whole budget it is
+benchmarked under.
 
-So the default here trains on one 96-well plate, a quarter of Wittmann et al.'s
-sample. That is a **compression, not a design choice**, and it is a handicap:
-the method's own paper shows outcome improving with training set size, so a
-96-variant MLDE is a weaker MLDE. Any table reporting this arm must carry the
-note; [MLDE.budget_note][evogfn.algorithms.baselines.mlde.MLDE.budget_note]
-returns it in a form a report can print, and
+So the default trains on one 96-well plate, a quarter of Wittmann et al.'s
+sample. That is a compression and a handicap -- their paper shows outcome
+improving with training set size.
+[MLDE.budget_note][evogfn.algorithms.baselines.mlde.MLDE.budget_note] returns
+the note in a form a report can print, and
 [MLDE.runs_below_published_training_size][evogfn.algorithms.baselines.mlde.MLDE.runs_below_published_training_size]
 is the boolean to branch on.
-
-Two ways out are provided and neither is silent.
 [MLDE.as_published][evogfn.algorithms.baselines.mlde.MLDE.as_published] builds
-the method at its own split for a reference run at a 480-call budget, and
-``training_size=PUBLISHED_TRAINING_SIZE`` does the same by hand. Neither changes
-what an existing caller gets.
+the method at its own split for a reference run at 480 calls, as does
+``training_size=PUBLISHED_TRAINING_SIZE``.
 
 The ensemble: theirs, and ours
 ------------------------------
 
-Wittmann et al. do not fit one model. Their released implementation
-(``github.com/fhalab/MLDE``) trains **22 architectures** -- 5 Keras networks
-(three MLP depths, two CNNs), 4 XGBoost variants, and 13 scikit-learn regressors
-including KernelRidge, KNeighborsRegressor, BayesianRidge, ElasticNet,
-RandomForest and GradientBoosting -- each under **5-fold cross-validation**,
-ranks the architectures by cross-validation error, and averages the predictions
-of **all cross-validation instances of the top 3**. A single kernel ridge is one
-of their 22 members, and calling that MLDE would understate the method.
+Their released implementation (``github.com/fhalab/MLDE``) trains 22
+architectures -- 5 Keras networks, 4 XGBoost variants and 13 scikit-learn
+regressors -- each under 5-fold cross-validation, ranks them by cross-validation
+error, and averages the predictions of all cross-validation instances of the top
+3.
 
-What is reproduced here, and is the paper's:
+Reproduced here, and theirs:
 
-* One-hot encoding of the variant, which is their ``onehot`` encoding and the
-  one their unsupervised-encoding ablations are measured against.
+* One-hot encoding, their ``onehot`` encoding.
 * 5-fold cross-validation of every member (`PUBLISHED_CV_FOLDS`).
 * Ranking members by cross-validated mean squared error and averaging only the
-  top few (`PUBLISHED_MODELS_AVERAGED`), rather than averaging blindly.
+  top few (`PUBLISHED_MODELS_AVERAGED`).
 * Averaging across the *fold instances* of the selected members, so the final
-  predictor is 15 models each trained on 4/5 of the data -- exactly their
+  predictor is 15 models each trained on 4/5 of the data -- their
   ``n_averaged x n_cv`` construction, not a refit on everything.
 
-What is ours, and why:
+Ours:
 
-* **The roster of 12 members, not 22.** XGBoost and Keras are two dependencies
-  this library does not have and will not take for one baseline, and sklearn is
-  not a dependency either (numpy and torch are). The members below are written
-  against numpy so that the *shape* of the ensemble -- different inductive
-  biases, selected by held-out error -- survives, which is the part their
-  ablations show matters. It is a smaller and less varied ensemble than theirs.
+* **12 members, not 22**, written against numpy: XGBoost, Keras and sklearn are
+  dependencies this library does not carry. What survives is the shape of the
+  ensemble -- different inductive biases, selected by held-out error.
 * **Which 12.** Polynomial-kernel ridge at degrees 1 and 2 and three penalties
   each (6); *local*-kernel ridge at two bandwidths and two penalties (4);
-  k-nearest-neighbours at k=5 and k=15 (2). Degree 1 is a linear model, so the
-  penalty sweep stands in for their many linear-ish regressors (BayesianRidge,
-  ElasticNet, ARDRegression, LinearSVR, SGDRegressor); degree 2 is their
-  KernelRidge and is the pairwise-epistasis model MLDE exists to capture; k-NN
-  is their KNeighborsRegressor, at sklearn's default k=5 and one wider setting.
-* **The local kernel.** ``exp(-gamma * hamming)`` with ``gamma`` set by the
-  median pairwise distance in the training set. Kernel ridge is theirs; this
-  particular kernel and the median-heuristic bandwidth are ours. It is here
-  because the polynomial kernel is global -- every training point influences
-  every prediction -- and a local kernel is a genuinely different bias rather
-  than another point on the same regularisation path.
-* **No neural member, and no trees.** Their 5 Keras networks and 7 tree models
-  have no stand-in here, which is the largest gap. The affordable substitute for
-  the Keras MLPs -- a random-ReLU-feature network -- is not one: at finite width
-  such a model is a Monte-Carlo approximation to the arc-cosine kernel, which for
-  one-hot inputs is again a function of the same agreement count the polynomial
-  kernel already uses, so it contributes sampling noise rather than a new bias --
-  and being near-constant, it is *selected* by cross-validated MSE precisely when
-  the real models are struggling. A trained MLP would be a different model; one
-  trained per fold per round across thousands of campaigns is not affordable
-  here. Tree ensembles are absent for the same cost reason.
-* **The candidate set.** Their library is four combinatorial sites -- 160,000
-  variants, exhaustively scorable. The environments here reach ``10^13`` designs
-  and upwards, so a random pool stands in for exhaustive enumeration and the
-  ensemble ranks that.
+  k-nearest-neighbours at k=5 and k=15 (2).
+* **The local kernel**, ``exp(-gamma * hamming)`` with ``gamma`` at the median
+  pairwise training distance. The polynomial kernel is global, so a local one is
+  a genuinely different bias rather than another point on the same
+  regularisation path.
+* **No neural member and no trees**, which is the largest gap. A
+  random-ReLU-feature network is not a substitute: at finite width it
+  approximates the arc-cosine kernel, which for one-hot inputs is again a
+  function of the same agreement count the polynomial kernel uses.
+* **The candidate set.** Their library is four sites and exhaustively scorable;
+  the environments here reach ``10^13`` designs, so a random pool stands in.
 
-The kernel deserves one line of justification since it does the most work: the
-inner product of two one-hot sequences is the number of positions at which they
-agree, so a degree-2 polynomial kernel is exactly the space of position-pair
-interactions, reached in the dual without ever forming the ``(L·V)²`` features,
-and the Hamming distance the local kernel needs is the same count again. That
-identity is standard; using it here instead of sklearn's KernelRidge is ours.
+The kernel identity does the most work: the inner product of two one-hot
+sequences is the number of positions at which they agree, so a degree-2
+polynomial kernel is exactly the space of position-pair interactions, reached in
+the dual without forming the ``(L·V)²`` features, and the Hamming distance the
+local kernel needs is the same count again.
 
 Where the compression shows
 ---------------------------
 
-The two adaptations above interact. Cross-validated selection between members
-only separates them when each fold holds out enough points to tell them apart,
-and the compressed 96-variant default leaves roughly 77 per fold. The members'
-errors can then sit within noise of each other and the ensemble can select a
-member with no ranking power at all. So the *variance* of running MLDE below its
-published training size is itself a cost, and it is a cost the budget note above
-is describing.
+Cross-validated selection between members only separates them when each fold
+holds out enough points, and the compressed 96-variant default leaves roughly 77
+per fold. The members' errors can then sit within noise of each other and the
+ensemble can select a member with no ranking power at all, so the *variance* of
+running below the published training size is itself a cost.
 
 The failure mode past the end of that: never fitting at all
 -----------------------------------------------------------
 
-There is a worse case than a weak fit, and it is not visible from the budget.
 `training_size` counts **usable** measurements, and
 [MLDE.observe][evogfn.algorithms.baselines.mlde.MLDE.observe] discards an
 infeasible assay -- there is no fitness to regress on -- while the campaign has
-already paid for the well. On a landscape with a transition constraint the
-screening plates therefore yield far fewer training examples than they cost: at a
-feasible share of 6%, 64 assays buy about four. Where that share is small enough
-the handover simply never happens, the campaign screens at random for its entire
-budget, and **the row in the results table is a random baseline reported under a
-supervised method's name**.
+already paid for the well. Under a transition constraint the screening plates
+yield far fewer training examples than they cost: at a feasible share of 6%, 64
+assays buy about four. Where that share is small enough the handover never
+happens and the row is a random baseline under a supervised method's name.
 
-Nothing about the spend says so. Such a campaign charges every oracle call its
-protocol allots, fills every plate, makes the same proposals, and reports a best
-value and a regret arithmetically indistinguishable from a fitted run's.
+Nothing about the spend says so: such a campaign charges every oracle call, fills
+every plate and reports a regret indistinguishable from a fitted run's.
 [MLDE.is_fitted][evogfn.algorithms.baselines.mlde.MLDE.is_fitted] is the only
-thing that separates the two, which is why it is stored per campaign as
-`RunRecord.fitted` rather than left as
-state on an object the store never sees.
+thing that separates them, which is why it is stored per campaign as
+`RunRecord.fitted`.
 
 Our adaptation: a training size a constrained screen can return
 ---------------------------------------------------------------
 
 `ADAPTED_TRAINING_SIZE` and
-[MLDE.adapted][evogfn.algorithms.baselines.mlde.MLDE.adapted] are **ours**, and
-the distance between them and Wittmann et al. is the whole content of this
-section. Their protocol assumes an assay comes back with a number. Where 95% of
-wells come back with nothing to regress on, its supervised phase is not
-compressed and not handicapped but *unreachable at any budget a laboratory would
-run*: the training set grows at a twentieth of the rate the budget shrinks, so
-their 384 usable measurements would cost upwards of seven thousand assays.
+[MLDE.adapted][evogfn.algorithms.baselines.mlde.MLDE.adapted] are **ours**.
+Where 95% of wells come back with nothing to regress on, the supervised phase is
+unreachable at any laboratory budget -- 384 usable measurements would cost
+upwards of seven thousand assays.
 
-Lowering the training size is how the question *would MLDE be competitive here if
-it ever got to be MLDE?* can be asked at all. It is **not** a claim about what
-the published method does, and no row produced by this configuration may be
-labelled MLDE -- it exists to separate "loses because a constrained space suits
-it badly" from "loses because it never fitted", and only the first of those is a
-statement about MLDE. The benchmark arm is named for that: see ``mlde+earlyfit``
-in [evogfn.benchmark.methods][]'s ``BASELINES``.
+Lowering the training size is how *would MLDE be competitive here if it ever got
+to be MLDE?* can be asked at all. **No row produced by this configuration may be
+labelled MLDE.** It separates "loses because a constrained space suits it badly"
+from "loses because it never fitted"; the benchmark arm is ``mlde+earlyfit`` in
+[evogfn.benchmark.methods][].
 
-What it trades away is most of the method. At eight measurements the five-fold
-cross-validation that ranks the twelve members holds out one or two points a
-fold, so the ranking is very nearly arbitrary and the three members it averages
-are close to three drawn at random -- the variance the compression section above
-describes, at its limit. The fit itself is a kernel machine on eight points: it
-can express "resembles the good variants measured so far" and not much more. That
-is four times `_MIN_TRAINING`, where a ridge on one point is a constant ranking
-and a fit would be nominal -- reporting nothing in a second way -- but it is a
-twelfth of the 96 already called a compression above. So a favourable number from
-this arm is a *lower* bound on what a trained MLDE would do here, and an
-unfavourable one is evidence about the setting rather than about the method.
+At eight measurements the five-fold cross-validation holds out one or two points
+a fold, so member ranking is very nearly arbitrary and the fit is a kernel
+machine on eight points. A favourable number from this arm is therefore a lower
+bound on a trained MLDE rather than a measurement of one.
 
-One thing it deliberately is not: adaptive. The training size is a single stated
-number, not one derived per task from that task's own measured feasibility. A
-configuration that reads the landscape it is scored on is not one configuration
-but a family, tuned on its own test set, and such a family beats any fixed member
-of itself by construction. The cost of fixing it is that the number is right for
-the feasibility the suite measured and merely defensible elsewhere, which is the
-right way round.
+It is deliberately **not adaptive**: the training size is a single stated number,
+not one derived per task from that task's measured feasibility. A configuration
+that reads the landscape it is scored on is a family tuned on its own test set,
+and beats any fixed member of itself by construction.
 """
 
 from __future__ import annotations
