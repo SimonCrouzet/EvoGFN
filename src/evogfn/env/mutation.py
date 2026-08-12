@@ -81,6 +81,7 @@ from typing import TYPE_CHECKING
 import numpy as np
 
 from evogfn.env.base import SequenceEnvironment, State
+from evogfn.env.feasibility import AdjacencyPredicate
 
 if TYPE_CHECKING:
     from typing import Self
@@ -88,6 +89,7 @@ if TYPE_CHECKING:
     import numpy.typing as npt
 
     from evogfn.core.types import Alphabet, Tokens
+    from evogfn.env.feasibility import FeasibilityPredicate
 
 # How many outgoing edges the forward search expands per call. The frontier of a
 # large graph has more edges than fit comfortably in one array, and the walk is
@@ -108,7 +110,17 @@ class MutationEnvironment(SequenceEnvironment):
         transitions: Optional ``(v, v)`` matrix whose zeros mark token pairs that
             may not be adjacent. When given, mutations producing a forbidden
             adjacency are masked out, so every sequence the environment can reach
-            is feasible by construction rather than filtered afterwards.
+            is feasible by construction rather than filtered afterwards. A
+            shorthand for ``feasibility=AdjacencyPredicate(transitions)``, kept
+            because it is what every existing caller and every stored record was
+            made with.
+        feasibility: Optional
+            [FeasibilityPredicate][evogfn.env.feasibility.FeasibilityPredicate]
+            saying which sequences are legal and which moves keep them so. Pass
+            this or ``transitions``, never both. A predicate whose constraint
+            graph is not a path has no closed-form constructibility test, so
+            `is_constructible` refuses on it rather than over-stating the search
+            space.
         allow_stop_before_max: Whether a trajectory may stop early. When
             ``False``, trajectories run until ``max_mutations`` and every
             terminal state carries exactly that many mutations.
@@ -118,13 +130,14 @@ class MutationEnvironment(SequenceEnvironment):
             the alphabet, or the arguments disagree in shape.
     """
 
-    def __init__(
+    def __init__(  # noqa: PLR0913 - the graph is defined by what it is handed
         self,
         parent: Tokens,
         alphabet: Alphabet,
         *,
         max_mutations: int | None = None,
         transitions: npt.NDArray[np.floating] | None = None,
+        feasibility: FeasibilityPredicate | None = None,
         allow_stop_before_max: bool = True,
     ) -> None:
         """Validate the parent and prepare the action layout."""
@@ -154,7 +167,25 @@ class MutationEnvironment(SequenceEnvironment):
                 raise ValueError(
                     f"transitions must be {expected} to match the alphabet, got {transitions.shape}"
                 )
+        if transitions is not None and feasibility is not None:
+            raise ValueError(
+                "pass transitions or feasibility, not both: they are two spellings of the "
+                "same argument and disagreeing copies would mask different graphs"
+            )
+        # Kept for callers that read back what they passed. **Nothing in this
+        # class reads it**: every feasibility question goes through
+        # `_feasibility`, because a re-anchored environment carries the
+        # predicate and not the matrix, so a test written against the matrix
+        # silently stops constraining anything after the first anchor move.
         self._transitions = transitions
+        # One object answers every feasibility question, so a variant of this
+        # graph is a different predicate rather than a different subclass. The
+        # matrix spelling is kept because it is what every existing caller and
+        # every stored record was made with, and it resolves to the predicate it
+        # always meant.
+        self._feasibility: FeasibilityPredicate | None = feasibility
+        if feasibility is None and transitions is not None:
+            self._feasibility = AdjacencyPredicate(transitions, length=self._length)
         self._allow_stop_before_max = allow_stop_before_max
         # log(k!) for every reachable k. A table rather than a call to lgamma
         # because k is bounded by the sequence length and this is read on every
@@ -212,13 +243,13 @@ class MutationEnvironment(SequenceEnvironment):
         every forbidden pair look identical from the outside.
 
         Returns:
-            ``True`` when a transition matrix is set, since this class masks it
-            at every step. A subclass that defers the rule to the terminal must
+            ``True`` when a feasibility predicate is set, since this class masks
+            it at every step. A subclass that defers the rule to the terminal must
             say so here as well as in its masks; leaving this ``True`` would let
             a caller narrow itself to a subset of what that subclass can build,
             and the loss would look like a search failure rather than a bug.
         """
-        return self._transitions is not None
+        return self._feasibility is not None
 
     def reanchored(self, parent: Tokens) -> Self:
         """Return the same environment anchored at a new parent.
@@ -272,17 +303,21 @@ class MutationEnvironment(SequenceEnvironment):
                 f"a new anchor must be one sequence of length {self._length}, "
                 f"got shape {candidate.shape}"
             )
-        if self._transitions is not None and not self._is_feasible(candidate):
+        if self._feasibility is not None and not self._is_feasible(candidate):
             raise ValueError(
                 "refusing to anchor at an infeasible design: it violates the "
-                "transition constraint, so the environment could no longer "
+                "feasibility predicate, so the environment could no longer "
                 "guarantee that what it builds is constructible"
             )
+        # The predicate is carried, not the matrix: a custom one would be lost
+        # by re-deriving from `transitions`, and the anchor is passed to the
+        # predicate per call rather than held by it, so the same object is
+        # correct at the new anchor.
         return type(self)(
             candidate,
             self._alphabet,
             max_mutations=self._max_mutations,
-            transitions=self._transitions,
+            feasibility=self._feasibility,
             allow_stop_before_max=self._allow_stop_before_max,
         )
 
@@ -296,10 +331,9 @@ class MutationEnvironment(SequenceEnvironment):
             ``True`` when no transition constraint is set, or when the sequence
             satisfies it.
         """
-        if self._transitions is None or self._length < 2:  # noqa: PLR2004 - a pair needs two
+        if self._feasibility is None or self._length < 2:  # noqa: PLR2004 - a pair needs two
             return True
-        permitted = self._transitions > 0
-        return bool(np.all(permitted[sequence[:-1], sequence[1:]]))
+        return bool(self._feasibility.is_feasible(np.asarray(sequence)[None, :])[0])
 
     def initial(self, n: int) -> State:
         """Create ``n`` trajectories sitting at the parent.
@@ -387,8 +421,8 @@ class MutationEnvironment(SequenceEnvironment):
         allowed: npt.NDArray[np.bool_] = (
             untouched[:, :, None] & differs & capacity_left[:, None, None]
         )
-        if self._transitions is not None:
-            allowed &= self._adjacency_allowed(state.sequences, self._transitions)
+        if self._feasibility is not None:
+            allowed &= self._feasibility.permits_substitution(state.sequences)
         return allowed
 
     def _may_stop(
@@ -476,11 +510,9 @@ class MutationEnvironment(SequenceEnvironment):
         """
         array = np.asarray(sequences)
         within_budget = (array != self._parent[None, :]).sum(axis=1) <= self._max_mutations
-        if self._transitions is None:
+        if self._feasibility is None:
             return np.asarray(within_budget, dtype=np.bool_)
-        permitted = self._transitions > 0
-        feasible = np.all(permitted[array[:, :-1], array[:, 1:]], axis=1)
-        return np.asarray(within_budget & feasible, dtype=np.bool_)
+        return np.asarray(within_budget & self._feasibility.is_feasible(array), dtype=np.bool_)
 
     def is_constructible(self, sequences: Tokens) -> npt.NDArray[np.bool_]:
         """Report which sequences some trajectory can actually build.
@@ -548,20 +580,28 @@ class MutationEnvironment(SequenceEnvironment):
         """
         array = np.asarray(sequences)
         reachable = self.is_reachable(array)
-        transitions = self._transitions
+        predicate = self._feasibility
         if (
-            transitions is None or not self.constrains_intermediates or self._length < 2  # noqa: PLR2004 - a pair needs two
+            predicate is None or not self.constrains_intermediates or self._length < 2  # noqa: PLR2004 - a pair needs two
         ):
             return reachable
 
-        permitted = transitions > 0
-        substituted = array != self._parent[None, :]
-        # The only pairs that can constrain an ordering, per step 3 above.
-        coupled = substituted[:, :-1] & substituted[:, 1:]
-        left_first = permitted[array[:, :-1], self._parent[None, 1:]]
-        right_first = permitted[self._parent[None, :-1], array[:, 1:]]
-        orderable = ~coupled | left_first | right_first
-        return np.asarray(reachable & orderable.all(axis=1), dtype=np.bool_)
+        # The linear test above is exact because this predicate's ordering
+        # conditions constrain a *path* (step 4). A predicate whose constraint
+        # graph is not a path has no such closed form, and there is no safe
+        # default: returning `reachable` would over-state the search space,
+        # which is the specific error this method exists to prevent. So it
+        # refuses, and a caller that needs constructibility under such a
+        # predicate must ask for a search rather than be handed a guess.
+        orderable = getattr(predicate, "orderable", None)
+        if orderable is None:
+            raise NotImplementedError(
+                f"{type(predicate).__name__} has no closed-form constructibility test; "
+                "the linear test is exact only where the predicate's constraint graph is a "
+                "path. Refusing rather than returning endpoint reachability, which would "
+                "over-state the search space."
+            )
+        return np.asarray(reachable & orderable(array, self._parent), dtype=np.bool_)
 
     def _revertible(self, sequences: Tokens) -> npt.NDArray[np.bool_]:
         """Which mutated positions have the reversion as a genuine parent state.
@@ -579,7 +619,7 @@ class MutationEnvironment(SequenceEnvironment):
             An ``(n, length)`` boolean array, ``True`` where reverting that
             position lands on a state this environment admits.
         """
-        if self._transitions is None:
+        if self._feasibility is None:
             return np.ones(sequences.shape, dtype=np.bool_)
         return self._parent_would_be_feasible(sequences)
 
@@ -590,17 +630,9 @@ class MutationEnvironment(SequenceEnvironment):
             An ``(n, length)`` boolean array, ``True`` where reverting that
             position keeps every adjacency permitted.
         """
-        if self._transitions is None:  # pragma: no cover - guarded by the caller
+        if self._feasibility is None:  # pragma: no cover - guarded by the caller
             return np.ones(sequences.shape, dtype=np.bool_)
-        permitted = self._transitions > 0
-        reverted = np.broadcast_to(self._parent[None, :], sequences.shape)
-
-        allowed = np.ones(sequences.shape, dtype=np.bool_)
-        if self._length > 1:
-            # Reverting position p only disturbs the (p-1, p) and (p, p+1) pairs.
-            allowed[:, 1:] &= permitted[sequences[:, :-1], reverted[:, 1:]]
-            allowed[:, :-1] &= permitted[reverted[:, :-1], sequences[:, 1:]]
-        return allowed
+        return self._feasibility.permits_reversion(sequences, self._parent)
 
     def step(self, state: State, actions: npt.NDArray[np.integer]) -> State:
         """Apply one action per trajectory.
@@ -1066,9 +1098,6 @@ class TerminalFeasibilityEnvironment(MutationEnvironment):
             An ``(n,)`` boolean array, all true where no constraint is set or
             where a sequence is too short to have an adjacency.
         """
-        if self._transitions is None or self._length < 2:  # noqa: PLR2004 - a pair needs two
+        if self._feasibility is None or self._length < 2:  # noqa: PLR2004 - a pair needs two
             return np.ones(sequences.shape[0], dtype=np.bool_)
-        permitted = self._transitions > 0
-        return np.asarray(
-            np.all(permitted[sequences[:, :-1], sequences[:, 1:]], axis=1), dtype=np.bool_
-        )
+        return self._feasibility.is_feasible(np.asarray(sequences))
