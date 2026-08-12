@@ -446,11 +446,17 @@ def _environment(
         The environment.
     """
     build = TerminalFeasibilityEnvironment if terminal_feasibility else MutationEnvironment
+    # A task that declares a predicate gets it; every task that does not gets
+    # the landscape's transition matrix, which is the predicate it always meant.
+    # Never both -- the environment refuses two spellings of one argument, so a
+    # declaration silently disagreeing with a matrix cannot arise.
+    predicate = None if task.feasibility is None else task.feasibility(landscape)
     return build(
         task.parent(landscape),
         landscape.alphabet,
         max_mutations=task.max_mutations,
-        transitions=_feasibility_of(landscape),
+        transitions=None if predicate is not None else _feasibility_of(landscape),
+        feasibility=predicate,
     )
 
 
