@@ -74,6 +74,7 @@ from evogfn.benchmark.attainable import (
     attainable_optimum,
     planted_distance,
     planted_optimum_reachable,
+    reanchored_attainable,
 )
 from evogfn.benchmark.protocol import Protocol
 from evogfn.benchmark.statistics import t_critical, unanimity_floor, unanimity_p
@@ -742,6 +743,21 @@ class InstanceOutcome:
             **not** a bracket: it says no audit was run on this draw, and a
             summary that counted it as one would report a reduced audit count as
             a shape that fails to pin.
+        reanchored_lower: Best value the **re-anchored** audit constructed --
+            the chain of Hamming balls a real campaign searches, each centred on
+            the last round's best design. ``None`` where this draw carried no
+            audit.
+
+            This is the other half of the headline. ``reachable_unbounded``
+            being ``False`` says holo's own verified optimum has no legal
+            construction order from a fixed anchor; this says what a campaign
+            that *moves* its anchor recovers, which is the difference between
+            an indictment of the benchmark and a statement about how it is used.
+            It rested on one draw per shape until it was swept.
+        reanchored_upper: The certified bound above it, or ``None`` likewise.
+        reanchored_pinned: Whether the re-anchored audit closed its bracket to a
+            point. ``None`` means no audit ran on this draw, which is not the
+            same as a bracket that failed to close.
         repaired: ``repaired_fraction`` per policy, keyed by policy name.
         all_constructible: Whether every repaired design was buildable, for
             every policy. A repair that leaves one behind has failed at its
@@ -756,6 +772,9 @@ class InstanceOutcome:
     attainable_lower: float | None
     attainable_upper: float | None
     pinned: bool | None
+    reanchored_lower: float | None
+    reanchored_upper: float | None
+    reanchored_pinned: bool | None
     repaired: dict[str, float]
     all_constructible: bool
 
@@ -800,6 +819,10 @@ def sweep_instance(
     )
     audited = shape.audits(seed) if audit is None else audit
     optimum = attainable_optimum(task) if audited else None
+    # The re-anchored audit chains one beam per round, so it costs the
+    # fixed-anchor audit times the round count -- which is why it rides on the
+    # same `audits(seed)` gate rather than running on every draw.
+    reanchored = reanchored_attainable(task) if audited else None
     repairs = repair_reference(task, n_designs=n_designs)
     return InstanceOutcome(
         shape=shape.name,
@@ -813,6 +836,9 @@ def sweep_instance(
         attainable_lower=None if optimum is None else optimum.lower,
         attainable_upper=None if optimum is None else optimum.upper,
         pinned=None if optimum is None else optimum.is_exact,
+        reanchored_lower=None if reanchored is None else reanchored.lower,
+        reanchored_upper=None if reanchored is None else reanchored.upper,
+        reanchored_pinned=None if reanchored is None else reanchored.is_exact,
         repaired={measurement.policy: measurement.repaired_fraction for measurement in repairs},
         all_constructible=all(measurement.constructible for measurement in repairs),
     )
@@ -1016,6 +1042,14 @@ class ShapeSummary:
         attainable: The audited lower bound, averaged over audited draws. Read
             beside `pinned`: where the bracket did not close this is the searched
             value and not the optimum.
+        reanchored: The **re-anchored** audit's lower bound, averaged over
+            audited draws. The other half of the headline: `unreachable` says
+            the planted optimum has no construction order from a fixed anchor,
+            and this says what a campaign that moves its anchor recovers. Quoted
+            without it, the unreachability rate reads as a defect in the
+            benchmark rather than as a property of how the benchmark is used.
+        reanchored_pinned: Share of audited draws whose re-anchored audit closed
+            its bracket, so the mean above is read as a value and not a floor.
         repaired: ``repaired_fraction`` per policy.
         constructible_everywhere: Whether every repair returned buildable
             designs on every draw.
@@ -1027,6 +1061,8 @@ class ShapeSummary:
     unreachable: RateEstimate
     pinned: RateEstimate
     attainable: MeanEstimate
+    reanchored: MeanEstimate
+    reanchored_pinned: RateEstimate
     repaired: dict[str, MeanEstimate]
     constructible_everywhere: bool
 
@@ -1038,6 +1074,11 @@ class ShapeSummary:
             f"  {self.unreachable!r}",
             f"  {self.pinned!r}",
             f"  {self.attainable!r}",
+            # Printed directly under the fixed-anchor pair, because the finding
+            # is the *difference* between them and a reader who has to fetch the
+            # second number from elsewhere will quote the first alone.
+            f"  {self.reanchored!r}",
+            f"  {self.reanchored_pinned!r}",
             *(f"  {estimate!r}" for estimate in self.repaired.values()),
         ]
         return "\n".join(lines)
@@ -1096,6 +1137,19 @@ def summarise(shape: str, outcomes: Sequence[InstanceOutcome]) -> ShapeSummary:
             )
             for policy in policies
         },
+        reanchored=mean_estimate(
+            "re-anchored attainable lower bound",
+            [
+                outcome.reanchored_lower
+                for outcome in audited
+                if outcome.reanchored_lower is not None
+            ],
+        ),
+        reanchored_pinned=rate_estimate(
+            "re-anchored audit pinned exactly",
+            sum(1 for outcome in audited if outcome.reanchored_pinned),
+            len(audited),
+        ),
         constructible_everywhere=all(outcome.all_constructible for outcome in outcomes),
     )
 
