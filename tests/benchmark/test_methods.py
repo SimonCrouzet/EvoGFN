@@ -1107,6 +1107,15 @@ class TestTheLadderIsBuiltOnTheConfigurationThatShips:
             "base+anchor",
             "base+terminal+anchor",
             "base+wide",
+            # The decomposition rungs: neither trains, and they differ from each
+            # other only in how much surrogate the screen is allowed to spend.
+            # The oracle budget -- the plate -- is the same on all of them and on
+            # the base, so the sweep varies compute against a free model rather
+            # than the budget the campaign is indexed by.
+            "base+untrained",
+            "base+untrained@p2048",
+            "base+untrained@p8192",
+            "base+untrained@p32768",
         }
 
     def test_every_arm_in_the_ladder_carries_the_base_arms_name(self):
