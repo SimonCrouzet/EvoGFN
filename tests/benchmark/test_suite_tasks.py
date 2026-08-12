@@ -36,6 +36,7 @@ re-check it is ``experiments/audit_optima.py``, which exists for exactly that.
 
 import itertools
 from dataclasses import replace
+from typing import cast
 
 import numpy as np
 import pytest
@@ -57,7 +58,6 @@ from evogfn.benchmark.suite import (
     REPLICATION_SEEDS,
     TRPB_MUTATIONS,
     _matched_kernel_genetic,
-    _round_rows,
     anchor_study,
     budget_gradient,
     constraint_density,
@@ -69,6 +69,7 @@ from evogfn.benchmark.suite import (
     rejection_curve,
     replicate_instance,
     replication,
+    round_rows,
     rounds_curve,
     run_task,
 )
@@ -1071,7 +1072,7 @@ def a_round(**overrides) -> RoundRecord:
 def test_a_stored_round_carries_both_repetition_counts(tmp_path):
     """Guards the hop that is not automatic and not loud when it is missed.
 
-    `_round_rows` builds its dict key by key, so a field added to `RoundRecord`
+    `round_rows` builds its dict key by key, so a field added to `RoundRecord`
     is present in memory, absent from every stored record, and silent about the
     difference: nothing raises, the rounds still serialise, and the column
     simply never exists. The pair is asserted together because they are only
@@ -1088,17 +1089,45 @@ def test_a_stored_round_carries_both_repetition_counts(tmp_path):
         assert not np.isnan(row["redundant"])
 
 
+def test_a_stored_round_carries_the_plate_and_the_anchor_it_was_built_from(tmp_path):
+    """The same hop, for the two fields that are lists rather than scalars.
+
+    Both were in `RoundRecord` or derivable from it and neither reached the
+    store, which is what made "where does `E[max]` over a plate saturate" and
+    "how diverse is this round against the set its own anchor could reach"
+    answerable only by re-running the campaign. `anchor` is the sharper case:
+    it had existed on the ledger all along and was dropped silently at this
+    boundary.
+    """
+    task = toy_task(reanchor=True, attainable=None)
+    record = stored(tmp_path, task)
+
+    assert record.rounds
+    for row in record.rounds:
+        assert {"fitness", "anchor"} <= set(row)
+        # One measurement per well, so the aggregates beside it are recoverable.
+        assert len(row["fitness"]) == int(row["evaluated"])
+        assert row["best_in_round"] == max(row["fitness"])
+        assert row["anchor"] is not None
+        assert len(row["anchor"]) == task.landscape().sequence_length
+
+    # Under re-anchoring the anchor is the object that moves, so a stored
+    # anchor that never changed would be the fixed-anchor campaign misfiled.
+    anchors = [tuple(row["anchor"]) for row in record.rounds]
+    assert len(set(anchors)) > 1
+
+
 def test_a_round_that_never_consulted_a_memory_stores_nothing_rather_than_zero():
     # Zero is a measurement -- "the memory refused nothing" -- and it would
     # average into a column beside real ones as evidence that the arm never
     # repeated itself. A campaign run without the screen never looked, which is
     # the opposite finding, and `nan` is what the store already uses for a
     # quantity nobody obtained.
-    absent = _round_rows([a_round(redundant=None)])[0]
-    measured = _round_rows([a_round(redundant=0)])[0]
+    absent = round_rows([a_round(redundant=None)])[0]
+    measured = round_rows([a_round(redundant=0)])[0]
 
-    assert np.isnan(absent["redundant"])
-    assert np.isnan(absent["redundant_fraction"])
+    assert np.isnan(cast("float", absent["redundant"]))
+    assert np.isnan(cast("float", absent["redundant_fraction"]))
     assert measured["redundant"] == 0.0
     assert measured["redundant_fraction"] == 0.0
 
