@@ -1308,7 +1308,7 @@ def _arm_parameters(method: Methodology, task: Task) -> dict[str, str | float | 
     return dict(getattr(method, "parameters", {}))
 
 
-def _round_rows(records: Sequence[RoundRecord]) -> list[dict[str, float]]:
+def round_rows(records: Sequence[RoundRecord]) -> list[dict[str, object]]:
     """The per-round ledger, flattened for storage.
 
     Built key by key rather than from the dataclass, which is what makes this
@@ -1317,13 +1317,20 @@ def _round_rows(records: Sequence[RoundRecord]) -> list[dict[str, float]]:
     [RoundRecord][evogfn.loop.ledger.RoundRecord] and not added here is present
     in memory, absent from every stored record, and silent about the difference.
 
+    **Public, and the only implementation.** The multi-objective suite kept a
+    second copy of this dict inline, and the copy had already drifted -- it was
+    missing both repetition counters, so every multi-objective record stored
+    since those were added carries neither. One function is what stops the two
+    suites disagreeing about what a round is.
+
     Args:
         records: The rounds that completed. On an exhausted campaign this is
             short of the protocol's round count, which is itself the record of
             how far the run got.
 
     Returns:
-        One dict per round, in order.
+        One dict per round, in order. Values are scalars except ``fitness`` and
+        ``anchor``, which are lists.
     """
     return [
         {
@@ -1361,6 +1368,19 @@ def _round_rows(records: Sequence[RoundRecord]) -> list[dict[str, float]]:
             # to the counter that needs it for the same reason.
             "redundant": float("nan") if record.redundant is None else float(record.redundant),
             "redundant_fraction": record.redundant_fraction,
+            # The plate itself, and the design it was built from. Both are
+            # *lists* where every other value here is a scalar, which is the
+            # reason this function's return type widened: the questions they
+            # answer -- where `E[max]` over a plate saturates, and what a
+            # round's diversity is relative to the set its own anchor could
+            # reach -- are not functions of any summary statistic, so they were
+            # answerable only by re-running the campaign.
+            #
+            # Costed before being added: one float per well against `length`
+            # integers per well, which is why the measurements are stored and
+            # the batch *sequences* still are not.
+            "fitness": [float(value) for value in record.fitness],
+            "anchor": None if record.anchor is None else [int(t) for t in record.anchor],
         }
         for record in records
     ]
@@ -1441,7 +1461,7 @@ def _exhausted_record(  # noqa: PLR0913 - a record is defined by what it declare
         # produced nothing to inspect.
         top_sequences=[],
         trace=[record.best_so_far for record in completed],
-        rounds=_round_rows(completed),
+        rounds=round_rows(completed),
         **_sampler_fields(campaign.sampler),
     )
 
@@ -1593,7 +1613,7 @@ def run_task(
                     deterministic=is_deterministic(),
                     top_sequences=_top_designs(result),
                     trace=result.trace(),
-                    rounds=_round_rows(result.rounds),
+                    rounds=round_rows(result.rounds),
                 )
             )
             ran += 1

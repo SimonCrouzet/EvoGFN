@@ -115,6 +115,19 @@ class RoundRecord:
             before a surrogate exists. Separates a method failing because its
             sampler proposes badly from one failing because its model cannot
             tell good designs from bad.
+        fitness: Every measured value this round, in the order the plate was
+            evaluated, as a tuple. The aggregates beside it -- ``best_in_round``,
+            ``mean_in_round`` -- are functions of this, and storing only them is
+            what made a whole class of batch-level question unanswerable without
+            re-running the campaign: what the marginal contribution of the k-th
+            well to ``E[max]`` is, where a plate saturates, what the measured
+            distribution over a plate looks like. Infeasible measurements appear
+            as ``-inf``, the same value they carry in the aggregates, so the
+            feasible count is recoverable from this alone.
+
+            Cheap in a way the batch *sequences* are not: one float per well
+            against ``length`` integers per well, which is why this is recorded
+            and they are not.
         anchor: The design this round's proposals were built from, as a tuple of
             token indices, or ``None`` when the campaign was not tracking an
             anchor. A tuple rather than an array so the record stays comparable,
@@ -135,6 +148,7 @@ class RoundRecord:
     best_so_far: float
     mean_in_round: float
     batch_diversity: float
+    fitness: tuple[float, ...] = ()
     surrogate_correlation: float = float("nan")
     hypervolume: float = float("nan")
     anchor: tuple[int, ...] | None = None

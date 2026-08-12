@@ -496,7 +496,7 @@ class RunRecord:
     oracle_calls: int
     proposals: int
     trace: list[float] = field(default_factory=list)
-    rounds: list[dict[str, float]] = field(default_factory=list)
+    rounds: list[dict[str, object]] = field(default_factory=list)
     proxy_calls: int = 0
     # Defaulted, like every field added after the first records were written:
     # `load` builds a record by keyword from the stored payload, so a key that
