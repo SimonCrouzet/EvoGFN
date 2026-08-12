@@ -224,6 +224,11 @@ def _outcome(seed, *, unreachable, pinned, repaired):
         attainable_lower=0.5,
         attainable_upper=0.5 if pinned else 1.0,
         pinned=pinned,
+        # The re-anchored audit answers on the same draws the fixed-anchor one
+        # does, and recovers more -- which is the whole point of the pair.
+        reanchored_lower=0.75,
+        reanchored_upper=0.75 if pinned else 1.0,
+        reanchored_pinned=pinned,
         repaired={"greedy": repaired, "exact": repaired},
         all_constructible=True,
     )
