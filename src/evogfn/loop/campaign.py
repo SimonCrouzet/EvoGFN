@@ -942,6 +942,11 @@ class Campaign:
             best_so_far=max(previous_best, best_in_round),
             mean_in_round=float(finite.mean()) if finite.size else float("-inf"),
             batch_diversity=(diversity(batch) if batch.shape[0] >= _MIN_FOR_DIVERSITY else 0.0),
+            # The plate itself, not a summary of it. `best_in_round` and
+            # `mean_in_round` above are both functions of this tuple, and
+            # keeping only them is what forced a re-run for every question
+            # about the shape of a plate rather than its extremes.
+            fitness=tuple(float(value) for value in flat),
             surrogate_correlation=_correlation(predicted, flat),
             hypervolume=self._hypervolume(history),
             # The twins, written together so a reader of this call site sees

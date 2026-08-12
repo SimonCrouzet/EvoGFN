@@ -172,7 +172,7 @@ from evogfn.benchmark.methods import (
     shipped_base,
 )
 from evogfn.benchmark.protocol import PLATE, Protocol
-from evogfn.benchmark.suite import DIAGNOSTIC_MUTATIONS, Purpose, Tier
+from evogfn.benchmark.suite import DIAGNOSTIC_MUTATIONS, Purpose, Tier, round_rows
 from evogfn.benchmark.tasks import Task
 from evogfn.env.mutation import MutationEnvironment
 from evogfn.landscapes.ch65 import CH65_DETECTION_FLOOR, CH65_N_SITES, CH65Landscape
@@ -2572,23 +2572,7 @@ def run_multi_objective_task(
                     deterministic=is_deterministic(),
                     top_sequences=_front_designs(result),
                     trace=result.trace(),
-                    rounds=[
-                        {
-                            "index": float(record.index),
-                            "proposed": float(record.proposed),
-                            "screened": float(record.screened),
-                            "evaluated": float(record.evaluated),
-                            "feasible": float(record.feasible),
-                            "best_in_round": record.best_in_round,
-                            "best_so_far": record.best_so_far,
-                            "mean_in_round": record.mean_in_round,
-                            "batch_diversity": record.batch_diversity,
-                            "surrogate_correlation": record.surrogate_correlation,
-                            "hypervolume": record.hypervolume,
-                            "anchor_distance": float(record.anchor_distance),
-                        }
-                        for record in result.rounds
-                    ],
+                    rounds=round_rows(result.rounds),
                 )
             )
             ran += 1
