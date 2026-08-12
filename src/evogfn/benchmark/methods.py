@@ -894,6 +894,7 @@ def gflownet(  # noqa: PLR0913 - an arm is defined by its hyperparameters
     terminal_feasibility: bool = False,
     anchor_conditioned: bool = False,
     match_anchor_capacity: bool = False,
+    pool_size: int = DEFAULT_POOL,
 ) -> Methodology:
     """A GFlowNet trained against the surrogate proxy.
 
@@ -935,6 +936,15 @@ def gflownet(  # noqa: PLR0913 - an arm is defined by its hyperparameters
             policy fits a function over anchors, which is something only an arm
             with a policy can do at all: a genetic algorithm's representation of
             where it is *is* its population.
+        pool_size: Candidates screened per proposal call, or `PLATE_POOL` for
+            exactly the plate and no screening at all. Exposed because the two
+            decomposition rungs below are defined by it: screening spends the
+            *surrogate*, which is not the campaign's budget -- the oracle budget
+            is the plate, and it is identical for every arm here whatever this is
+            set to. So a rung that screens more is not being given a larger
+            budget, it is being given more compute against a free model, which is
+            what makes "how far does masking plus screening get on its own"
+            answerable rather than rhetorical.
         match_anchor_capacity: Widen the plain trunk, per task, until it carries
             what an anchor-conditioned trunk of `hidden_dim` would carry on that
             task's own shape. Off is every arm but the capacity control. It has
@@ -1020,7 +1030,12 @@ def gflownet(  # noqa: PLR0913 - an arm is defined by its hyperparameters
                 # and `steps * TRAINING_BATCH` proxy evaluations either way, and
                 # every round retrains, so an arm that starts each ball from
                 # nothing is given exactly as much compute to recover with.
-                config=TrainingConfig(steps=steps, batch_size=TRAINING_BATCH, seed=stream),
+                # `steps or 1` keeps the config well-formed where the arm
+                # does not train at all; `train` is what actually decides, and
+                # the recorded `steps` stays 0 so a reader of the row sees the
+                # arm for what it is.
+                config=TrainingConfig(steps=steps or 1, batch_size=TRAINING_BATCH, seed=stream),
+                train=steps > 0,
                 objective=objective,
                 seed=stream,
             )
@@ -1029,7 +1044,7 @@ def gflownet(  # noqa: PLR0913 - an arm is defined by its hyperparameters
             built.append(sampler)
             return _RebuiltOnMove(sampler, built)
 
-        return _campaign(task, landscape, env, make, ensemble, pool_size=DEFAULT_POOL)
+        return _campaign(task, landscape, env, make, ensemble, pool_size=pool_size)
 
     def resolved(task: Task) -> dict[str, ArmParameter]:
         """What the capacity control came out at on this task, for the record.
@@ -1061,7 +1076,7 @@ def gflownet(  # noqa: PLR0913 - an arm is defined by its hyperparameters
             "beta": beta,
             "learn_flow": learn_flow,
             "hidden_dim": hidden_dim,
-            "pool_size": DEFAULT_POOL,
+            "pool_size": pool_size,
             "carry_policy": carry_policy,
             "terminal_feasibility": terminal_feasibility,
             "anchor_conditioned": anchor_conditioned,
@@ -2148,6 +2163,27 @@ def variant_arms(base: LadderBase | None = None) -> dict[str, Methodology]:
             terminal_feasibility=True, anchor_conditioned=True
         ),
         f"{base.name}+wide": base.rung(match_anchor_capacity=True),
+        # The decomposition the headline claim rests on, in two steps. Neither
+        # rung trains: `steps=0` leaves the policy at its random initialisation,
+        # so both draw from the *masked construction graph* and differ from the
+        # base arm in learning alone.
+        #
+        # `+untrained` screens nothing -- `PLATE_POOL` fills the plate directly
+        # -- so it is masking and nothing else, and it spends zero surrogate
+        # calls. It is the arm behind the observation that an untrained masked
+        # draw already beats published baselines' final answers.
+        #
+        # `+untrained@pN` adds the screen at pool `N`. The sweep exists because
+        # the surrogate is **not** the campaign's budget: the oracle budget is
+        # the plate and is identical on every one of these rungs, so screening
+        # more is more compute against a free model rather than a larger budget.
+        # A single pool would leave "would more screening have closed the gap?"
+        # unanswered and unanswerable from the table; three say where it
+        # saturates, which is the honest form of the control.
+        f"{base.name}+untrained": base.rung(steps=0, pool_size=PLATE_POOL),
+        f"{base.name}+untrained@p2048": base.rung(steps=0, pool_size=2048),
+        f"{base.name}+untrained@p8192": base.rung(steps=0, pool_size=8192),
+        f"{base.name}+untrained@p32768": base.rung(steps=0, pool_size=32768),
     }
 
 

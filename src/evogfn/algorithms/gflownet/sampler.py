@@ -81,6 +81,16 @@ class GFlowNetSampler(Sampler):
             Never the oracle.
         reward: Transforms proxy values into log rewards.
         config: Training settings applied on every retrain.
+        train: Whether to retrain at all. ``False`` leaves the policy at the
+            weights it was built with for the whole campaign, which is how the
+            ``+untrained`` rung is expressed: the mask, the environment, the
+            proposal path and the plate are the shipped arm's, and learning is
+            the single thing removed. Spelled as a flag rather than as zero
+            gradient steps because
+            [TrainingConfig][evogfn.algorithms.gflownet.training.TrainingConfig]
+            rejects a zero-step run -- correctly, since that describes no
+            training run at all -- and the distinction wanted here is between
+            *running* a degenerate one and not running one.
         objective: How balance violation is measured. Defaults to trajectory
             balance.
         genetic: A genetic algorithm to use as the policy's teacher. With one,
@@ -102,12 +112,14 @@ class GFlowNetSampler(Sampler):
         proxy: ProxyLandscape,
         reward: Reward,
         config: TrainingConfig | None = None,
+        train: bool = True,
         objective: GFlowNetObjective | None = None,
         genetic: GeneticAlgorithm | None = None,
         genetic_config: GeneticConfig | None = None,
         seed: int = 0,
     ) -> None:
         """Store the training setup without running it."""
+        self._train = train
         super().__init__()
         self._env = env
         self._policy = policy
@@ -353,7 +365,7 @@ class GFlowNetSampler(Sampler):
         Returns:
             An ``(n, sequence_length)`` array of terminal states.
         """
-        if self._proxy.is_ready:
+        if self._proxy.is_ready and self._train:
             # A distinct seed per round, or every round replays the same
             # trajectories and the later rounds teach nothing.
             config = replace(self._config, seed=self._config.seed + self._rounds_trained)
