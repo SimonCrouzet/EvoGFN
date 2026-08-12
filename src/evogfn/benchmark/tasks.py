@@ -50,6 +50,7 @@ if TYPE_CHECKING:
 
     from evogfn.benchmark.protocol import Protocol
     from evogfn.core.types import Tokens
+    from evogfn.env.feasibility import FeasibilityPredicate
     from evogfn.landscapes.base import FitnessLandscape
 
 #: Slack for comparing a declared bound against a landscape's own optimum.
@@ -216,6 +217,17 @@ class Task:
             default: it makes `run_task` store no regret at all, on the grounds
             that a regret against an unaudited optimum is the failure this field
             exists to prevent.
+        feasibility: Builds the rule saying which sequences are legal, from the
+            landscape. ``None`` means the landscape's own transition matrix,
+            which is what every task declared before predicates existed and
+            what all of them still declare.
+
+            A factory rather than a predicate, because a predicate is sized to
+            the alphabet and the sequence length and neither is known until the
+            landscape is built -- and a task is a *declaration*, built once and
+            reused across every seed, while a landscape may be drawn per seed.
+            Declaring the instance here would pin one draw's shape onto every
+            other.
         parent_seed: Seeds the starting sequence.
     """
 
@@ -226,6 +238,7 @@ class Task:
     max_mutations: int
     reanchor: bool = False
     attainable: Attainable | None = None
+    feasibility: Callable[[FitnessLandscape], FeasibilityPredicate] | None = None
     parent_seed: int = 0
 
     def landscape(self) -> FitnessLandscape:
