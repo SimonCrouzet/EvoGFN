@@ -70,6 +70,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import subprocess
 import sys
 import time
 from dataclasses import dataclass
@@ -132,6 +133,9 @@ if TYPE_CHECKING:
 
 #: Seeds per tier. The main tiers differ because campaign cost differs by an
 #: order of magnitude between L=4 and L=256, not because the claims differ.
+#: How often the shard supervisor wakes to reap finished children.
+_SHARD_POLL_SECONDS = 2.0
+
 MAIN_SEEDS = 100
 LARGE_SPACE_SEEDS = 30
 DIAGNOSTIC_SEEDS = 50
@@ -1625,6 +1629,18 @@ def main(argv: list[str] | None = None) -> int:
         "--diagnostic-seeds", type=int, default=DIAGNOSTIC_SEEDS, help="Seeds for diagnostics."
     )
     parser.add_argument("--results", default="results", help="Where to store results.")
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        help="Run this many shards as subprocesses. Determinism pins each "
+        "process to one thread, so the unit of parallelism has to be the "
+        "process; and the store keeps one file per task and method, so shards "
+        "never contend. Sharding lives here rather than in a shell script "
+        "because the roster -- which tasks, which arms -- is then the tier "
+        "declarations, which are typed and tested, instead of a list nothing "
+        "checks.",
+    )
     parser.add_argument("--report", action="store_true", help="Report without running.")
     args = parser.parse_args(argv)
 
@@ -1655,6 +1671,9 @@ def main(argv: list[str] | None = None) -> int:
     if not selected:
         print(f"nothing matched tier={args.tier} task={args.task}", file=sys.stderr)
         return 2
+
+    if args.workers > 1 and not args.report:
+        return _run_sharded(selected, args)
 
     started = time.perf_counter()
     for tier in selected:
@@ -1724,6 +1743,91 @@ def _run(
         _flush(f"{running.name}: runs named cells, so --method cannot select within it")
         return None
     return run_anchor_study(store, running.seeds, report=_flush)
+
+
+def _shard_bounds(count: int, workers: int) -> list[tuple[int, int]]:
+    """Contiguous seed ranges covering ``count`` seeds, at most ``workers`` of them.
+
+    Contiguous rather than strided so a shard's log reads as a seed range, and
+    so a shard that dies leaves an obvious hole rather than a comb.
+
+    Args:
+        count: Seeds in the tier.
+        workers: Most shards to cut it into.
+
+    Returns:
+        ``(low, high)`` pairs, half-open, covering ``range(count)`` exactly.
+    """
+    workers = max(1, min(workers, count))
+    step, spare = divmod(count, workers)
+    bounds, low = [], 0
+    for shard in range(workers):
+        high = low + step + (1 if shard < spare else 0)
+        bounds.append((low, high))
+        low = high
+    return bounds
+
+
+def _run_sharded(selected: list[Tier], args: argparse.Namespace) -> int:
+    """Re-invoke this script as one subprocess per (task, seed range).
+
+    Each child runs with ``--workers 1``, so the recursion is one level deep by
+    construction. Every campaign is seeded from its own seed rather than from
+    process order, so a sharded run and a serial one produce identical records
+    -- which is what makes this a scheduling decision and not an experimental
+    one.
+
+    Args:
+        selected: Tiers already filtered by the caller's arguments.
+        args: The parsed command line, reused verbatim for the children.
+
+    Returns:
+        A process exit code: 0 when every shard succeeded, 1 otherwise.
+    """
+    jobs: list[list[str]] = []
+    for tier in selected:
+        for task in tier.tasks:
+            for low, high in _shard_bounds(len(tier.seeds), args.workers):
+                if low == high:
+                    continue
+                command = [
+                    sys.executable,
+                    str(Path(__file__).resolve()),
+                    "--tier",
+                    tier.name,
+                    "--task",
+                    task.name,
+                    "--seeds",
+                    str(args.seeds),
+                    "--diagnostic-seeds",
+                    str(args.diagnostic_seeds),
+                    "--seed-from",
+                    str(low),
+                    "--seed-to",
+                    str(high),
+                    "--results",
+                    args.results,
+                ]
+                for name in args.method or []:
+                    command += ["--method", name]
+                jobs.append(command)
+
+    _flush(f"{len(jobs)} shards at {args.workers} workers")
+    failures = 0
+    running: list[subprocess.Popen[bytes]] = []
+    pending = list(jobs)
+    while pending or running:
+        while pending and len(running) < args.workers:
+            running.append(subprocess.Popen(pending.pop(0)))  # noqa: S603 - our own argv
+        done = [process for process in running if process.poll() is not None]
+        for process in done:
+            running.remove(process)
+            failures += process.returncode != 0
+        if not done:
+            time.sleep(_SHARD_POLL_SECONDS)
+    if failures:
+        _flush(f"{failures} of {len(jobs)} shards failed")
+    return 1 if failures else 0
 
 
 def _flush(message: str) -> None:
