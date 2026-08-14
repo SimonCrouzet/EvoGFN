@@ -299,18 +299,39 @@ class ContactPredicate:
 
     @property
     def induced_width(self) -> int:
-        """A cheap upper bound: the maximum degree of the contact graph.
+        """An upper bound on the treewidth of the contact graph, by min-degree elimination.
+
+        Eliminate the lowest-degree position, connect its neighbours to each
+        other, and record the degree it had; the largest such degree bounds the
+        treewidth from above. Exact treewidth is NP-hard and nothing here needs
+        it exactly -- but the bound has to be *tight enough to be right about the
+        easy end*, which maximum degree is not: a path has maximum degree 2 and
+        treewidth 1, so reading degree would have this class report width 2 for
+        the very constraint graph `AdjacencyPredicate` correctly calls width 1,
+        and `factorises` reads this number.
 
         Returns:
-            The largest number of contacts incident to any one position, or 0
-            where there are none. An upper bound rather than the true treewidth,
-            which is NP-hard to compute and which nothing here needs exactly --
-            the dial only has to move monotonically.
+            The bound, or 0 where there are no contacts.
         """
         if not self.pairs.size:
             return 0
-        degree = np.bincount(self.pairs.reshape(-1), minlength=self._length)
-        return int(degree.max())
+        neighbours: dict[int, set[int]] = {p: set() for p in range(self._length)}
+        for left, right in self.pairs:
+            neighbours[int(left)].add(int(right))
+            neighbours[int(right)].add(int(left))
+
+        width = 0
+        remaining = {p for p, n in neighbours.items() if n}
+        while remaining:
+            position = min(remaining, key=lambda p: len(neighbours[p]))
+            clique = neighbours[position]
+            width = max(width, len(clique))
+            for other in clique:
+                neighbours[other].discard(position)
+                neighbours[other] |= clique - {other}
+            del neighbours[position]
+            remaining.remove(position)
+        return width
 
     def is_feasible(self, sequences: Tokens) -> npt.NDArray[np.bool_]:
         """Whether every contact carries a permitted token pair."""

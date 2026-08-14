@@ -86,6 +86,7 @@ from evogfn.algorithms.baselines.genetic import GeneticAlgorithm
 from evogfn.benchmark.determinism import is_deterministic
 from evogfn.benchmark.protocol import PLATE, Protocol, round_sweep
 from evogfn.benchmark.tasks import Attainable, Task
+from evogfn.env.feasibility import BudgetBandPredicate, ContactPredicate
 from evogfn.landscapes.ehrlich import EhrlichLandscape
 from evogfn.landscapes.gb1 import GB1Landscape
 from evogfn.landscapes.trpb import TRPB_POSITIONS, TrpBLandscape
@@ -98,6 +99,7 @@ if TYPE_CHECKING:
     from evogfn.benchmark.attainable import AttainableOptimum
     from evogfn.benchmark.methods import Methodology
     from evogfn.benchmark.store import ResultStore, RunRecord
+    from evogfn.env.feasibility import FeasibilityPredicate
     from evogfn.env.mutation import MutationEnvironment
     from evogfn.landscapes.base import FitnessLandscape
     from evogfn.loop.campaign import Campaign
@@ -730,6 +732,302 @@ def constraint_density() -> tuple[Task, ...]:
         )
         for density in CONSTRAINT_DENSITIES
     )
+
+
+#: The support study's instance. Two properties are load-bearing and neither is
+#: a tuning choice.
+#:
+#: **Enumerable.** At ten positions over four tokens the Hamming ball is
+#: 1,048,576, inside `MAX_ENUMERABLE_SIZE`, so ``|feasible|`` and ``|reachable|``
+#: are both *exact* rather than estimated. That is the whole reason this study
+#: can be run here and essentially nowhere else. Twelve positions would be
+#: 16.7 million and would put both quantities out of reach.
+#:
+#: **Its own constraint is vacuous.** ``transition_density=1.0`` leaves zero
+#: forbidden adjacencies, which matters because an Ehrlich landscape scores a
+#: sequence violating *its* transition matrix at minus infinity. Without this
+#: the reward would carry a second feasibility rule that the declared predicate
+#: knows nothing about, and a contrast meant to vary one thing would vary two.
+SUPPORT_INSTANCE: dict[str, object] = {
+    "sequence_length": 10,
+    "vocab_size": 4,
+    "n_motifs": 2,
+    "motif_length": 2,
+    "transition_density": 1.0,
+    "seed": 7,
+}
+
+#: Positions in the support instance, named because the predicates are sized to
+#: it and the budget is set equal to it.
+SUPPORT_LENGTH = 10
+
+#: Tokens per position in the support instance.
+SUPPORT_TOKENS = 4
+
+#: Which anchor the predicate factories must agree with. `Task.parent` resolves
+#: an Ehrlich anchor as ``feasible_sequence(parent_seed)``, and a predicate that
+#: forbade the anchor's own contacts would start every trajectory infeasible --
+#: so the factories read the same seed rather than assuming a default.
+SUPPORT_PARENT_SEED = 0
+
+#: Induced widths the contact family sweeps. One is a path, and therefore the
+#: shape `AdjacencyPredicate` already describes -- the rung that says the dial's
+#: easy end reproduces the predicate this project shipped. Above it the
+#: completion oracle costs ``O(L * v**(w+1) * B)``, so the axis is the exponent.
+SUPPORT_WIDTHS: tuple[int, ...] = (1, 2, 3)
+
+#: Share of the sequence space each rung's predicate admits, held **equal
+#: across rungs**. This is the control that makes the family readable: the
+#: question is what fraction of a feasible set the mask can reach, and a rung
+#: whose feasible set is a different size is answering a different question.
+#:
+#: Calibrated rather than set. Per-contact density compounds over the contact
+#: count, so a fixed density collapses the feasible set as the width grows --
+#: measured, a shared 0.6 gave 21,188 feasible at width 1 and 61 at width 3,
+#: which is a family varying its own difficulty rather than its structure.
+#: Each rung therefore solves for the density that hits this share.
+SUPPORT_FEASIBLE_TARGET = 0.02
+
+#: Magnitude of the budget band's integer weights. Large on purpose, twice
+#: over: it spreads the distribution of totals so a narrow band is genuinely
+#: selective (at +/-4 even the single-point band admits ~6% of the space), and
+#: the NP-hardness of the band is **weak**, so instances with small weights
+#: admit a pseudo-polynomial dynamic program and are easy. Range is what makes
+#: the reduction bite.
+SUPPORT_WEIGHT = 16
+
+
+def _contact_pairs(width: int, length: int = SUPPORT_LENGTH) -> np.ndarray:
+    """Coupled positions whose constraint graph has the requested induced width.
+
+    Built by adding skips to a path: the path alone is width 1, adding every
+    ``(i, i+2)`` makes it 2, and ``(i, i+3)`` makes it 3. The point is that the
+    *predicate* is the same kind of object at every rung -- a set of pairwise
+    constraints -- and only how densely the positions couple changes.
+
+    Args:
+        width: Induced width wanted. Must be at least 1.
+        length: Sequence length.
+
+    Returns:
+        An ``(m, 2)`` array of position pairs.
+
+    Raises:
+        ValueError: If ``width`` is below 1.
+    """
+    if width < 1:
+        raise ValueError(f"width must be at least 1, got {width}")
+    pairs = [(i, i + skip) for skip in range(1, width + 1) for i in range(length - skip)]
+    return np.asarray(pairs, dtype=np.int64)
+
+
+def _contact_predicate(width: int) -> Callable[[FitnessLandscape], FeasibilityPredicate]:
+    """A factory for the contact predicate at one rung of the width dial.
+
+    A factory rather than a predicate because the permitted token pairs are
+    drawn *around the anchor*: every contact is forced to permit the pair the
+    anchor already carries there, which is what stops the campaign beginning at
+    an infeasible state. The anchor is not known until the landscape is built,
+    which is exactly the reason `Task.feasibility` takes a factory.
+
+    Args:
+        width: Which rung.
+
+    Returns:
+        A callable taking the landscape and returning the predicate.
+    """
+
+    def build(landscape: FitnessLandscape) -> FeasibilityPredicate:
+        pairs = _contact_pairs(width)
+        # Solve for the per-contact density that leaves the same share of the
+        # space feasible as every other rung: independently, m contacts each
+        # admitting d leave d**m, so d is the m-th root of the target.
+        density = SUPPORT_FEASIBLE_TARGET ** (1.0 / len(pairs))
+        rng = np.random.default_rng(SUPPORT_INSTANCE["seed"])  # type: ignore[arg-type]
+        permitted = rng.random((len(pairs), SUPPORT_TOKENS, SUPPORT_TOKENS)) < density
+        anchor = np.asarray(landscape.feasible_sequence(SUPPORT_PARENT_SEED))  # type: ignore[attr-defined]
+        for index, (left, right) in enumerate(pairs):
+            permitted[index, anchor[left], anchor[right]] = True
+        return ContactPredicate(
+            pairs, permitted, length=SUPPORT_LENGTH, alphabet_size=SUPPORT_TOKENS
+        )
+
+    return build
+
+
+def _band_bounds(weights: np.ndarray) -> int:
+    """The half-width admitting `SUPPORT_FEASIBLE_TARGET` of the space.
+
+    Computed exactly rather than sampled. A sequence's total is a sum of one
+    weight per position, so the distribution over a uniform sequence is the
+    convolution of the ten per-position distributions -- cheap over an integer
+    range, deterministic, and it makes the band a *calibrated* quantity rather
+    than a constant somebody picked.
+
+    Args:
+        weights: The ``(length, tokens)`` integer weights, already shifted so
+            the anchor totals zero.
+
+    Returns:
+        The smallest half-width whose band admits at least the target share.
+    """
+    low, high = int(weights.min(axis=1).sum()), int(weights.max(axis=1).sum())
+    distribution = np.zeros(high - low + 1)
+    distribution[-low] = 1.0
+    for position in range(weights.shape[0]):
+        convolved = np.zeros_like(distribution)
+        for token in range(weights.shape[1]):
+            convolved += np.roll(distribution, int(weights[position, token]))
+        distribution = convolved / weights.shape[1]
+
+    zero = -low
+    total = distribution.sum()
+    for half in range(high - low + 1):
+        share = distribution[max(0, zero - half) : zero + half + 1].sum() / total
+        if share >= SUPPORT_FEASIBLE_TARGET:
+            return half
+    return high - low
+
+
+def _band_predicate() -> Callable[[FitnessLandscape], FeasibilityPredicate]:
+    """A factory for the budget band -- the rung where no tractable mask exists.
+
+    Every position enters one running total, so the constraint graph is complete
+    and the induced width is the sequence length. Deciding whether a legal
+    construction order exists is **NP-complete**, by reduction from PARTITION.
+
+    The weights are shifted so the anchor's own tokens weigh nothing, which puts
+    the anchor at a total of zero and therefore inside any band containing it.
+    That is the same device the reduction uses, and it is what makes the anchor
+    feasible without weakening the constraint anywhere else.
+
+    Returns:
+        A callable taking the landscape and returning the predicate.
+    """
+
+    def build(landscape: FitnessLandscape) -> FeasibilityPredicate:
+        rng = np.random.default_rng(SUPPORT_INSTANCE["seed"])  # type: ignore[arg-type]
+        shape = (SUPPORT_LENGTH, SUPPORT_TOKENS)
+        weights = rng.integers(-SUPPORT_WEIGHT, SUPPORT_WEIGHT + 1, shape)
+        anchor = np.asarray(landscape.feasible_sequence(SUPPORT_PARENT_SEED))  # type: ignore[attr-defined]
+        # Zero the anchor's own tokens, so its total is zero and it is legal.
+        weights = weights - weights[np.arange(SUPPORT_LENGTH), anchor][:, None]
+        half = _band_bounds(weights)
+        return BudgetBandPredicate(weights, low=-half, high=half, length=SUPPORT_LENGTH)
+
+    return build
+
+
+def support_study() -> tuple[Task, ...]:
+    """Tasks whose axis is whether a *sound* mask can be built at all.
+
+    Every other constrained task in this suite poses the same feasibility rule:
+    permitted adjacent token pairs, whose constraint graph is a path. That rule
+    is the tractable case by construction -- the completion oracle is a dynamic
+    program, an exact projection exists, and a learned sampler can buy no
+    support advantage over it. So the condition this project states is measured
+    only on the half where it holds, and the half where it fails is instantiated
+    nowhere.
+
+    This family instantiates it. The rungs share one landscape, one anchor and
+    one protocol, and differ **only** in the predicate:
+
+    * ``support-w1`` -- contacts along a path. Induced width 1, and therefore the
+      shape `AdjacencyPredicate` already describes; the rung that says the dial's
+      easy end reproduces what ships.
+    * ``support-w2``, ``support-w3`` -- the same kind of predicate with positions
+      coupled more densely. The oracle costs ``O(L * v**(w+1) * B)``, so this is
+      the exponent moving, and the tractable side degrades continuously rather
+      than falling off a cliff.
+    * ``support-band`` -- a weighted running total confined to a band. Every
+      position couples to every other, and deciding constructibility is
+      NP-complete by reduction from PARTITION. The endpoint the dial points at.
+
+    **Unbudgeted, and fixed-anchor, both deliberately.** The per-round budget is
+    the sequence length, so it never binds; and the anchor does not move. A
+    design unreachable here is unreachable because of the *predicate*, which is
+    the only one of the three causes this family exists to isolate. Adding a
+    budget or a moving anchor would reintroduce the other two and make the
+    contrast unreadable.
+
+    Returns:
+        One task per rung, widths first and the band last. None declares an
+        attainable optimum: the reachable set differs at every rung by
+        construction, so a neighbouring rung's audited value would be a floor no
+        method could clear. This family is read on support, not on regret.
+    """
+    protocol = Protocol(rounds=4, batch_size=PLATE, max_mutations=SUPPORT_LENGTH)
+    shared = (
+        "Ten positions over four tokens, so the feasible and reachable sets are "
+        "both enumerable exactly. The instance's own transition constraint is "
+        "vacuous, so the declared predicate is the only feasibility rule. "
+        "Unbudgeted and fixed-anchor, so unreachability is the predicate's doing "
+        "and not the budget's or the anchor's."
+    )
+    tasks = [
+        _task(
+            f"support-w{width}",
+            f"Does a sound mask exist when the constraint graph has induced width "
+            f"{width}? {shared}",
+            _ehrlich(**SUPPORT_INSTANCE),
+            protocol,
+            reanchor=False,
+            attainable=None,
+        )
+        for width in SUPPORT_WIDTHS
+    ]
+    band = _task(
+        "support-band",
+        "Does a sound mask exist when deciding constructibility is NP-complete? "
+        "A weighted running total confined to a band, so every position couples "
+        f"to every other. {shared}",
+        _ehrlich(**SUPPORT_INSTANCE),
+        protocol,
+        reanchor=False,
+        attainable=None,
+    )
+    return (*tasks, band)
+
+
+def support_predicates() -> dict[str, Callable[[FitnessLandscape], FeasibilityPredicate]]:
+    """The predicate each support task declares, by task name.
+
+    Kept beside `support_study` rather than inside it because `Task` is frozen
+    and the tasks are built by the shared `_task` helper, which knows nothing
+    about predicates. `support_tasks` is what puts the two together.
+
+    Returns:
+        Factories by task name.
+    """
+    return {
+        **{f"support-w{width}": _contact_predicate(width) for width in SUPPORT_WIDTHS},
+        "support-band": _band_predicate(),
+    }
+
+
+def support_tasks() -> tuple[Task, ...]:
+    """The support study with each task's predicate attached.
+
+    Returns:
+        The tasks of `support_study`, each carrying the factory
+        `support_predicates` names for it.
+    """
+    declared = support_predicates()
+    return tuple(replace(task, feasibility=declared[task.name]) for task in support_study())
+
+
+def support_tier(seeds: Sequence[int]) -> Tier:
+    """The support study as a tier.
+
+    Args:
+        seeds: Seeds per arm.
+
+    Returns:
+        A `Purpose.DIAGNOSTIC` tier. Diagnostic and not benchmark: what it
+        varies is the *shape of the reachable set*, which explains where a
+        method can help rather than establishing that one did.
+    """
+    return Tier("support", support_tasks(), tuple(seeds), Purpose.DIAGNOSTIC)
 
 
 #: Per-round mutation radii the rejection diagnostic sweeps. The axis is how
