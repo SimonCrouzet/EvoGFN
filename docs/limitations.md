@@ -92,10 +92,14 @@ ran.
 
 ---
 
-## 5. The oracle budget is the only budget, and it is identical everywhere
+## 5. The oracle budget is the only budget, and it is identical within a task
 
-Every arm on every task spends **384 oracle calls**. Nothing in this suite measures a method that
-buys a better result with more assays, because no such comparison exists here.
+**Corrected 2026-08-14.** An earlier draft of this page said every arm spends 384 oracle calls. It
+is 384 under the four-plate protocols (`feasibility`, `gb1-anchor`, `trpb-anchor`,
+`protocol-evolvepro`) and **396** under the ALDE protocol (`protocol-alde` and the three
+`replicate-alde-*` instances), whose three plates are 132 wells each. The load-bearing claim is
+unaffected and is the one to quote: **every arm within a task spends the same**, so no method here
+buys a better result with more assays.
 
 What differs between arms is *compute against a free surrogate*, and it differs enormously:
 
@@ -112,8 +116,12 @@ What differs between arms is *compute against a free surrogate*, and it differs 
 it. Any statement of the form "N× fewer proxy calls" is therefore about *training* compute, and is
 not a budget saving in the sense a laboratory means. This page previously implied otherwise.
 
-The 72–202× CPU gap is real and is a genuine cost of the method. It is not offset by anything
-measured here.
+**The CPU gap is 108×–245×**, measured per instance against the exact projection — not the
+72×–202× an earlier note claimed, which does not reproduce from any pair in the store. It is a
+genuine cost of the method and is not offset by anything measured here.
+
+Note also that 38,400 proxy calls is specific to the three-round ALDE protocol; the eight-round
+`protocol-evolvepro` spends **134,400**, because the count scales with the rounds that train.
 
 ---
 
