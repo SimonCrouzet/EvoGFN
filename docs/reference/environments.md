@@ -10,4 +10,6 @@ afterwards.
 
 ::: evogfn.env.base
 
+::: evogfn.env.feasibility
+
 ::: evogfn.env.mutation
