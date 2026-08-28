@@ -819,6 +819,21 @@ SUPPORT_SEPARATIONS: tuple[int, ...] = (2, 3, 4)
 #: by solving for its per-contact density.
 SUPPORT_CODEBOOK = 800
 
+#: Lengths the codebook family is built at. Ten positions is where the *support*
+#: table lives, because measuring the reachable share exactly needs the Hamming
+#: ball enumerated and 4^10 is inside the limit. The longer rungs exist because
+#: that requirement does not apply to the method evaluation: coverage and
+#: precision are taken against the codebook, which is known exactly by
+#: construction at any length, so they can be measured where a shallow search
+#: genuinely fails rather than only where it is cheap.
+#:
+#: Longer is also *easier* to construct, which is worth stating because it reads
+#: as though it should be harder. Random codewords over four tokens differ in
+#: about three quarters of their positions, so separation is nearly free once
+#: the sequence is long: reaching 800 designs at separation four took 6,246
+#: draws at ten positions and 799 -- one per design -- at twenty.
+SUPPORT_LENGTHS: tuple[int, ...] = (10, 20, 30)
+
 
 def _contact_pairs(width: int, length: int = SUPPORT_LENGTH) -> np.ndarray:
     """Coupled positions whose constraint graph has the requested induced width.
@@ -981,7 +996,9 @@ def _two_band_predicate() -> Callable[[FitnessLandscape], FeasibilityPredicate]:
     return build
 
 
-def _codebook_predicate(separation: int) -> Callable[[FitnessLandscape], FeasibilityPredicate]:
+def _codebook_predicate(
+    separation: int, length: int = SUPPORT_LENGTH
+) -> Callable[[FitnessLandscape], FeasibilityPredicate]:
     """A factory for a codebook whose designs are mutually well separated.
 
     Built greedily around the anchor: candidates are drawn from the shared
@@ -992,6 +1009,7 @@ def _codebook_predicate(separation: int) -> Callable[[FitnessLandscape], Feasibi
 
     Args:
         separation: Least Hamming distance between two legal designs.
+        length: Sequence length the codebook is drawn at.
 
     Returns:
         A callable taking the landscape and returning the predicate.
@@ -1002,7 +1020,7 @@ def _codebook_predicate(separation: int) -> Callable[[FitnessLandscape], Feasibi
         rng = np.random.default_rng(SUPPORT_INSTANCE["seed"])  # type: ignore[arg-type]
         book = [anchor]
         accepted = anchor[None, :]
-        for candidate in rng.integers(0, SUPPORT_TOKENS, (400_000, SUPPORT_LENGTH)):
+        for candidate in rng.integers(0, SUPPORT_TOKENS, (400_000, length)):
             if int((accepted != candidate).sum(axis=1).min()) >= separation:
                 book.append(candidate)
                 accepted = np.asarray(book)
@@ -1010,7 +1028,7 @@ def _codebook_predicate(separation: int) -> Callable[[FitnessLandscape], Feasibi
                     break
         return CodebookPredicate(
             accepted,
-            length=SUPPORT_LENGTH,
+            length=length,
             alphabet_size=SUPPORT_TOKENS,
             separation=separation,
         )
@@ -1112,7 +1130,30 @@ def support_study() -> tuple[Task, ...]:
         )
         for separation in SUPPORT_SEPARATIONS
     ]
-    return (*tasks, band, two_band, *separated)
+    # The same codebook family at lengths where a shallow search genuinely
+    # fails. Only the method evaluation runs here: coverage and precision are
+    # taken against the codebook, which is exact by construction at any length,
+    # where the support table needs the Hamming ball enumerated and so stays at
+    # ten positions.
+    longer = [
+        _task(
+            f"support-sep{separation}-L{length}",
+            f"Does a learned flow recover the support at {length} positions, "
+            f"where legal designs are {separation} substitutions apart and a "
+            f"depth-two search cannot reach them? The feasible set is the "
+            f"codebook and is known exactly without enumerating the ball, so "
+            f"coverage and precision are measurable here even though the "
+            f"reachable share is not. {shared}",
+            _ehrlich(**{**SUPPORT_INSTANCE, "sequence_length": length}),
+            Protocol(rounds=4, batch_size=PLATE, max_mutations=length),
+            reanchor=False,
+            attainable=None,
+        )
+        for length in SUPPORT_LENGTHS
+        if length != SUPPORT_LENGTH
+        for separation in (4,)
+    ]
+    return (*tasks, band, two_band, *separated, *longer)
 
 
 def support_predicates() -> dict[str, Callable[[FitnessLandscape], FeasibilityPredicate]]:
@@ -1132,6 +1173,11 @@ def support_predicates() -> dict[str, Callable[[FitnessLandscape], FeasibilityPr
         **{
             f"support-sep{separation}": _codebook_predicate(separation)
             for separation in SUPPORT_SEPARATIONS
+        },
+        **{
+            f"support-sep4-L{length}": _codebook_predicate(4, length)
+            for length in SUPPORT_LENGTHS
+            if length != SUPPORT_LENGTH
         },
     }
 

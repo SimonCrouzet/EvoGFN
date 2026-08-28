@@ -591,6 +591,10 @@ class CodebookPredicate:
 
     Attributes:
         separation: Least Hamming distance between two legal designs.
+        designs: The codebook itself. Exposed because it *is* the feasible set,
+            stated rather than searched for -- which is what lets a measurement
+            taken against that set run at lengths where the Hamming ball is far
+            beyond enumeration.
     """
 
     def __init__(
@@ -621,6 +625,7 @@ class CodebookPredicate:
         self.separation = int(separation)
         self._place = self._size ** np.arange(self._length)
         self._codes = np.sort(book @ self._place)
+        self.designs = book
 
     def _encode(self, sequences: np.ndarray) -> np.ndarray:
         """Base-``alphabet`` codes for a batch of sequences."""

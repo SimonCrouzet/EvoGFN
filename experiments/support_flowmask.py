@@ -109,8 +109,14 @@ class FeasibilityLandscape(FitnessLandscape):
         return admitted.astype(np.float64)[:, None]
 
 
-def measure(
-    task: object, *, steps: int, draws: int, seed: int, objective: str = "fldb"
+def measure(  # noqa: PLR0913 - a measurement is defined by its settings
+    task: object,
+    *,
+    steps: int,
+    draws: int,
+    seed: int,
+    objective: str = "fldb",
+    epsilon_end: float = 0.0,
 ) -> dict[str, float]:
     """Train a policy without a local mask and measure what it covers.
 
@@ -119,6 +125,7 @@ def measure(
         steps: Gradient steps.
         draws: Designs sampled from the trained policy.
         seed: Seeds the policy and the sampling.
+        epsilon_end: Exploration floor held to the end of training.
         objective: Which training objective to use; `fldb` assigns credit along
             the trajectory rather than only at the terminal, which is what the
             flow-as-oracle premise actually requires.
@@ -131,10 +138,17 @@ def measure(
     anchor = np.asarray(task.parent(landscape))  # type: ignore[attr-defined]
     local = _environment(task, landscape)  # type: ignore[arg-type]
     predicate = local._feasibility
-    legal = predicate.is_feasible(local.enumerate_terminal_states())
-    legal_designs = {
-        tuple(int(t) for t in design) for design in local.enumerate_terminal_states()[legal]
-    } - {tuple(int(t) for t in anchor)}
+    # Read the legal set off the predicate where it can state it, and fall back
+    # to enumerating the ball only where it cannot. This is what lets the method
+    # evaluation run at lengths the support table cannot reach: a codebook knows
+    # its own members exactly, while 4**20 is far outside any enumeration limit.
+    designs = getattr(predicate, "designs", None)
+    if designs is None:
+        legal = predicate.is_feasible(local.enumerate_terminal_states())
+        designs = local.enumerate_terminal_states()[legal]
+    legal_designs = {tuple(int(t) for t in design) for design in designs} - {
+        tuple(int(t) for t in anchor)
+    }
 
     # Terminal-only feasibility: the policy is not told which moves are safe.
     env = _environment(task, landscape, terminal_feasibility=True)  # type: ignore[arg-type]
@@ -151,7 +165,7 @@ def measure(
         policy,
         FeasibilityLandscape(predicate, env.alphabet, env.sequence_length, anchor),
         TemperedReward(beta=1.0),
-        TrainingConfig(steps=steps, batch_size=64, seed=seed),
+        TrainingConfig(steps=steps, batch_size=64, seed=seed, epsilon_end=epsilon_end),
         objective={
             "fldb": ForwardLookingDetailedBalance(),
             "subtb": SubTrajectoryBalance(),
@@ -185,6 +199,16 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--draws", type=int, default=DEFAULT_DRAWS)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
+        "--epsilon-end",
+        type=float,
+        default=0.0,
+        help="Exploration probability at the end of training. The default "
+        "schedule decays to zero, which removes the only mechanism that finds "
+        "legal designs on a reward that is zero almost everywhere; holding a "
+        "floor is what separates an exploration failure from an objective that "
+        "carries no pressure toward breadth.",
+    )
+    parser.add_argument(
         "--objective",
         default="fldb",
         choices=("fldb", "subtb", "tb"),
@@ -201,11 +225,16 @@ def main(argv: list[str] | None = None) -> int:
         print(f"nothing matched task={args.task}", file=sys.stderr)
         return 2
 
-    print(f"objective: {args.objective}")
+    print(f"objective: {args.objective}, epsilon_end: {args.epsilon_end}")
     print(f"{'task':<16}{'|legal|':>9}{'coverage':>11}{'precision':>11}")
     for task in tasks:
         got = measure(
-            task, steps=args.steps, draws=args.draws, seed=args.seed, objective=args.objective
+            task,
+            steps=args.steps,
+            draws=args.draws,
+            seed=args.seed,
+            objective=args.objective,
+            epsilon_end=args.epsilon_end,
         )
         print(
             f"{task.name:<16}{got['legal']:>9,.0f}{got['coverage']:>11.3f}"
