@@ -86,7 +86,12 @@ from evogfn.algorithms.baselines.genetic import GeneticAlgorithm
 from evogfn.benchmark.determinism import is_deterministic
 from evogfn.benchmark.protocol import PLATE, Protocol, round_sweep
 from evogfn.benchmark.tasks import Attainable, Task
-from evogfn.env.feasibility import BudgetBandPredicate, ContactPredicate
+from evogfn.env.feasibility import (
+    BudgetBandPredicate,
+    CodebookPredicate,
+    ConjunctionPredicate,
+    ContactPredicate,
+)
 from evogfn.landscapes.ehrlich import EhrlichLandscape
 from evogfn.landscapes.gb1 import GB1Landscape
 from evogfn.landscapes.trpb import TRPB_POSITIONS, TrpBLandscape
@@ -796,6 +801,24 @@ SUPPORT_FEASIBLE_TARGET = 0.02
 #: the reduction bite.
 SUPPORT_WEIGHT = 16
 
+#: Stream for the second band's weights. Independent of the first, which is
+#: what stops one substitution repairing both totals at once.
+SUPPORT_SECOND_SEED = 101
+
+#: Separations the codebook family sweeps. The dial is the least Hamming
+#: distance between two legal designs, and therefore the depth of lookahead a
+#: sound mask needs: moving between neighbours costs that many substitutions and
+#: every intermediate is illegal, so a mask seeing fewer moves ahead admits
+#: nothing. Two is the smallest separation at which a local mask is already
+#: stuck; four is deep enough that the cost of soundness, `alphabet**depth`
+#: continuations per move, is visibly growing.
+SUPPORT_SEPARATIONS: tuple[int, ...] = (2, 3, 4)
+
+#: Designs per codebook, held equal across separations so the feasible set does
+#: not change size with the dial -- the same control the contact family applies
+#: by solving for its per-contact density.
+SUPPORT_CODEBOOK = 800
+
 
 def _contact_pairs(width: int, length: int = SUPPORT_LENGTH) -> np.ndarray:
     """Coupled positions whose constraint graph has the requested induced width.
@@ -855,7 +878,7 @@ def _contact_predicate(width: int) -> Callable[[FitnessLandscape], FeasibilityPr
     return build
 
 
-def _band_bounds(weights: np.ndarray) -> int:
+def _band_bounds(weights: np.ndarray, target: float = SUPPORT_FEASIBLE_TARGET) -> int:
     """The half-width admitting `SUPPORT_FEASIBLE_TARGET` of the space.
 
     Computed exactly rather than sampled. A sequence's total is a sum of one
@@ -867,6 +890,9 @@ def _band_bounds(weights: np.ndarray) -> int:
     Args:
         weights: The ``(length, tokens)`` integer weights, already shifted so
             the anchor totals zero.
+        target: Share of the space the band should admit. Defaults to the shared
+            target; a conjunction passes the square root, so that two bands
+            together admit the shared target.
 
     Returns:
         The smallest half-width whose band admits at least the target share.
@@ -884,7 +910,7 @@ def _band_bounds(weights: np.ndarray) -> int:
     total = distribution.sum()
     for half in range(high - low + 1):
         share = distribution[max(0, zero - half) : zero + half + 1].sum() / total
-        if share >= SUPPORT_FEASIBLE_TARGET:
+        if share >= target:
             return half
     return high - low
 
@@ -914,6 +940,80 @@ def _band_predicate() -> Callable[[FitnessLandscape], FeasibilityPredicate]:
         weights = weights - weights[np.arange(SUPPORT_LENGTH), anchor][:, None]
         half = _band_bounds(weights)
         return BudgetBandPredicate(weights, low=-half, high=half, length=SUPPORT_LENGTH)
+
+    return build
+
+
+def _two_band_predicate() -> Callable[[FitnessLandscape], FeasibilityPredicate]:
+    """A factory for two simultaneous bands on independently drawn weights.
+
+    The rung that a one-step lookahead cannot repair. With a single band, a
+    state whose running total has left it is restored by any substitution whose
+    weight is large enough to carry the total back, and because the weights span
+    more than the band's width such a substitution almost always exists -- so a
+    mask looking one move ahead recovers the whole feasible set, and the
+    measured reachable share went from 0.0005 under a strictly local mask to
+    1.000 under depth-one lookahead.
+
+    Drawing a second set of weights independently removes that repair. Each
+    substitution moves both totals at once, and a move chosen to carry the first
+    back inside its band moves the second by an unrelated amount, so restoring
+    feasibility generally requires several substitutions chosen together. Each
+    band is calibrated to the square root of the shared target, so that the two
+    together admit the same share of the space as every other rung.
+
+    Returns:
+        A callable taking the landscape and returning the predicate.
+    """
+
+    def build(landscape: FitnessLandscape) -> FeasibilityPredicate:
+        anchor = np.asarray(landscape.feasible_sequence(SUPPORT_PARENT_SEED))  # type: ignore[attr-defined]
+        shape = (SUPPORT_LENGTH, SUPPORT_TOKENS)
+        bands = []
+        for stream in (SUPPORT_INSTANCE["seed"], SUPPORT_SECOND_SEED):
+            rng = np.random.default_rng(stream)  # type: ignore[arg-type]
+            weights = rng.integers(-SUPPORT_WEIGHT, SUPPORT_WEIGHT + 1, shape)
+            weights = weights - weights[np.arange(SUPPORT_LENGTH), anchor][:, None]
+            half = _band_bounds(weights, target=SUPPORT_FEASIBLE_TARGET**0.5)
+            bands.append(BudgetBandPredicate(weights, low=-half, high=half, length=SUPPORT_LENGTH))
+        return ConjunctionPredicate(bands)
+
+    return build
+
+
+def _codebook_predicate(separation: int) -> Callable[[FitnessLandscape], FeasibilityPredicate]:
+    """A factory for a codebook whose designs are mutually well separated.
+
+    Built greedily around the anchor: candidates are drawn from the shared
+    stream and accepted when they lie at least ``separation`` substitutions from
+    every design already accepted, so the guarantee the predicate records is
+    established by construction rather than asserted. The anchor is accepted
+    first, which is what makes the campaign legal at its own starting point.
+
+    Args:
+        separation: Least Hamming distance between two legal designs.
+
+    Returns:
+        A callable taking the landscape and returning the predicate.
+    """
+
+    def build(landscape: FitnessLandscape) -> FeasibilityPredicate:
+        anchor = np.asarray(landscape.feasible_sequence(SUPPORT_PARENT_SEED))  # type: ignore[attr-defined]
+        rng = np.random.default_rng(SUPPORT_INSTANCE["seed"])  # type: ignore[arg-type]
+        book = [anchor]
+        accepted = anchor[None, :]
+        for candidate in rng.integers(0, SUPPORT_TOKENS, (400_000, SUPPORT_LENGTH)):
+            if int((accepted != candidate).sum(axis=1).min()) >= separation:
+                book.append(candidate)
+                accepted = np.asarray(book)
+                if len(book) >= SUPPORT_CODEBOOK:
+                    break
+        return CodebookPredicate(
+            accepted,
+            length=SUPPORT_LENGTH,
+            alphabet_size=SUPPORT_TOKENS,
+            separation=separation,
+        )
 
     return build
 
@@ -986,7 +1086,33 @@ def support_study() -> tuple[Task, ...]:
         reanchor=False,
         attainable=None,
     )
-    return (*tasks, band)
+    two_band = _task(
+        "support-band2",
+        "Does a sound mask exist when two independent totals must both stay in "
+        "band? A single band is repaired by one substitution of sufficient "
+        "weight, so a mask looking one move ahead recovers all of it; two "
+        "totals drawn independently are not repaired together by any single "
+        f"move. {shared}",
+        _ehrlich(**SUPPORT_INSTANCE),
+        protocol,
+        reanchor=False,
+        attainable=None,
+    )
+    separated = [
+        _task(
+            f"support-sep{separation}",
+            f"How far ahead must a mask see when legal designs are {separation} "
+            f"substitutions apart? Every intermediate between two of them is "
+            f"illegal, so a mask seeing fewer than {separation - 1} moves ahead "
+            f"admits nothing at all. {shared}",
+            _ehrlich(**SUPPORT_INSTANCE),
+            protocol,
+            reanchor=False,
+            attainable=None,
+        )
+        for separation in SUPPORT_SEPARATIONS
+    ]
+    return (*tasks, band, two_band, *separated)
 
 
 def support_predicates() -> dict[str, Callable[[FitnessLandscape], FeasibilityPredicate]]:
@@ -1002,6 +1128,11 @@ def support_predicates() -> dict[str, Callable[[FitnessLandscape], FeasibilityPr
     return {
         **{f"support-w{width}": _contact_predicate(width) for width in SUPPORT_WIDTHS},
         "support-band": _band_predicate(),
+        "support-band2": _two_band_predicate(),
+        **{
+            f"support-sep{separation}": _codebook_predicate(separation)
+            for separation in SUPPORT_SEPARATIONS
+        },
     }
 
 

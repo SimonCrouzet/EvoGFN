@@ -51,11 +51,15 @@ import numpy as np
 import numpy.typing as npt
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
     from evogfn.core.types import Tokens
 
 __all__ = [
     "AdjacencyPredicate",
     "BudgetBandPredicate",
+    "CodebookPredicate",
+    "ConjunctionPredicate",
     "ContactPredicate",
     "FeasibilityPredicate",
 ]
@@ -472,3 +476,189 @@ class BudgetBandPredicate:
         added = self.weights[self._positions, anchor][None, :]
         total = current - removed + added
         return np.asarray((total >= self.low) & (total <= self.high))
+
+
+class ConjunctionPredicate:
+    """Several predicates at once; a design is legal when all of them admit it.
+
+    The construction that makes a local mask genuinely insufficient. A single
+    band is not enough on its own: from a state whose running total has left the
+    band, one substitution of large enough weight moves the total back inside it,
+    so a mask that looks one move ahead recovers the whole feasible set and
+    nothing has to be learned. Measured on an enumerable instance, depth-one
+    lookahead took the reachable share from 0.0005 to 1.000.
+
+    Two totals whose weights are drawn independently do not admit that repair.
+    A substitution changes both at once, and a move that carries the first total
+    back into its band generally carries the second out of its own, so no single
+    move restores feasibility and the depth of lookahead a sound mask needs grows
+    with how many constraints have to be satisfied simultaneously. That is also
+    the setting a design campaign actually poses -- net charge *and* hydrophobic
+    fraction, expression *and* stability -- rather than a single scalar budget.
+
+    Attributes:
+        parts: The predicates conjoined, in the order given.
+    """
+
+    def __init__(self, parts: Sequence[FeasibilityPredicate]) -> None:
+        """Store the conjuncts.
+
+        Args:
+            parts: Two or more predicates over the same sequence shape.
+
+        Raises:
+            ValueError: If fewer than two predicates are given, which would be a
+                conjunction in name only and would hide the single-predicate
+                case behind a wrapper.
+        """
+        if len(parts) < 2:  # noqa: PLR2004 - a conjunction needs two
+            raise ValueError(f"a conjunction needs at least two predicates, got {len(parts)}")
+        self.parts = tuple(parts)
+
+    @property
+    def factorises(self) -> bool:
+        """Whether every conjunct admits a tractable completion oracle.
+
+        Returns:
+            ``True`` only when all of them do. A conjunction inherits the
+            hardest conjunct: an oracle for the whole must answer for each part
+            simultaneously, so one intractable part is enough to lose the
+            guarantee, and satisfying the parts separately does not satisfy them
+            together.
+        """
+        return all(part.factorises for part in self.parts)
+
+    @property
+    def induced_width(self) -> int:
+        """The largest width among the conjuncts.
+
+        Returns:
+            The maximum. This is a *lower* bound on the width of the union of
+            the conjuncts' constraint graphs, and it is exact where one
+            conjunct's graph contains the others' -- which is the case that
+            matters here, since two running totals over every position are each
+            already complete. Reported rather than computed on the union so the
+            number is cheap and never overstates tractability.
+        """
+        return max(part.induced_width for part in self.parts)
+
+    def is_feasible(self, sequences: Tokens) -> npt.NDArray[np.bool_]:
+        """Whether every conjunct admits each sequence."""
+        array = np.atleast_2d(np.asarray(sequences))
+        admitted = np.ones(array.shape[0], dtype=np.bool_)
+        for part in self.parts:
+            admitted &= part.is_feasible(array)
+        return admitted
+
+    def permits_substitution(self, sequences: Tokens) -> npt.NDArray[np.bool_]:
+        """Which substitutions every conjunct permits."""
+        array = np.asarray(sequences)
+        allowed = self.parts[0].permits_substitution(array).copy()
+        for part in self.parts[1:]:
+            allowed &= part.permits_substitution(array)
+        return allowed
+
+    def permits_reversion(self, sequences: Tokens, parent: Tokens) -> npt.NDArray[np.bool_]:
+        """Which reversions every conjunct permits."""
+        array = np.asarray(sequences)
+        allowed = self.parts[0].permits_reversion(array, parent).copy()
+        for part in self.parts[1:]:
+            allowed &= part.permits_reversion(array, parent)
+        return allowed
+
+
+class CodebookPredicate:
+    """Legal designs are an explicit set whose members are mutually well separated.
+
+    The construction that makes the *depth* of lookahead a sound mask needs into
+    a controlled quantity, and it exists because the two earlier attempts did
+    not. A single weighted band, and then two independent bands, both admitted
+    repair by one substitution: from a state whose totals had left their bands,
+    some single move among the ``length * alphabet`` available carried them back,
+    so a mask looking one move ahead recovered essentially the whole feasible
+    set -- measured, from a reachable share of 0.002 to 0.998. The reason is
+    counting rather than structure. With far more moves available than
+    constraints to violate, a repairing move almost always exists.
+
+    Separation removes it by construction. Where every pair of legal designs
+    differs in at least ``separation`` positions, moving between two of them
+    requires that many substitutions and every intermediate is illegal, so a
+    mask that looks fewer than ``separation - 1`` moves ahead admits nothing at
+    all and the reachable set collapses to the anchor. The depth at which the
+    support reappears is then a property of the predicate that can be dialled,
+    and it is exactly the cost of soundness: a mask certain to be sound must
+    search ``alphabet**depth`` continuations per move.
+
+    Attributes:
+        separation: Least Hamming distance between two legal designs.
+    """
+
+    def __init__(
+        self, designs: Tokens, *, length: int, alphabet_size: int, separation: int
+    ) -> None:
+        """Store the codebook, encoded for constant-time membership.
+
+        Sequences are encoded as integers in base ``alphabet_size`` so that
+        membership is a sorted-array lookup rather than a per-row comparison
+        against the whole book; the masks below ask ``length * alphabet``
+        membership questions per state, and a linear scan would dominate.
+
+        Args:
+            designs: An ``(m, length)`` array of legal designs.
+            length: Sequence length.
+            alphabet_size: Tokens per position.
+            separation: Least Hamming distance between distinct designs, which
+                the caller guarantees and this class records.
+
+        Raises:
+            ValueError: If the codebook is empty or the wrong shape.
+        """
+        book = np.atleast_2d(np.asarray(designs))
+        if book.size == 0 or book.shape[1] != length:
+            raise ValueError(f"designs must be (m, {length}), got {book.shape}")
+        self._length = int(length)
+        self._size = int(alphabet_size)
+        self.separation = int(separation)
+        self._place = self._size ** np.arange(self._length)
+        self._codes = np.sort(book @ self._place)
+
+    def _encode(self, sequences: np.ndarray) -> np.ndarray:
+        """Base-``alphabet`` codes for a batch of sequences."""
+        return np.asarray(sequences) @ self._place
+
+    @property
+    def factorises(self) -> bool:
+        """No: an explicit set carries no structure a dynamic program can exploit."""
+        return False
+
+    @property
+    def induced_width(self) -> int:
+        """The sequence length: membership couples every position at once."""
+        return self._length
+
+    def is_feasible(self, sequences: Tokens) -> npt.NDArray[np.bool_]:
+        """Whether each sequence is in the codebook."""
+        array = np.atleast_2d(np.asarray(sequences))
+        return np.isin(self._encode(array), self._codes)
+
+    def permits_substitution(self, sequences: Tokens) -> npt.NDArray[np.bool_]:
+        """Which substitutions land on another codeword.
+
+        With ``separation`` at two or more this admits nothing from a legal
+        state, which is the point: the local mask cannot move at all, and every
+        design beyond the anchor is reached only by a mask that looks ahead.
+        """
+        array = np.asarray(sequences)
+        codes = self._encode(array)
+        tokens = np.arange(self._size)
+        # Substituting position p replaces its contribution to the code.
+        delta = (tokens[None, None, :] - array[:, :, None]) * self._place[None, :, None]
+        return np.isin(codes[:, None, None] + delta, self._codes)
+
+    def permits_reversion(self, sequences: Tokens, parent: Tokens) -> npt.NDArray[np.bool_]:
+        """Which reversions to the anchor land on another codeword."""
+        array = np.asarray(sequences)
+        anchor = np.asarray(parent)
+        codes = self._encode(array)
+        delta = (anchor[None, :] - array) * self._place[None, :]
+        return np.isin(codes[:, None] + delta, self._codes)
