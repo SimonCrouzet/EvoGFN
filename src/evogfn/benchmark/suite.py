@@ -1182,6 +1182,184 @@ def support_predicates() -> dict[str, Callable[[FitnessLandscape], FeasibilityPr
     }
 
 
+def _contact_predicate_on(
+    width: int,
+    *,
+    parent_seed: int = 0,
+    density: float,
+) -> Callable[[FitnessLandscape], FeasibilityPredicate]:
+    """A contact predicate sized to whatever landscape it is given.
+
+    `_contact_predicate` is pinned to the support study's own instance
+    (`SUPPORT_LENGTH`, `SUPPORT_TOKENS`) because that is the shape its exact
+    reachable-set enumeration needs. This drops that pin -- `length` and
+    `alphabet_size` come from the landscape at build time -- so the same
+    predicate family can replace a headline task's Ehrlich-adjacency rule
+    directly, on that task's own landscape and anchor, rather than only being
+    measurable on the diagnostic instance the support study built for it.
+
+    ``density`` is a **per-contact** permitted-pair rate, the same kind of
+    quantity as `EhrlichLandscape`'s own `transition_density` -- not a global
+    feasible-share target. A global target (as `_contact_predicate` solves
+    for) is right for the support study, which is unbudgeted and reads on
+    reachability of the *whole* space; here the campaign is budgeted at a few
+    mutations per round, so what matters is the *local* branching factor near
+    the anchor, and a target calibrated to a global share can make that
+    approximately zero at these lengths even where the source task's own
+    adjacency constraint leaves a large local neighbourhood -- measured: at
+    `SUPPORT_FEASIBLE_TARGET` on `feasibility`'s L=64 landscape, both
+    `genetic` and `genetic-feasible` failed to reach a single feasible design
+    in a 2-seed pilot. Passing the source task's own `transition_density`
+    instead keeps the two predicates comparable at the same per-edge
+    stringency, on a denser graph -- the width dial's intended effect.
+
+    ``parent_seed`` must match the campaign's own `Task.parent_seed`: the
+    predicate permits the anchor's own token pair at every contact, which is
+    what keeps the campaign's actual starting sequence legal, and an anchor
+    built at a different seed would not be the sequence this predicate protects.
+
+    Args:
+        width: Induced width of the constraint graph.
+        parent_seed: Seed the campaign starts its anchor from.
+        density: Per-contact probability a given token pair is permitted.
+
+    Returns:
+        A callable taking the landscape and returning the predicate.
+    """
+
+    def build(landscape: FitnessLandscape) -> FeasibilityPredicate:
+        length = landscape.sequence_length
+        tokens = landscape.alphabet.size
+        pairs = _contact_pairs(width, length)
+        rng = np.random.default_rng(SUPPORT_INSTANCE["seed"])  # type: ignore[arg-type]
+        permitted = rng.random((len(pairs), tokens, tokens)) < density
+        anchor = np.asarray(landscape.feasible_sequence(parent_seed))  # type: ignore[attr-defined]
+        for index, (left, right) in enumerate(pairs):
+            permitted[index, anchor[left], anchor[right]] = True
+        return ContactPredicate(pairs, permitted, length=length, alphabet_size=tokens)
+
+    return build
+
+
+#: Headline tasks re-run under the width-2 contact predicate in place of their
+#: own Ehrlich-adjacency rule -- the second predicate family in the headline
+#: table (item 3), rather than only in `support_study`. `feasibility` and
+#: `protocol-alde` are picked because they bracket the headline claim: a fixed
+#: narrow anchor against rejection, and a wide re-anchoring campaign against it.
+#: `protocol-evolvepro` shares `protocol-alde`'s landscape and is left out here
+#: purely on compute grounds (eight rounds vs three, at the same per-seed cost)
+#: -- adding it is a one-line change to this tuple if the pilot below justifies it.
+#:
+#: `EhrlichLandscape._evaluate` zeroes reward by `self.is_feasible`, which reads
+#: the landscape's **own** `transition_density` matrix -- entirely independent
+#: of whatever predicate `Task.feasibility` hands the environment. Reusing
+#: `feasibility` / `protocol-alde` as built therefore does not replace their
+#: constraint, it adds a second, uncoordinated one: a design can be feasible
+#: under the landscape's own adjacency (real reward) and infeasible under the
+#: width-2 predicate (refused as an anchor), or the reverse, and re-anchoring
+#: crashes the moment `genetic` -- which does not check either predicate while
+#: proposing -- picks one of the first kind as its best. `support_study` avoids
+#: exactly this by building on a **vacuous** transition matrix
+#: (`SUPPORT_INSTANCE`, density 1.0); each rung's own tuple below does the same
+#: -- same length, vocab, motif structure and seed as the headline task, so the
+#: reward surface matches, but with `transition_density=1.0` so `is_feasible`
+#: is vacuously true there and the width-2 predicate is the *only* constraint.
+#: One consequence worth stating rather than hiding: `_random_ergodic_transitions`
+#: draws from the same RNG stream the motifs are drawn from, so a landscape
+#: built at density 1.0 is not bit-identical to the source task's at its own
+#: density even at the same seed -- comparable in structure, not a shared draw.
+#:
+#: Each entry is ``(sequence_length, vocab_size, n_motifs, motif_length, seed,
+#: contact_density)``, where ``contact_density`` is the per-contact permitted-
+#: pair rate passed to `_contact_predicate_on` -- calibrated by Monte Carlo
+#: (uniform draws at the task's own `max_mutations`) so the local neighbourhood
+#: a round can reach is small but non-empty: ~8% for `feasibility` (0.85) and
+#: ~13% for `protocol-alde` (0.97), against the ~0% either gets from a naively
+#: matched density and the >50% that density 0.99+ gives (near-vacuous). A
+#: calibration choice, not a derived match to any published stringency.
+#: `protocol-alde` (`reanchor=True`) is left out for a second, harder reason
+#: than compute: `_advance_anchor` filters infeasible candidates by the
+#: **landscape's** `_evaluate` (`scores[~self.is_feasible(sequences)] =
+#: -np.inf`), which reads the landscape's own transition matrix -- vacuous
+#: here by construction -- not the environment's active `feasibility`
+#: predicate. An unmasked arm (`genetic`, `random`, `cmaes`, ...) that does not
+#: itself consult the injected predicate while proposing therefore sees every
+#: candidate as equally scoreable, picks its best by raw fitness with no
+#: feasibility signal, and `reanchored()` then refuses it as infeasible --
+#: reproduced: `genetic` crashes on `protocol-alde-w2` at round 1 every seed
+#: tried. `support_study` never hits this because every one of its rungs is
+#: `reanchor=False`; that is a deliberate property of its design, not an
+#: oversight this file can route around without giving the campaign loop a way
+#: to score against the *active* predicate rather than the landscape's own --
+#: out of scope here. `feasibility` (`reanchor=False`) has no anchor to move
+#: and is unaffected.
+WIDTH2_SOURCE_TASKS: dict[str, tuple[int, int, int, int, int, float]] = {
+    "feasibility": (64, 20, 2, 4, 1, 0.85),
+}
+
+
+def width2_tasks() -> tuple[Task, ...]:
+    """`WIDTH2_SOURCE_TASKS`, with their feasibility rule swapped to width-2 contacts.
+
+    Each keeps its source task's protocol, anchor rule and parent seed, and a
+    landscape matching its structural parameters -- only the constraint
+    changes, from a path-shaped adjacency matrix (width 1, and a second one
+    live on the landscape besides) to a denser, still-tractable
+    (`ContactPredicate.TRACTABLE_WIDTH = 2`) contact graph as the sole rule.
+
+    `attainable=None`: no audit has enumerated this predicate's reachable set
+    on these landscapes, so this tier reports on `best`/proposals/discards
+    directly (sign tests, W/T/L) rather than on regret against a floor nobody
+    has established yet.
+
+    Returns:
+        One task per name in `WIDTH2_SOURCE_TASKS`.
+    """
+    by_name = {task.name: task for task in MAIN}
+    return tuple(
+        replace(
+            by_name[name],
+            name=f"{name}-w2",
+            build=_ehrlich(
+                sequence_length=length,
+                vocab_size=vocab,
+                n_motifs=motifs,
+                motif_length=motif_length,
+                transition_density=1.0,
+                seed=seed,
+            ),
+            feasibility=_contact_predicate_on(
+                2, parent_seed=by_name[name].parent_seed, density=density
+            ),
+            attainable=None,
+        )
+        for name, (
+            length,
+            vocab,
+            motifs,
+            motif_length,
+            seed,
+            density,
+        ) in WIDTH2_SOURCE_TASKS.items()
+    )
+
+
+def width2_tier(seeds: Sequence[int]) -> Tier:
+    """The width-2 contact-predicate tasks as a tier.
+
+    Args:
+        seeds: Seeds per arm.
+
+    Returns:
+        A `Purpose.BENCHMARK` tier -- unlike `support_tier`, this belongs in
+        the headline comparison, not the diagnostics: it is the same
+        feasibility-by-construction question, measured under a second
+        predicate family on the same landscapes the headline table already
+        uses.
+    """
+    return Tier("width2", width2_tasks(), tuple(seeds), Purpose.BENCHMARK)
+
+
 def support_tasks() -> tuple[Task, ...]:
     """The support study with each task's predicate attached.
 
