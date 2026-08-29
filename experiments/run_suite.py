@@ -120,6 +120,7 @@ from evogfn.benchmark.suite import (
     rounds_curve,
     run_anchor_study,
     run_tier,
+    width2_tier,
 )
 
 if TYPE_CHECKING:
@@ -314,6 +315,13 @@ def tiers(main_seeds: int, diagnostic_seeds: int) -> list[Tier]:
         # the constructibility columns. Seeds bought for a regret comparison
         # would be buying precision on a column the tier does not report.
         constraint_density_tier(range(diagnostic_seeds)),
+        # The second predicate family in the headline comparison, not only in
+        # the diagnostic support study: `feasibility` and `protocol-alde`
+        # re-run under a width-2 contact predicate in place of their own
+        # Ehrlich-adjacency rule. Main-tier seed count, since this asks whether
+        # the headline finding survives a different constraint shape on the
+        # same landscapes, not a diagnostic axis.
+        width2_tier(range(main_seeds)),
         # A tier for *reporting* that is **run** cell by cell -- see the branch
         # in `main`. The cross of these two tasks with `anchor_arms` is six
         # campaigns and the study is five: the cross also contains a rebuilt
