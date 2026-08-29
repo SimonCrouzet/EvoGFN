@@ -1922,6 +1922,11 @@ def _sampler_fields(sampler: Sampler) -> dict[str, object]:
         "draws_attempted": int(getattr(sampler, "draws_attempted", 0)),
         "draws_rejected": int(getattr(sampler, "draws_rejected", 0)),
         "draws_unmutated": int(getattr(sampler, "draws_unmutated", 0)),
+        # Construction's own proposal-cost pair, alongside rejection's: edits a
+        # masked variation operator called for versus how many it never had a
+        # legal turn to make. Zero on every arm but the masked GA.
+        "construction_attempted": int(getattr(sampler, "construction_attempted", 0)),
+        "construction_dropped": int(getattr(sampler, "construction_dropped", 0)),
         "unconstructible_fraction": float(getattr(sampler, "unconstructible_fraction", 0.0)),
         # Read off the *final* sampler, and safe under re-anchoring only because
         # the arm that reports this carries its repair counters across a move
