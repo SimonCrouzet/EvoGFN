@@ -36,6 +36,33 @@ Poisson(1), so a large share of every batch is the anchor unchanged, and those
 draws are reachable by definition. They pass the filter, hold the rejection rate
 down, and search nothing. The three ``draws_*`` counters are reported together
 for that reason -- two of them are a rate, and the third is what the rate means.
+
+Construction, and the sharper control it gives the feasibility claim
+----------------------------------------------------------------------
+
+Rejection is not the only way to give a genetic algorithm the environment's
+constraint. ``construct_feasible`` decides the offspring the same way
+recombination and mutation already do -- a target genotype, the same ``p_m``
+and ``p_r`` -- but rather than accept or discard that target whole, it walks
+toward it one substitution at a time through
+[MutationEnvironment.forward_mask][evogfn.env.mutation.MutationEnvironment.forward_mask],
+the identical mask a masked GFlowNet policy is scored against. An edit the mask
+forbids at the point it would be made is dropped; the rest of the target
+survives. Nothing is redrawn and nothing is discarded whole, so this arm never
+raises for exhausting an attempt budget and its ``proposals_made`` is always
+exactly the plate.
+
+This is the control the rejection arm cannot be: if a rejection-sampling GA
+loses to the masked GFlowNet, a reader can still ask whether the loss is about
+*learning* or merely about the mechanics of rejection versus construction. A
+GA whose variation operator is itself masked removes that question --
+construction is available to a GA too, and what is left after this arm is run
+is attributable to the sampler rather than asserted about it.
+[construction_attempted][evogfn.algorithms.baselines.genetic.GeneticAlgorithm.construction_attempted]
+and
+[construction_dropped][evogfn.algorithms.baselines.genetic.GeneticAlgorithm.construction_dropped]
+report the proposal cost this way pays instead of rejection's: individual
+edits given up rather than whole offspring redrawn.
 """
 
 from __future__ import annotations
@@ -80,11 +107,17 @@ class GeneticAlgorithm(Sampler):
             the feasibility claim; see the module docstring.
         max_attempts: Resampling rounds before giving up when
             ``feasible_only``.
+        construct_feasible: Walk each offspring toward its target through the
+            environment's own forward mask rather than accepting or rejecting
+            the target whole. Mutually exclusive with ``feasible_only`` --
+            they are two different controls for the same claim. See the
+            module docstring.
         seed: Seeds the population and the operators.
 
     Raises:
-        ValueError: If a probability is outside ``[0, 1]`` or a size is not
-            positive.
+        ValueError: If a probability is outside ``[0, 1]``, a size is not
+            positive, or both ``feasible_only`` and ``construct_feasible`` are
+            set.
     """
 
     def __init__(  # noqa: PLR0913 - a GA is defined by its operators' rates
@@ -98,6 +131,7 @@ class GeneticAlgorithm(Sampler):
         carry_population: bool = True,
         feasible_only: bool = False,
         max_attempts: int = 50,
+        construct_feasible: bool = False,
         seed: int = 0,
     ) -> None:
         """Seed the population from the parent."""
@@ -111,7 +145,13 @@ class GeneticAlgorithm(Sampler):
         self._carry_population = carry_population
         self._feasible_only = feasible_only
         self._max_attempts = max_attempts
+        self._construct_feasible = construct_feasible
 
+        if feasible_only and construct_feasible:
+            raise ValueError(
+                "feasible_only and construct_feasible are two different controls for the "
+                "same claim -- rejection versus construction -- and cannot both be set"
+            )
         if population_size < 1:
             raise ValueError(f"population_size must be at least 1, got {population_size}")
         for label, value in [
@@ -128,11 +168,17 @@ class GeneticAlgorithm(Sampler):
         self._draws_attempted = 0
         self._draws_rejected = 0
         self._draws_unmutated = 0
+        self._construction_attempted = 0
+        self._construction_dropped = 0
 
     @property
     def name(self) -> str:
-        """Short label, marking whether feasibility is enforced."""
-        return "GeneticAlgorithm" + (" (rejection)" if self._feasible_only else "")
+        """Short label, marking whether and how feasibility is enforced."""
+        if self._feasible_only:
+            return "GeneticAlgorithm (rejection)"
+        if self._construct_feasible:
+            return "GeneticAlgorithm (masked)"
+        return "GeneticAlgorithm"
 
     @property
     def population(self) -> Tokens:
@@ -198,6 +244,7 @@ class GeneticAlgorithm(Sampler):
             carry_population=self._carry_population,
             feasible_only=self._feasible_only,
             max_attempts=self._max_attempts,
+            construct_feasible=self._construct_feasible,
         )
         if self._carry_population:
             population, intact = reprojected(env, self._population, self._rng)
@@ -213,6 +260,8 @@ class GeneticAlgorithm(Sampler):
         moved._draws_attempted = self._draws_attempted
         moved._draws_rejected = self._draws_rejected
         moved._draws_unmutated = self._draws_unmutated
+        moved._construction_attempted = self._construction_attempted
+        moved._construction_dropped = self._construction_dropped
         return moved
 
     @property
@@ -250,6 +299,29 @@ class GeneticAlgorithm(Sampler):
         return self._draws_unmutated
 
     @property
+    def construction_attempted(self) -> int:
+        """Substitutions the recombination/mutation target called for.
+
+        Zero unless ``construct_feasible``. The construction analogue of
+        ``draws_attempted`` -- but it counts individual edits, not whole
+        offspring, because construction never discards a whole offspring.
+        """
+        return self._construction_attempted
+
+    @property
+    def construction_dropped(self) -> int:
+        """Of those, how many the forward mask never had a legal turn to make.
+
+        A position drops once every position still open to it becomes
+        illegal under the current state and stays that way -- the offspring
+        stops early rather than force an edge that is not in the graph. This
+        is what construction spends instead of rejection's discarded
+        offspring: read beside ``construction_attempted`` it is a rate over
+        edits, not over plates.
+        """
+        return self._construction_dropped
+
+    @property
     def carried_fitness(self) -> int:
         """Individuals holding a measurement that was taken on them.
 
@@ -281,6 +353,10 @@ class GeneticAlgorithm(Sampler):
                 designs silently would corrupt the comparison this exists for.
         """
         parents = self._survivors()
+        if self._construct_feasible:
+            offspring = self._breed_masked(parents, n)
+            self._count(n)
+            return offspring
         if not self._feasible_only:
             offspring = self._breed(parents, n)
             self._count(n)
@@ -383,3 +459,85 @@ class GeneticAlgorithm(Sampler):
             surplus = self._rng.choice(positions, size=int(counts[row] - budget), replace=False)
             offspring[row, surplus] = wild_type[surplus]
         return offspring
+
+    def _breed_masked(self, parents: Tokens, n: int) -> Tokens:
+        """Walk each offspring toward its bred target through the forward mask.
+
+        ``_breed`` already decides *what* recombination and mutation want --
+        this decides how much of it a legal trajectory from the anchor can
+        actually deliver. Every position the target differs from the anchor is
+        one intended edit; edits are made one at a time, in a random order per
+        offspring, each gated by
+        [forward_mask][evogfn.env.mutation.MutationEnvironment.forward_mask] --
+        the identical mask a masked policy is scored against, so an edge this
+        walk takes is an edge the GFlowNet could also have taken. An edit whose
+        turn comes and finds itself illegal is dropped rather than the whole
+        offspring; the offspring that comes out the far end is exactly a
+        `forward_mask`-reachable state, not merely one that satisfies the
+        constraint at its own coordinates the way `is_reachable` checks (see
+        `MutationEnvironment.is_reachable`'s own caveat that it is necessary
+        and not sufficient) -- because it was built by taking only edges that
+        mask permitted, never by satisfying the predicate after the fact.
+
+        Args:
+            parents: Survivors to recombine and mutate.
+            n: How many offspring to build.
+
+        Returns:
+            An ``(n, sequence_length)`` array.
+        """
+        from evogfn.algorithms.gflownet.sampling import _step_live  # noqa: PLC0415
+
+        env = self._env
+        wild_type = env.parent
+        v = env.alphabet.size
+        length = env.sequence_length
+
+        target = self._breed(parents, n)
+        has_edit = target != wild_type[None, :]
+        position_index = np.arange(length)[None, :]
+        action_for_position = position_index * v + target  # (n, length)
+
+        self._construction_attempted += int(has_edit.sum())
+
+        state = env.initial(n)
+        remaining = has_edit.copy()
+
+        for _ in range(length + 1):
+            live = ~state.stopped
+            if not live.any():
+                break
+
+            mask = env.forward_mask(state)
+            legal_at_position = np.take_along_axis(mask, action_for_position, axis=1)
+            legal_remaining = remaining & legal_at_position & live[:, None]
+            has_move = legal_remaining.any(axis=1)
+
+            # A live row with no legal remaining edit is done: the walk cannot
+            # make any of what is left of its target legal by waiting, because
+            # nothing about its own state changes while other rows move.
+            giving_up = live & ~has_move
+            if giving_up.any():
+                self._construction_dropped += int(remaining[giving_up].sum())
+                remaining[giving_up] = False
+
+            priority = np.where(legal_remaining, self._rng.random((n, length)), -1.0)
+            chosen_position = priority.argmax(axis=1)
+            rows = np.arange(n)
+            actions = np.where(
+                has_move,
+                chosen_position * v + target[rows, chosen_position],
+                env.stop_action,
+            )
+
+            state = _step_live(env, state, actions, live)
+            moving = live & has_move
+            remaining[moving, chosen_position[moving]] = False
+
+        # The loop is bounded by `length + 1` forward steps, one per position at
+        # most, so this fires only if a row never got a chance to try its last
+        # edit before the bound -- accounting still has to close either way.
+        if remaining.any():
+            self._construction_dropped += int(remaining.sum())
+
+        return state.sequences

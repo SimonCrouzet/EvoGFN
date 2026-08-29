@@ -352,6 +352,16 @@ class RunRecord:
             reads survivable, while the arm makes no progress. Without this
             column the rejection rate is the only evidence and it says the
             wrong thing.
+        construction_attempted: Edits a masked variation operator's bred target
+            called for, summed over every offspring of every round. Zero for
+            every arm but the masked GA -- construction's own proposal-cost
+            counter, over edits rather than over whole offspring the way the
+            ``draws_*`` trio counts rejection's.
+        construction_dropped: Of those, how many the operator never had a legal
+            turn to make before the offspring it belonged to stopped early.
+            Read beside ``construction_attempted`` the way ``draws_rejected``
+            is read beside ``draws_attempted``: a rate over edits, and what
+            construction spends instead of a whole offspring redrawn.
         fitted: For an arm that trains a model on its own measurements, whether
             that model had **actually been fitted** by the time the campaign
             ended. ``None`` for an arm that fits nothing, which is most of them:
@@ -507,6 +517,8 @@ class RunRecord:
     draws_attempted: int = 0
     draws_rejected: int = 0
     draws_unmutated: int = 0
+    construction_attempted: int = 0
+    construction_dropped: int = 0
     # `bool | None` and not `bool`: the three states are "fitted", "never
     # fitted" and "nobody measured", and collapsing the last two is what let an
     # arm that never fitted read as a tuned supervised baseline that lost.
