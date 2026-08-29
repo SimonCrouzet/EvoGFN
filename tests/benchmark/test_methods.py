@@ -367,6 +367,9 @@ class TestTheLadderIsWhatItSaysItIs:
             "genetic+screen",
             "genetic+search",
             "genetic+distinct",
+            # Ours, not published: the feasibility claim's construction control,
+            # a GA masked the same way a GFlowNet policy is -- see `_masked_genetic`.
+            "genetic-masked",
         }
 
     @pytest.mark.parametrize("name", BARE)
