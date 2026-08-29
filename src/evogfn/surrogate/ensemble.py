@@ -72,11 +72,23 @@ class DeepEnsemble(Surrogate):
             spread a resampling estimate rather than an initialisation one. Off
             by default; see the module docstring for why it is not a free
             improvement to be switched on everywhere.
-        seed: Seeds initialisation, batch order and the resampling.
+        label_noise_std: Gaussian noise added to the fit targets, as a
+            multiple of the targets' own standard deviation so the knob is
+            comparable across landscapes whose fitness scales differ by
+            orders of magnitude. Zero reproduces the shipped surrogate. This
+            is the intervention arm for the surrogate-quality/margin
+            question: the correlation between surrogate-oracle Pearson r and
+            where the GFlowNet's advantage comes from (masking vs. learning)
+            is measurable from stored campaigns without this, but only this
+            knob turns it into a causal claim, by degrading fit quality on
+            purpose rather than reading it off wherever it happened to land.
+        seed: Seeds initialisation, batch order, the resampling and the
+            injected noise.
         device: Where to train.
 
     Raises:
-        ValueError: If any size is not positive.
+        ValueError: If any size is not positive, or `label_noise_std` is
+            negative.
     """
 
     def __init__(  # noqa: PLR0913 - the ensemble's shape is its definition
@@ -90,6 +102,7 @@ class DeepEnsemble(Surrogate):
         epochs: int = 200,
         learning_rate: float = 1e-3,
         bootstrap: bool = False,
+        label_noise_std: float = 0.0,
         seed: int = 0,
         device: torch.device | str = "cpu",
     ) -> None:
@@ -104,12 +117,16 @@ class DeepEnsemble(Surrogate):
         ]:
             if value < 1:
                 raise ValueError(f"{name} must be at least 1, got {value}")
+        if label_noise_std < 0:
+            raise ValueError(f"label_noise_std must be non-negative, got {label_noise_std}")
 
         self._n_tokens = n_tokens
         self._length = sequence_length
         self._epochs = epochs
         self._learning_rate = learning_rate
         self._bootstrap = bootstrap
+        self._label_noise_std = label_noise_std
+        self._noise_rng = np.random.default_rng(seed)
         self._device = device
         self._fitted = False
         # Standardisation statistics, set at fit time. Fitness scales differ by
@@ -188,6 +205,19 @@ class DeepEnsemble(Surrogate):
         if not finite.any():
             raise ValueError("cannot fit a surrogate when no observation is finite")
         features, targets = features[finite], targets[finite]
+
+        if self._label_noise_std > 0:
+            # Scaled to this fit's own targets, not fixed in absolute units,
+            # so the same `label_noise_std` degrades fit quality by a
+            # comparable amount on landscapes whose fitness ranges differ by
+            # orders of magnitude. Redrawn every fit (every round), matching
+            # the campaign's own retrain-from-scratch-on-accumulated-data
+            # behaviour rather than corrupting each measurement once at
+            # observation time.
+            spread = float(targets.std()) or 1.0
+            targets = targets + self._noise_rng.normal(
+                0.0, self._label_noise_std * spread, size=targets.shape
+            )
 
         self._mean = float(targets.mean())
         self._scale = float(targets.std()) or 1.0
