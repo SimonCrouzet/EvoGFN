@@ -84,7 +84,7 @@ import numpy as np
 
 from evogfn.algorithms.baselines.genetic import GeneticAlgorithm
 from evogfn.benchmark.determinism import is_deterministic
-from evogfn.benchmark.protocol import PLATE, Protocol, round_sweep
+from evogfn.benchmark.protocol import MAX_SENSIBLE_ROUNDS, PLATE, Protocol, round_sweep
 from evogfn.benchmark.tasks import Attainable, Task
 from evogfn.env.feasibility import (
     BudgetBandPredicate,
@@ -627,6 +627,16 @@ def rounds_curve(budget: int = 384) -> tuple[Task, ...]:
     Returns:
         One task per split, on the shared diagnostic landscape.
     """
+    protocols = round_sweep(budget)
+    # `round_sweep` steps by halving batch size, which at this budget lands
+    # exactly on 4x96 and 8x48 and skips every split between them -- two points,
+    # not a curve, and the two ends of the one range a reviewer would ask about.
+    # 64 is the batch size halving cannot reach from 96 (96, 48, 24, ...), so the
+    # midpoint is added explicitly here rather than by changing what
+    # `round_sweep` enumerates for its other callers.
+    midpoint = Protocol(rounds=budget // 64, batch_size=64, label=f"{budget // 64}x64")
+    if midpoint.rounds <= MAX_SENSIBLE_ROUNDS and midpoint not in protocols:
+        protocols = tuple(sorted((*protocols, midpoint), key=lambda p: p.rounds))
     return tuple(
         _task(
             f"rounds-{protocol.rounds}x{protocol.batch_size}",
@@ -639,7 +649,7 @@ def rounds_curve(budget: int = 384) -> tuple[Task, ...]:
             reanchor=True,
             attainable=DIAGNOSTIC_ATTAINABLE,
         )
-        for protocol in round_sweep(budget)
+        for protocol in protocols
     )
 
 
