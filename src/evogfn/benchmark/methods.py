@@ -375,6 +375,7 @@ def _parts(
     *,
     terminal_feasibility: bool = False,
     bootstrap: bool = False,
+    label_noise_std: float = 0.0,
 ) -> tuple[object, MutationEnvironment, DeepEnsemble]:
     """Everything a campaign needs that is not the method itself.
 
@@ -402,6 +403,10 @@ def _parts(
             arm that names it, on the same reasoning: it changes what the spread
             *means*, so two arms ranked on uncertainty either side of this flag
             are not ranked on the same quantity.
+        label_noise_std: Forwarded to
+            [DeepEnsemble][evogfn.surrogate.ensemble.DeepEnsemble]. Zero is
+            every shipped arm; the surrogate-quality intervention is the only
+            caller that sets this.
 
     Returns:
         The landscape, the environment and an unfitted surrogate. The ensemble
@@ -417,6 +422,7 @@ def _parts(
         sequence_length=landscape.sequence_length,
         epochs=150,
         bootstrap=bootstrap,
+        label_noise_std=label_noise_std,
         seed=seed,
     )
     return landscape, env, surrogate
@@ -901,6 +907,7 @@ def gflownet(  # noqa: PLR0913 - an arm is defined by its hyperparameters
     anchor_conditioned: bool = False,
     match_anchor_capacity: bool = False,
     pool_size: int = DEFAULT_POOL,
+    label_noise_std: float = 0.0,
 ) -> Methodology:
     """A GFlowNet trained against the surrogate proxy.
 
@@ -960,6 +967,14 @@ def gflownet(  # noqa: PLR0913 - an arm is defined by its hyperparameters
             be right on one of them and silently wrong -- in the direction that
             manufactures the effect the control exists to rule out -- on the rest.
             See `matched_capacity`.
+        label_noise_std: Forwarded to `_parts`, which forwards it to
+            [DeepEnsemble][evogfn.surrogate.ensemble.DeepEnsemble]. Zero
+            reproduces the shipped arm. This is the surrogate-quality
+            intervention: the correlation between surrogate-oracle Pearson r
+            and whether masking or learning carries the GFlowNet's margin is
+            readable off stored campaigns without touching this, but only
+            deliberately degrading fit quality turns that correlation into a
+            causal claim.
 
     Returns:
         A methodology, carrying its settings for the record. The capacity control
@@ -988,7 +1003,12 @@ def gflownet(  # noqa: PLR0913 - an arm is defined by its hyperparameters
 
     def methodology(task: Task, seed: int) -> Campaign:
         width = width_on(task)
-        landscape, env, ensemble = _parts(task, seed, terminal_feasibility=terminal_feasibility)
+        landscape, env, ensemble = _parts(
+            task,
+            seed,
+            terminal_feasibility=terminal_feasibility,
+            label_noise_std=label_noise_std,
+        )
         # Built once and closed over when the policy is carried, so a rebuild
         # for a moved anchor keeps the trained weights. It survives the move
         # because its action space -- length * |alphabet| + 1 indices -- and its
@@ -1087,6 +1107,7 @@ def gflownet(  # noqa: PLR0913 - an arm is defined by its hyperparameters
             "terminal_feasibility": terminal_feasibility,
             "anchor_conditioned": anchor_conditioned,
             "match_anchor_capacity": match_anchor_capacity,
+            "label_noise_std": label_noise_std,
         },
         resolved if match_anchor_capacity else None,
     )
