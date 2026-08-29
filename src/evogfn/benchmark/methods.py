@@ -1385,6 +1385,20 @@ def _feasible_genetic(env: MutationEnvironment, seed: int, _protocol: Protocol) 
     return GeneticAlgorithm(env, seed=seed, feasible_only=True, max_attempts=200)
 
 
+def _masked_genetic(env: MutationEnvironment, seed: int, _protocol: Protocol) -> Sampler:
+    """A genetic algorithm whose variation operator only proposes legal moves.
+
+    The second control for the feasibility claim, alongside `_feasible_genetic`.
+    Construction is available to a GA too: this arm decides an offspring the
+    same way `genetic` does and then builds it edge by edge through the same
+    `forward_mask` a masked GFlowNet policy is scored against, dropping an
+    individual edit where the mask forbids it rather than discarding the whole
+    offspring the way rejection does. If this still loses to the GFlowNet, the
+    gap is attributable to learning rather than to rejection's mechanics.
+    """
+    return GeneticAlgorithm(env, seed=seed, construct_feasible=True)
+
+
 #: The classical baselines, each as its own paper published it. Directed
 #: evolution *is* a genetic algorithm, so these are the incumbents rather than
 #: strawmen to be cleared -- and an incumbent is a whole pipeline, which is what
@@ -1414,7 +1428,11 @@ def _feasible_genetic(env: MutationEnvironment, seed: int, _protocol: Protocol) 
 #: ``adalead``            the sequence-design lineage's default model-guided
 #:                        comparator
 #: ``cmaes``              the continuous relaxation the in-silico lineage runs
-#: ``genetic-feasible``   ours; the control for the feasibility claim
+#: ``genetic-feasible``   ours; the control for the feasibility claim by
+#:                        rejection
+#: ``genetic-masked``     ours; the control for the feasibility claim by
+#:                        construction -- a GA masked the same way a GFlowNet
+#:                        policy is
 #: ``mlde+earlyfit``      ours; the supervised reference at a training size a
 #:                        constrained screen can actually return, which is the
 #:                        only configuration of it that ever fits there
@@ -1458,6 +1476,7 @@ BASELINES: dict[str, Methodology] = {
     "recomb": classical(_recomb),
     "genetic": classical(_genetic),
     "genetic-feasible": classical(_feasible_genetic),
+    "genetic-masked": classical(_masked_genetic),
     "cmaes": classical(_cmaes),
     # AdaLead's model is inside its own rollout, so the campaign hands it none
     # and its pool is one plate: what it proposes has already been screened and
