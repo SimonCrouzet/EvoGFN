@@ -1370,6 +1370,46 @@ def width2_tier(seeds: Sequence[int]) -> Tier:
     return Tier("width2", width2_tasks(), tuple(seeds), Purpose.BENCHMARK)
 
 
+#: The headline tasks whose graph actually constrains construction. The
+#: objective ablation runs here rather than on every task because an objective's
+#: effect on feasibility-by-construction is only visible where feasibility is
+#: constrained -- on `gb1-anchor`/`trpb-anchor` every design is reachable, so the
+#: objectives would differ only in sample efficiency, which the objectives
+#: diagnostic already measures on its own landscape.
+OBJECTIVE_FAMILY_TASKS: tuple[str, ...] = ("feasibility", "protocol-alde", "protocol-evolvepro")
+
+
+def objective_family_tasks() -> tuple[Task, ...]:
+    """The constrained headline tasks, as the same objects `main` runs.
+
+    Reused by name rather than rebuilt so that the `gfn-tb` and `gfn-subtb`
+    cells the objective ablation shares with the headline tier are the *same*
+    store cells, and only the arms new to the ablation cost a campaign.
+
+    Returns:
+        One task per name in `OBJECTIVE_FAMILY_TASKS`.
+    """
+    by_name = {task.name: task for task in MAIN}
+    return tuple(by_name[name] for name in OBJECTIVE_FAMILY_TASKS)
+
+
+def objective_family_tier(seeds: Sequence[int]) -> Tier:
+    """Every objective, plus a learned-``P_B`` rung, on the constrained tasks.
+
+    The objective comparison carried from the diagnostic landscape to where the
+    constraint binds.
+
+    Args:
+        seeds: Seeds per arm.
+
+    Returns:
+        A `Purpose.BENCHMARK` tier: the objective is part of the shipped method,
+        so which one wins where construction is constrained is a headline
+        question, not a diagnostic knob.
+    """
+    return Tier("objective-family", objective_family_tasks(), tuple(seeds), Purpose.BENCHMARK)
+
+
 def support_tasks() -> tuple[Task, ...]:
     """The support study with each task's predicate attached.
 

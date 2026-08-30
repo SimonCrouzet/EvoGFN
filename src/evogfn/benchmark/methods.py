@@ -577,13 +577,14 @@ def _campaign(  # noqa: PLR0913 - a campaign is defined by its protocol
     )
 
 
-def _policy(
+def _policy(  # noqa: PLR0913 - a policy is defined by the heads it carries
     env: MutationEnvironment,
     *,
     hidden_dim: int,
     learn_flow: bool,
     seed: int,
     anchor_conditioned: bool = False,
+    learn_backward: bool = False,
 ) -> SequencePolicy:
     """A policy sized to an environment's action space.
 
@@ -607,6 +608,14 @@ def _policy(
             argument for which the environment's *anchor* is read and not only
             its shape -- and the anchor moves, so the sampler re-binds it rather
             than this being the last word on it.
+        learn_backward: Learn ``P_B`` rather than fixing it uniform over the
+            parents the backward mask permits. The uniform choice is exact and
+            max-entropy on this subset lattice, so this is not a correction but
+            an empirical question -- Malkin et al. report a learned backward
+            policy converging faster on some tasks. Wired for the
+            non-anchor-conditioned trunk only, which is the arm that asks the
+            question; a conditioned trunk that also learned ``P_B`` would vary
+            two things at once.
 
     Returns:
         The policy.
@@ -627,6 +636,7 @@ def _policy(
         n_tokens=env.alphabet.size,
         hidden_dim=hidden_dim,
         learn_flow=learn_flow,
+        learn_backward=learn_backward,
         seed=seed,
     )
 
@@ -908,6 +918,7 @@ def gflownet(  # noqa: PLR0913 - an arm is defined by its hyperparameters
     match_anchor_capacity: bool = False,
     pool_size: int = DEFAULT_POOL,
     label_noise_std: float = 0.0,
+    learn_backward: bool = False,
 ) -> Methodology:
     """A GFlowNet trained against the surrogate proxy.
 
@@ -975,6 +986,11 @@ def gflownet(  # noqa: PLR0913 - an arm is defined by its hyperparameters
             readable off stored campaigns without touching this, but only
             deliberately degrading fit quality turns that correlation into a
             causal claim.
+        learn_backward: Learn ``P_B`` rather than fixing it uniform over the
+            backward mask's parents. Off is the shipped method; on is the
+            learned-backward rung of the objective ablation, asking whether a
+            learned backward policy buys anything where the uniform one is
+            already exact and max-entropy.
 
     Returns:
         A methodology, carrying its settings for the record. The capacity control
@@ -1021,6 +1037,7 @@ def gflownet(  # noqa: PLR0913 - an arm is defined by its hyperparameters
                 learn_flow=learn_flow,
                 seed=seed,
                 anchor_conditioned=anchor_conditioned,
+                learn_backward=learn_backward,
             )
             if carry_policy
             else None
@@ -1048,6 +1065,7 @@ def gflownet(  # noqa: PLR0913 - an arm is defined by its hyperparameters
                     learn_flow=learn_flow,
                     seed=stream,
                     anchor_conditioned=anchor_conditioned,
+                    learn_backward=learn_backward,
                 ),
                 proxy=proxy,
                 reward=TemperedReward(beta=beta),
@@ -1594,6 +1612,36 @@ def flow_objectives() -> dict[str, Methodology]:
         # resulting scan would report a curve the shipped arm is not on.
         "gfn-subtb": gflownet(SubTrajectoryBalance(lam=DEFAULT_LAMBDA), learn_flow=True),
         "gfn-fldb": gflownet(ForwardLookingDetailedBalance(), learn_flow=True),
+    }
+
+
+def objective_family() -> dict[str, Methodology]:
+    """Every objective, plus a learned-``P_B`` arm, for the constrained ablation.
+
+    Carries the objective question onto the *constrained* tasks.
+    The objectives diagnostic (`OBJECTIVES` + `flow_objectives`) settles which
+    objective to promote on one unconstrained landscape; this set runs the same
+    comparison where construction is actually constrained, which is where the
+    single global ``log Z`` of `gfn-tb` meets the ``-log k!`` spread across
+    trajectory lengths and where `gfn-fldb`'s intermediate-flow shaping is the
+    learned estimate of the completion question a local mask cannot answer.
+
+    ``gfn-tb`` and ``gfn-subtb`` are the same objects the headline tier runs, so
+    their constrained-task records are reused rather than measured again; the
+    four arms that are new here are `gfn-contrastive`, `gfn-db`, `gfn-fldb` and
+    the learned-``P_B`` rung.
+
+    Returns:
+        Methodologies by name.
+    """
+    return {
+        "gfn-tb": OBJECTIVES["gfn-tb"],
+        "gfn-contrastive": OBJECTIVES["gfn-contrastive"],
+        **flow_objectives(),
+        # The one arm that varies the backward policy rather than the loss:
+        # trajectory balance with a learned ``P_B`` in place of the uniform one,
+        # to see whether learning it buys anything where the constraint binds.
+        "gfn-tb-learnpb": gflownet(TrajectoryBalance(), learn_backward=True),
     }
 
 
