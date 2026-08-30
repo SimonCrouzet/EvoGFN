@@ -85,6 +85,7 @@ from evogfn.benchmark.methods import (
     OBJECTIVES,
     anchor_arms,
     flow_objectives,
+    objective_family,
     reproduced_rungs,
     sensitivity,
     shipped_base,
@@ -113,6 +114,7 @@ from evogfn.benchmark.suite import (
     budget_gradient,
     constraint_density_tier,
     fit_status,
+    objective_family_tier,
     objective_task,
     records_to_metric,
     replicate_instance,
@@ -322,6 +324,12 @@ def tiers(main_seeds: int, diagnostic_seeds: int) -> list[Tier]:
         # the headline finding survives a different constraint shape on the
         # same landscapes, not a diagnostic axis.
         width2_tier(range(main_seeds)),
+        # The objective comparison carried from the diagnostic landscape onto the
+        # constrained tasks, plus a learned-P_B rung. Main-tier seed count,
+        # because which objective wins where construction is constrained is a
+        # headline question; `gfn-tb`/`gfn-subtb` reuse their headline cells, so
+        # only the four arms new here cost a campaign.
+        objective_family_tier(range(main_seeds)),
         # A tier for *reporting* that is **run** cell by cell -- see the branch
         # in `main`. The cross of these two tasks with `anchor_arms` is six
         # campaigns and the study is five: the cross also contains a rebuilt
@@ -616,6 +624,7 @@ def methods_for(tier: Tier) -> dict[str, object]:
     """
     fixed: dict[str, Callable[[], dict[str, object]]] = {
         "objectives": lambda: {**OBJECTIVES, **flow_objectives()},
+        "objective-family": objective_family,
         "sensitivity": lambda: dict(sensitivity()),
         # By name out of the shipped table rather than rebuilt, so these are the
         # same objects, and therefore the same store cells, that every other tier
