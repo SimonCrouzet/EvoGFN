@@ -35,7 +35,7 @@ classifiers = [
 dependencies = [
     "numpy>=1.26",
     "torch>=2.4",
-    "hydra-core>=1.3",
+    "hydra-core>=1.3.5",
     # Thread-pool limits that apply after the numerical libraries have loaded.
     # The OMP_/MKL_/OPENBLAS_ environment variables are read once, when the
     # library is dlopen'd at `import numpy`, so setting them from Python is
