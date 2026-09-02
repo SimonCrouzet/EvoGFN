@@ -1482,6 +1482,84 @@ def _masked_genetic(env: MutationEnvironment, seed: int, _protocol: Protocol) ->
 #:
 #: Note what ``genetic+screen`` and ``alde`` are *not*: the same arm. They share
 #: a surrogate over a library pool and differ in the sampler, the acquisition
+def gfnseqeditor(  # noqa: PLR0913 - an arm is defined by its hyperparameters
+    *,
+    steps: int = DEFAULT_TRAINING_STEPS,
+    beta: float = DEFAULT_BETA,
+    delta: float = 0.4,
+    lam: float = 0.1,
+    sigma: float = 0.001,
+    hidden_dim: int = DEFAULT_HIDDEN_DIM,
+    pool_size: int = DEFAULT_POOL,
+) -> Arm:
+    r"""GFNSeqEditor \citep{ghari2024gfnseqeditor} as a baseline, at their params.
+
+    The prior GFlowNet-based sequence editor in this domain. It trains a de-novo
+    GFlowNet on the surrogate reward, then edits the anchor position by position,
+    flagging a position for editing when keeping the seed token has low flow and
+    resampling from the flow-proportional policy. It carries no feasibility mask:
+    its own setting has no hard predicate, so on a constrained task it optimises
+    the property and leaves legality to chance, which is the comparison. Defaults
+    are the authors' reported ``delta=0.4, lambda=0.1, sigma=0.001``.
+
+    The flow trains in a
+    [DeNovoEnvironment][evogfn.env.denovo.DeNovoEnvironment] rather than the edit
+    lattice, so this is the published method and not our mask handed a new head;
+    the editing procedure lives in
+    [GFNSeqEditorSampler][evogfn.algorithms.baselines.gfnseqeditor.GFNSeqEditorSampler].
+    """
+    from evogfn.algorithms.baselines.gfnseqeditor import GFNSeqEditorSampler  # noqa: PLC0415
+    from evogfn.env.denovo import DeNovoEnvironment  # noqa: PLC0415
+    from evogfn.models.policy import SequencePolicy  # noqa: PLC0415
+
+    def methodology(task: Task, seed: int) -> Campaign:
+        landscape, env, ensemble = _parts(task, seed)
+        proxy = ProxyLandscape(ensemble, alphabet=env.alphabet, sequence_length=env.sequence_length)
+        generation = count()
+
+        def make(anchored: MutationEnvironment) -> Sampler:
+            """Build the editor against whichever anchor the campaign is at."""
+            stream = _anchor_seed(seed, next(generation))
+            denovo = DeNovoEnvironment(anchored.alphabet, anchored.sequence_length)
+            policy = SequencePolicy(
+                n_tokens=anchored.alphabet.size + 1,
+                sequence_length=anchored.sequence_length,
+                n_actions=anchored.alphabet.size + 1,
+                learn_backward=False,
+                hidden_dim=hidden_dim,
+                seed=stream,
+            )
+            return GFNSeqEditorSampler(
+                denovo,
+                policy,
+                anchored.parent,
+                proxy=proxy,
+                reward=TemperedReward(beta=beta),
+                delta=delta,
+                lam=lam,
+                sigma=sigma,
+                config=TrainingConfig(steps=steps or 1, batch_size=TRAINING_BATCH, seed=stream),
+                train=steps > 0,
+                seed=stream,
+            )
+
+        return _campaign(task, landscape, env, make, ensemble, pool_size=pool_size)
+
+    return Arm(
+        methodology,
+        {
+            "family": "gfnseqeditor",
+            "steps": steps,
+            "beta": beta,
+            "delta": delta,
+            "lam": lam,
+            "sigma": sigma,
+            "hidden_dim": hidden_dim,
+            "pool_size": pool_size,
+        },
+    )
+
+
 #: rule and the ensemble's estimator -- and only one of them is a pipeline
 #: somebody published.
 BASELINES: dict[str, Methodology] = {
@@ -1495,6 +1573,7 @@ BASELINES: dict[str, Methodology] = {
     "genetic": classical(_genetic),
     "genetic-feasible": classical(_feasible_genetic),
     "genetic-masked": classical(_masked_genetic),
+    "gfnseqeditor": gfnseqeditor(),
     "cmaes": classical(_cmaes),
     # AdaLead's model is inside its own rollout, so the campaign hands it none
     # and its pool is one plate: what it proposes has already been screened and
