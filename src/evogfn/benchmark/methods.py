@@ -132,7 +132,7 @@ from dataclasses import dataclass, replace
 from functools import cache
 from itertools import count
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import numpy as np
 
@@ -1491,6 +1491,7 @@ def gfnseqeditor(  # noqa: PLR0913 - an arm is defined by its hyperparameters
     sigma: float = 0.001,
     hidden_dim: int = DEFAULT_HIDDEN_DIM,
     pool_size: int = DEFAULT_POOL,
+    feasible_only: bool = False,
 ) -> Arm:
     r"""GFNSeqEditor \citep{ghari2024gfnseqeditor} as a baseline, at their params.
 
@@ -1541,6 +1542,10 @@ def gfnseqeditor(  # noqa: PLR0913 - an arm is defined by its hyperparameters
                 config=TrainingConfig(steps=steps or 1, batch_size=TRAINING_BATCH, seed=stream),
                 train=steps > 0,
                 seed=stream,
+                feasible_only=feasible_only,
+                feasible_check=(
+                    cast("FitnessLandscape", landscape).is_feasible if feasible_only else None
+                ),
             )
 
         return _campaign(task, landscape, env, make, ensemble, pool_size=pool_size)
@@ -1556,6 +1561,7 @@ def gfnseqeditor(  # noqa: PLR0913 - an arm is defined by its hyperparameters
             "sigma": sigma,
             "hidden_dim": hidden_dim,
             "pool_size": pool_size,
+            "feasible_only": feasible_only,
         },
     )
 
@@ -1574,6 +1580,9 @@ BASELINES: dict[str, Methodology] = {
     "genetic-feasible": classical(_feasible_genetic),
     "genetic-masked": classical(_masked_genetic),
     "gfnseqeditor": gfnseqeditor(),
+    # Rejection variant, asked one plate at a time like `genetic-feasible`, so the
+    # 200-attempt cap bounds re-editing a plate rather than a 2048-design pool.
+    "gfnseqeditor-feasible": gfnseqeditor(feasible_only=True, pool_size=PLATE_POOL),
     "cmaes": classical(_cmaes),
     # AdaLead's model is inside its own rollout, so the campaign hands it none
     # and its pool is one plate: what it proposes has already been screened and

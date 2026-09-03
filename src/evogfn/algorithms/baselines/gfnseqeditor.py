@@ -35,6 +35,8 @@ from evogfn.algorithms.gflownet.training import TrainingConfig, train_trajectory
 from evogfn.env.base import State
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     import numpy.typing as npt
 
     from evogfn.core.types import Tokens
@@ -75,6 +77,9 @@ class GFNSeqEditorSampler(Sampler):
         config: TrainingConfig | None = None,
         train: bool = True,
         seed: int = 0,
+        feasible_only: bool = False,
+        feasible_check: Callable[[Tokens], npt.NDArray[np.bool_]] | None = None,
+        max_attempts: int = 200,
     ) -> None:
         """Store the training and editing setup without running it."""
         super().__init__()
@@ -92,6 +97,12 @@ class GFNSeqEditorSampler(Sampler):
         self._rounds_trained = 0
         self._proxy_calls = 0
         self._noise = np.random.default_rng(seed)
+        # Rejection mode, the control mirroring genetic-feasible: keep only edited
+        # designs the predicate admits, re-editing up to max_attempts to reach the
+        # requested count, so feasibility does not confound the edit-quality claim.
+        self._feasible_only = feasible_only
+        self._feasible_check = feasible_check
+        self._max_attempts = int(max_attempts)
 
     @property
     def name(self) -> str:
@@ -124,9 +135,30 @@ class GFNSeqEditorSampler(Sampler):
             )
             self._proxy_calls += result.oracle_calls
             self._rounds_trained += 1
-        designs = self._edit(n)
-        self._count(n)
+        designs = self._edit(n) if not self._feasible_only else self._edit_feasible(n)
+        self._count(len(designs))
         return designs
+
+    def _edit_feasible(self, n: int) -> Tokens:
+        """Edit, keep only designs the predicate admits, re-editing up to the cap.
+
+        Mirrors ``genetic-feasible``: rejection instead of masking. Where the
+        editor's low diversity cannot yield ``n`` distinct feasible designs, it
+        returns fewer, and the campaign exhausts -- which is the finding.
+        """
+        check = self._feasible_check
+        if check is None:
+            return self._edit(n)
+        kept = np.empty((0, self._env.sequence_length), dtype=np.int32)
+        for _ in range(self._max_attempts):
+            cand = self._edit(n)
+            ok = np.asarray(check(cand)).astype(np.bool_)
+            if ok.any():
+                feasible = cand[ok].astype(np.int32)
+                kept = feasible if not kept.size else np.vstack([kept, feasible]).astype(np.int32)
+            if len(kept) >= n:
+                return kept[:n]
+        return kept
 
     def _forward_probs(
         self, prefix: npt.NDArray[np.int64], t: int, n: int
