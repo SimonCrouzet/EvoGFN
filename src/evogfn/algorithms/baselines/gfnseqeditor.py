@@ -39,7 +39,7 @@ if TYPE_CHECKING:
 
     import numpy.typing as npt
 
-    from evogfn.core.types import Tokens
+    from evogfn.core.types import Fitness, Tokens
     from evogfn.env.denovo import DeNovoEnvironment
     from evogfn.models.policy import SequencePolicy
     from evogfn.rewards.base import Reward
@@ -97,6 +97,14 @@ class GFNSeqEditorSampler(Sampler):
         self._rounds_trained = 0
         self._proxy_calls = 0
         self._noise = np.random.default_rng(seed)
+        # Retrain once per round, not once per proposal call. The campaign fills a
+        # plate by calling propose repeatedly (up to MAX_PROPOSAL_ATTEMPTS), and
+        # retraining on every call spends 300 gradient steps per retry -- which on
+        # a low-diversity editor that needs many retries to fill a plate turns one
+        # round into tens of minutes. observe (called once per round with the
+        # round's measurements) marks the policy stale; propose retrains at most
+        # once before serving that round's proposals.
+        self._needs_train = True
         # Rejection mode, the control mirroring genetic-feasible: keep only edited
         # designs the predicate admits, re-editing up to max_attempts to reach the
         # requested count, so feasibility does not confound the edit-quality claim.
@@ -128,16 +136,27 @@ class GFNSeqEditorSampler(Sampler):
         Returns:
             An ``(n, length)`` array of edited designs.
         """
-        if self._train and self._proxy.is_ready:
+        if self._train and self._proxy.is_ready and self._needs_train:
             config = replace(self._config, seed=self._config.seed + self._rounds_trained)
             result = train_trajectory_balance(
                 self._env, self._policy, self._proxy, self._reward, config
             )
             self._proxy_calls += result.oracle_calls
             self._rounds_trained += 1
+            self._needs_train = False
         designs = self._edit(n) if not self._feasible_only else self._edit_feasible(n)
         self._count(len(designs))
         return designs
+
+    def observe(self, sequences: Tokens, values: Fitness) -> None:
+        """A round's measurements arrived; retrain once before the next round.
+
+        The proxy is refit from these between rounds, so the policy is stale and
+        should be retrained -- but only once, ahead of the next round's first
+        proposal, not on every fill-retry within it.
+        """
+        del sequences, values
+        self._needs_train = True
 
     def _edit_feasible(self, n: int) -> Tokens:
         """Edit, keep only designs the predicate admits, re-editing up to the cap.
