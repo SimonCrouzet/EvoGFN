@@ -1492,6 +1492,7 @@ def gfnseqeditor(  # noqa: PLR0913 - an arm is defined by its hyperparameters
     hidden_dim: int = DEFAULT_HIDDEN_DIM,
     pool_size: int = DEFAULT_POOL,
     feasible_only: bool = False,
+    max_attempts: int = 200,
 ) -> Arm:
     r"""GFNSeqEditor \citep{ghari2024gfnseqeditor} as a baseline, at their params.
 
@@ -1546,6 +1547,7 @@ def gfnseqeditor(  # noqa: PLR0913 - an arm is defined by its hyperparameters
                 feasible_check=(
                     cast("FitnessLandscape", landscape).is_feasible if feasible_only else None
                 ),
+                max_attempts=max_attempts,
             )
 
         return _campaign(task, landscape, env, make, ensemble, pool_size=pool_size)
@@ -1562,6 +1564,7 @@ def gfnseqeditor(  # noqa: PLR0913 - an arm is defined by its hyperparameters
             "hidden_dim": hidden_dim,
             "pool_size": pool_size,
             "feasible_only": feasible_only,
+            "max_attempts": max_attempts,
         },
     )
 
@@ -1581,8 +1584,14 @@ BASELINES: dict[str, Methodology] = {
     "genetic-masked": classical(_masked_genetic),
     "gfnseqeditor": gfnseqeditor(),
     # Rejection variant, asked one plate at a time like `genetic-feasible`, so the
-    # 200-attempt cap bounds re-editing a plate rather than a 2048-design pool.
-    "gfnseqeditor-feasible": gfnseqeditor(feasible_only=True, pool_size=PLATE_POOL),
+    # attempt cap bounds re-editing a plate rather than a 2048-design pool. Capped
+    # at 20 re-edits rather than 200: near-deterministic editing (sigma=0.001)
+    # yields too few distinct feasible designs to fill a plate at any cap, so the
+    # campaign exhausts either way and 20 makes that measurable rather than a run
+    # that grinds through 200 futile re-edits per fill-retry before exhausting.
+    "gfnseqeditor-feasible": gfnseqeditor(
+        feasible_only=True, pool_size=PLATE_POOL, max_attempts=20
+    ),
     "cmaes": classical(_cmaes),
     # AdaLead's model is inside its own rollout, so the campaign hands it none
     # and its pool is one plate: what it proposes has already been screened and

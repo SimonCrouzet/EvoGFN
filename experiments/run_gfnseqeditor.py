@@ -24,11 +24,14 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--task", required=True, choices=[t.name for t in MAIN])
     parser.add_argument("--seeds", type=int, nargs="+", required=True)
+    parser.add_argument(
+        "--arm", default="gfnseqeditor", choices=["gfnseqeditor", "gfnseqeditor-feasible"]
+    )
     args = parser.parse_args()
 
     task = next(t for t in MAIN if t.name == args.task)
     store = ResultStore("results")
-    run_task(task, {"gfnseqeditor": BASELINES["gfnseqeditor"]}, store, args.seeds)
+    run_task(task, {args.arm: BASELINES[args.arm]}, store, args.seeds)
     return 0
 
 
